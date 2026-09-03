@@ -1,0 +1,16 @@
+# Loads every dashboard JSON from /var/lib/grafana/dashboards
+# (bind-mounted from ./grafana/dashboards, see compose.yaml).
+apiVersion: 1
+
+providers:
+  - name: GardenHub
+    orgId: 1
+    folder: GardenHub
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

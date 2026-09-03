@@ -1,0 +1,29 @@
+# Development-only services. Start the dev stack with BOTH files:
+#
+#   docker compose -f compose.yaml -f compose-dev.yaml up -d
+#
+# Production runs `compose.yaml` alone, so this container never starts there.
+name: gardenhub
+
+services:
+  gardenhub-adminer:
+    image: adminer:5
+    container_name: gardenhub-adminer
+    restart: unless-stopped
+    ports:
+      - "${ADMINER_PORT:-8081}:8080"
+    environment:
+      # Pre-fills the server field on the login form; user and password
+      # are still typed manually (no credentials in the browser).
+      ADMINER_DEFAULT_SERVER: gardenhub-mysql
+    depends_on:
+      gardenhub-mysql:
+        condition: service_healthy
+    networks:
+      - gardenhub
+
+# Reference to the shared network defined in compose.yaml so the adminer
+# container can reach gardenhub-mysql over the internal Docker network.
+networks:
+  gardenhub:
+    name: gardenhub

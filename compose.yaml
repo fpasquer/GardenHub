@@ -1,0 +1,190 @@
+name: gardenhub
+
+services:
+  gardenhub-nginx:
+    image: nginx:1.27-alpine
+    container_name: gardenhub-nginx
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:80"
+    volumes:
+      # public/ is shared read-only: nginx serves static assets and the
+      # path must match the api container for SCRIPT_FILENAME resolution.
+      - ./api/public:/app/public:ro
+      - ./api/docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      gardenhub-api:
+        condition: service_healthy
+    healthcheck:
+      # End-to-end check: nginx → PHP-FPM → Symfony → Doctrine → MySQL.
+      # 127.0.0.1 is used instead of localhost: in this container localhost
+      # resolves to IPv6 ::1 while nginx only listens on IPv4.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
+  gardenhub-api:
+    build:
+      context: ./api
+    image: gardenhub-api
+    container_name: gardenhub-api
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+    # Source code is bind-mounted for development so changes apply without
+    # rebuilding. Composer dependencies live inside the image; rebuild the
+    # image (`docker compose up -d --build`) after changing composer.json.
+    volumes:
+      - ./api/bin:/app/bin
+      - ./api/config:/app/config
+      - ./api/migrations:/app/migrations
+      - ./api/public:/app/public
+      - ./api/src:/app/src
+      - ./api/templates:/app/templates
+      - ./api/composer.json:/app/composer.json
+      - ./api/composer.lock:/app/composer.lock
+      - ./api/symfony.lock:/app/symfony.lock
+      - ./api/.env:/app/.env
+    depends_on:
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      # Boots the Symfony kernel: proves the application is functional,
+      # not merely that a PHP process exists.
+      test: ["CMD", "php", "bin/console", "about"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
+  gardenhub-worker:
+    image: gardenhub-api
+    container_name: gardenhub-worker
+    restart: unless-stopped
+    # tty so Monolog's console handler (which checks posix_isatty(STDERR))
+    # actually writes to the container logs — without it
+    # `docker compose logs gardenhub-worker` stays empty.
+    tty: true
+    command: php bin/console gardenhub:mqtt:consume
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+      MQTT_HOST: ${MQTT_HOST}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+    # Allows reaching a service on the Docker host itself (e.g. an MQTT
+    # broker exposed on the host loopback in the dev environment) via
+    # the hostname host.docker.internal.
+    # Note: Docker's built-in "host-gateway" resolves to the DEFAULT docker0
+    # bridge (172.17.0.1), NOT this network's gateway (172.22.0.1) — which
+    # makes it unreachable for containers on the gardenhub network. We map
+    # the name explicitly to the gardenhub gateway instead (see the pinned
+    # subnet at the bottom of this file).
+    extra_hosts:
+      - "host.docker.internal:172.22.0.1"
+    volumes:
+      - ./api/bin:/app/bin
+      - ./api/config:/app/config
+      - ./api/src:/app/src
+      - ./api/.env:/app/.env
+    depends_on:
+      gardenhub-api:
+        condition: service_healthy
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      # The consumer is a long-running CLI process (no HTTP port).
+      test: ["CMD-SHELL", "pgrep -f 'gardenhub:mqtt:consume' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
+  gardenhub-mysql:
+    image: mysql:8.4
+    container_name: gardenhub-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    # MySQL is intentionally not exposed to the host network. It is only
+    # reachable from the gardenhub Docker network. Use
+    # `docker compose exec gardenhub-mysql mysql -uroot -p` to access it.
+    volumes:
+      - gardenhub-mysql-data:/var/lib/mysql
+    healthcheck:
+      # Note: $$ escapes to a single $ so Compose does not interpolate it;
+      # MYSQL_ROOT_PASSWORD is read inside the container at runtime.
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - gardenhub
+
+  gardenhub-grafana:
+    image: grafana/grafana:12.1
+    container_name: gardenhub-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Local-first: no usage reports, update checks or external calls.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      # Passed through so the provisioned MySQL datasource can use them.
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - gardenhub-grafana-data:/var/lib/grafana
+      # Datasources and dashboard provider are provisioned at startup;
+      # dashboard JSON lives in ./grafana/dashboards (see README).
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
+volumes:
+  gardenhub-mysql-data:
+    name: gardenhub-mysql-data
+  gardenhub-grafana-data:
+    name: gardenhub-grafana-data
+
+networks:
+  gardenhub:
+    name: gardenhub
+    # Pinned subnet so the gateway is ALWAYS 172.22.0.1. Without this,
+    # Docker picks a free subnet at network-creation time and the
+    # host.docker.internal extra_hosts mapping (gardenhub-worker) would
+    # silently go stale after a network recreate / Docker restart.
+    ipam:
+      config:
+        - subnet: 172.22.0.0/16

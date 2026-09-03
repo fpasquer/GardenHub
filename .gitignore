@@ -1,0 +1,23 @@
+###> GardenHub ###
+# Local environment overrides and secrets (never commit real credentials)
+/.env.local
+/.env.*.local
+/.env
+
+# Local Docker Compose overrides
+/compose.override.yaml
+/docker-compose.override.yaml
+/docker-compose.override.yml
+###< GardenHub ###
+
+###> IDE / editors ###
+.idea/
+.vscode/
+*.swp
+*.swo
+###< IDE / editors ###
+
+###> OS ###
+.DS_Store
+Thumbs.db
+###< OS ###

@@ -1,0 +1,10 @@
+api_platform:
+    title: GardenHub API
+    description: Self-hosted backend API for the GardenHub connected garden and IoT platform.
+    version: 0.1.0
+    # Hide Webby, the spider mascot, from the documentation page.
+    show_webby: false
+    defaults:
+        stateless: true
+        cache_headers:
+            vary: ['Content-Type', 'Authorization', 'Origin']

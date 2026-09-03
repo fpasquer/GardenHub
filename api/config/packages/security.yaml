@@ -1,0 +1,40 @@
+security:
+    # The security bundle requires at least one provider. The API key
+    # authenticator is self-validating and resolves the ApiClient itself
+    # from the key hash, so this in-memory provider holds no users.
+    providers:
+        empty_memory: { memory: null }
+
+    firewalls:
+        dev:
+            # Ensure dev tools and static assets are always allowed
+            pattern: ^/(_profiler|_wdt|assets|build)/
+            security: false
+        main:
+            lazy: true
+            stateless: true
+            provider: empty_memory
+            custom_authenticators:
+                - App\Security\ApiKeyAuthenticator
+
+    # Note: Only the *first* matching rule is applied
+    access_control:
+        # Public: health check, API entrypoint and OpenAPI/Swagger documentation
+        - { path: ^/healthz, roles: PUBLIC_ACCESS }
+        - { path: ^/api/docs, roles: PUBLIC_ACCESS }
+        - { path: ^/api/contexts, roles: PUBLIC_ACCESS }
+        - { path: ^/api$, roles: PUBLIC_ACCESS }
+        # Writes require ROLE_API_WRITE, reads ROLE_API_READ
+        - { path: ^/api, roles: ROLE_API_WRITE, methods: [POST, PUT, PATCH, DELETE] }
+        - { path: ^/api, roles: ROLE_API_READ }
+
+when@test:
+    security:
+        password_hashers:
+            # Password hashers are resource-intensive by design to ensure security.
+            # In tests, it's safe to reduce their cost to improve performance.
+            Symfony\Component\Security\Core\User\PasswordAuthenticatedUserInterface:
+                algorithm: auto
+                cost: 4 # Lowest possible value for bcrypt
+                time_cost: 3 # Lowest possible value for argon
+                memory_cost: 10 # Lowest possible value for argon

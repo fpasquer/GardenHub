@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../vendor/symfony/dependency-injection/Loader/schema/services.schema.json
+
+# This file is the entry point to configure your own services.
+# Files in the packages/ subdirectory configure your dependencies.
+# See also https://symfony.com/doc/current/service_container/import.html
+
+# Put parameters here that don't need to change on each machine where the app is deployed
+# https://symfony.com/doc/current/best_practices.html#use-parameters-for-application-configuration
+parameters:
+    # Maps ChirpStack codec-decoded payload fields to Sensor type/unit.
+    # Defaults match the real Dragino SE01-LB codec output; adjust to the
+    # codec configured in ChirpStack. Unmapped fields (Node_type, s_flag,
+    # i_flag, Mod, ...) are ignored.
+    mqtt.field_map:
+        'BatV': { type: battery, unit: 'V' }
+        'water_SOIL': { type: soil_moisture, unit: '%' }
+        'temp_SOIL': { type: soil_temperature, unit: '°C' }
+        'temp_DS18B20': { type: air_temperature, unit: '°C' }
+        'conduct_SOIL': { type: soil_conductivity, unit: 'µS/cm' }
+
+services:
+    # default configuration for services in *this* file
+    _defaults:
+        autowire: true      # Automatically injects dependencies in your services.
+        autoconfigure: true # Automatically registers your services as commands, event subscribers, etc.
+
+    # makes classes in src/ available to be used as services
+    # this creates a service per class whose id is the fully-qualified class name
+    App\:
+        resource: '../src/'
+
+    # Adds the api_key security scheme to the OpenAPI document (Swagger UI "Authorize" button)
+    App\OpenApi\OpenApiFactory:
+        decorates: api_platform.openapi.factory
+
+    App\Mqtt\ChirpStackUplinkHandler:
+        arguments:
+            $fieldMap: '%mqtt.field_map%'
+
+    App\Command\MqttConsumeCommand:
+        arguments:
+            $host: '%env(MQTT_HOST)%'
+            $port: '%env(int:MQTT_PORT)%'
+            $username: '%env(MQTT_USERNAME)%'
+            $password: '%env(MQTT_PASSWORD)%'
+            $clientId: '%env(MQTT_CLIENT_ID)%'
+            $topic: '%env(MQTT_TOPIC)%'
+
+    # add more service definitions when explicit configuration is needed
+    # please note that last definitions always *replace* previous ones

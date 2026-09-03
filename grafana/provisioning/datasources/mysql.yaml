@@ -1,0 +1,21 @@
+# MySQL datasource pointing at the gardenhub-mysql container.
+# $VAR placeholders are expanded from the container environment
+# (MYSQL_DATABASE / MYSQL_USER / MYSQL_PASSWORD come from compose.yaml).
+apiVersion: 1
+
+datasources:
+  - name: GardenHub MySQL
+    uid: gardenhub-mysql
+    type: mysql
+    access: proxy
+    url: gardenhub-mysql:3306
+    database: $MYSQL_DATABASE
+    user: $MYSQL_USER
+    secureJsonData:
+      password: $MYSQL_PASSWORD
+    isDefault: true
+    editable: true
+    jsonData:
+      maxOpenConns: 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400

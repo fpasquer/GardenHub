@@ -1,0 +1,7 @@
+# Never send secrets, caches or dependencies into the build context
+.env.local
+.env.*.local
+.git/
+var/
+vendor/
+docker/
