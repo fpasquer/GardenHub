@@ -6,7 +6,7 @@ services:
     container_name: gardenhub-nginx
     restart: unless-stopped
     ports:
-      - "${APP_PORT:-8080}:80"
+      - "192.168.1.20:${APP_PORT:-8080}:80"
     volumes:
       # public/ is shared read-only: nginx serves static assets and the
       # path must match the api container for SCRIPT_FILENAME resolution.
@@ -109,6 +109,7 @@ services:
       start_period: 30s
     networks:
       - gardenhub
+      - iot-lan
 
   gardenhub-mysql:
     image: mysql:8.4
@@ -140,11 +141,12 @@ services:
     container_name: gardenhub-grafana
     restart: unless-stopped
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "192.168.1.20:${GRAFANA_PORT:-3000}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
       # Local-first: no usage reports, update checks or external calls.
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
@@ -188,3 +190,6 @@ networks:
     ipam:
       config:
         - subnet: 172.22.0.0/16
+  iot-lan:
+    external: true
+    name: iot_iot-lan
