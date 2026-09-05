@@ -1,927 +1,1117 @@
 # GardenHub 🌱
 
-GardenHub is the backend platform for a local, self-hosted IoT system designed to monitor and eventually automate a connected garden.
+GardenHub is a local, self-hosted IoT backend for monitoring and eventually automating a connected garden.
 
-The project is intentionally separated from the LoRaWAN infrastructure running on the Raspberry Pi.
+The platform is designed to remain fully functional without cloud services. It consumes LoRaWAN sensor uplinks from ChirpStack through MQTT, persists normalized measurements in MySQL, exposes them through a Symfony/API Platform REST API, and visualizes them in Grafana.
 
-The goal is to build a reliable, modular and fully local backend capable of collecting sensor data, storing historical measurements, exposing an API and later supporting automation, dashboards and additional IoT devices.
+The production deployment runs on a single local server (`gardenhub-server`) while keeping the LoRaWAN infrastructure and the GardenHub application as separate Docker Compose projects.
+
+---
+
+## Current Production Architecture
+
+Production host:
+
+```text
+gardenhub-server
+192.168.1.20
+Ubuntu Server 26.04 LTS
+Docker + Docker Compose
+```
+
+Directory layout:
+
+```text
+/opt/
+├── lorastack/
+│   ├── docker-compose.yml
+│   ├── .env
+│   └── configuration/
+│
+├── gardenhub/
+│   ├── compose.yaml
+│   ├── compose-dev.yaml
+│   ├── .env
+│   ├── api/
+│   └── grafana/
+│
+└── scripts/
+    └── backup/
+
+/mnt/backup/
+└── gardenhub-server/
+    ├── daily/
+    └── monthly/
+```
+
+High-level data flow:
+
+```text
+SE01-Avocado
+     │
+     │ LoRaWAN
+     ▼
+Dragino LPS8N
+192.168.1.18
+     │
+     │ Semtech UDP / 1700
+     ▼
+┌──────────────────────────────────────────────┐
+│ gardenhub-server — 192.168.1.20              │
+│                                              │
+│  LoRaStack                                   │
+│  ┌────────────────────────────────────────┐  │
+│  │ ChirpStack              :8080          │  │
+│  │ Gateway Bridge          :1700/udp      │  │
+│  │ Mosquitto               Docker only    │  │
+│  │ PostgreSQL              Docker only    │  │
+│  │ Redis                   Docker only    │  │
+│  └────────────────────────────────────────┘  │
+│                    │                         │
+│                    │ MQTT                    │
+│                    │ shared Docker network   │
+│                    ▼                         │
+│  GardenHub                                   │
+│  ┌────────────────────────────────────────┐  │
+│  │ MQTT Worker                            │  │
+│  │ Symfony / API Platform                 │  │
+│  │ MySQL                   Docker only    │  │
+│  │ nginx                   :8081          │  │
+│  │ Grafana                 :3000          │  │
+│  └────────────────────────────────────────┘  │
+└──────────────────────────────────────────────┘
+```
+
+The LoRaStack and GardenHub repositories remain logically independent, but in production they share the same physical host.
 
 ---
 
 ## Current Status
 
-### Implemented now
+### Implemented
 
-* Docker Compose stack (`compose.yaml`) with a dedicated `gardenhub` network:
-  * `gardenhub-nginx` — nginx 1.27 web server, the only service exposed on the host
-  * `gardenhub-api` — PHP 8.4 FPM + Symfony 7.4 LTS + API Platform 4.3 (FastCGI behind nginx)
-  * `gardenhub-mysql` — MySQL 8.4 with a persistent named volume (`gardenhub-mysql-data`)
-  * `gardenhub-grafana` — Grafana 12 dashboards reading MySQL directly (read-only SQL),
-    with a provisioned datasource and a GardenHub overview dashboard
-* Doctrine ORM and Doctrine Migrations configured and connected to MySQL through the Docker network
-* Symfony Messenger installed (sync transport by default, ready for future MQTT ingestion)
-* Symfony Validator, Serializer and Monolog configured
-* API Platform entrypoint, OpenAPI documentation and Swagger UI exposed
-* Domain model with three API resources: `Device`, `Sensor`, `Measurement`
-  (`/api/devices`, `/api/sensors`, `/api/measurements`) with validation
-* MQTT ingestion: a `gardenhub-worker` container consumes ChirpStack uplinks from
-  the lorastack-pi broker and persists them through Symfony Messenger; devices
-  and sensors are auto-provisioned from incoming payloads
-* API key authentication (`Authorization: Bearer <key>`) with per-consumer
-  read/write roles; public docs, protected resources
-* API filtering (device/sensor/date/value) and pagination on all collections
-* Grafana dashboards: a pre-provisioned "Garden Overview" dashboard (current
-  values + history per sensor type) backed by a provisioned MySQL datasource
-* Measurements are immutable over HTTP (read + create only)
-* HTTP health endpoint (`/healthz`) verifying the Symfony → Doctrine → MySQL chain, used by the Docker health check
-* Environment-based configuration via `.env` (safe defaults) and git-ignored `.env.local`
+- Docker Compose based deployment.
+- PHP 8.4 / Symfony 7.4 LTS backend.
+- API Platform 4.3+.
+- MySQL 8.4 persistent storage.
+- Doctrine ORM and Doctrine Migrations.
+- Domain model:
+  - `Device`
+  - `Sensor`
+  - `Measurement`
+  - `ApiClient`
+- MQTT ingestion from ChirpStack.
+- Automatic device provisioning from ChirpStack `devEui`.
+- Automatic sensor provisioning from mapped payload fields.
+- Symfony Messenger based ingestion pipeline.
+- API key authentication.
+- API filtering and pagination.
+- Grafana 12 with a provisioned MySQL datasource and Garden overview dashboard.
+- HTTP health endpoint for nginx → Symfony → Doctrine → MySQL.
+- Persistent Docker volumes.
+- Automated backups to a dedicated external SSD.
+- Daily and monthly backup retention.
+- Hardened local-network deployment.
 
-### Planned later (not implemented yet)
+### Planned
 
-* Extended domain model (`Garden`, `GardenBed`, `Plant`, `IrrigationEvent`, `Alert`, ...)
-* HTTPS termination (currently plain HTTP on the LAN)
-* Frontend, automation, AI integrations
+- Extended domain model:
+  - `Garden`
+  - `GardenBed`
+  - `Plant`
+  - `IrrigationEvent`
+  - `Alert`
+- Automation rules.
+- Telegram alerts.
+- Frontend.
+- Optional HTTPS on the LAN.
+- Additional devices and sensors.
+- AI-assisted analysis where useful.
 
 ---
 
-## Getting Started
+# GardenHub Stack
 
-A new developer only needs Docker and Docker Compose on the host. PHP, Composer, Symfony CLI and MySQL all run inside containers.
+GardenHub contains five main services:
 
-### 1. Prerequisites
+```text
+gardenhub-nginx
+gardenhub-api
+gardenhub-worker
+gardenhub-mysql
+gardenhub-grafana
+```
 
-* Docker 24+
-* Docker Compose v2 (`docker compose`)
+## `gardenhub-nginx`
 
-### 2. Clone the repository
+nginx is the HTTP entry point for the GardenHub API.
+
+Production binding:
+
+```text
+192.168.1.20:8081
+```
+
+Dynamic PHP requests are forwarded to `gardenhub-api` over FastCGI.
+
+Static files are served from `api/public`.
+
+## `gardenhub-api`
+
+Symfony / API Platform backend running with PHP-FPM.
+
+Responsibilities:
+
+- REST API
+- validation
+- serialization
+- Doctrine persistence
+- API authentication
+- health checks
+- domain/application logic
+
+The container is not directly exposed on the host.
+
+## `gardenhub-worker`
+
+Long-running Symfony command:
+
+```bash
+php bin/console gardenhub:mqtt:consume
+```
+
+Responsibilities:
+
+- connect to Mosquitto
+- subscribe to ChirpStack uplinks
+- decode messages
+- dispatch messages through Symfony Messenger
+- auto-provision devices and sensors
+- persist measurements
+
+The worker is connected to both:
+
+```text
+gardenhub
+iot_iot-lan
+```
+
+This allows GardenHub to reach Mosquitto directly through Docker DNS.
+
+Production MQTT host:
+
+```text
+mosquitto
+```
+
+MQTT is **not exposed on the host LAN**.
+
+## `gardenhub-mysql`
+
+MySQL 8.4 database.
+
+Persistent volume:
+
+```text
+gardenhub-mysql-data
+```
+
+MySQL is not published on the host network.
+
+## `gardenhub-grafana`
+
+Grafana 12 dashboard service.
+
+Production binding:
+
+```text
+192.168.1.20:3000
+```
+
+Grafana reads MySQL directly through the internal GardenHub Docker network.
+
+Anonymous access and user self-registration are disabled.
+
+---
+
+# LoRaStack Integration
+
+The LoRaWAN infrastructure lives in the separate `lorastack-pi` project, deployed on the same production server under:
+
+```text
+/opt/lorastack
+```
+
+It contains:
+
+- ChirpStack
+- ChirpStack Gateway Bridge
+- Mosquitto
+- PostgreSQL
+- Redis
+
+Production bindings:
+
+| Service | Binding |
+|---|---|
+| ChirpStack | `192.168.1.20:8080` |
+| Gateway Bridge | `192.168.1.20:1700/udp` |
+| Mosquitto | Docker networks only |
+| PostgreSQL | Docker internal only |
+| Redis | Docker internal only |
+
+The LPS8N gateway is configured to forward Semtech UDP packets to:
+
+```text
+192.168.1.20:1700
+```
+
+Gateway EUI:
+
+```text
+a84041ffff2e1fc0
+```
+
+Current device:
+
+```text
+SE01-Avocado
+DevEUI: a84041b04f5a93be
+```
+
+---
+
+# MQTT
+
+The GardenHub worker subscribes to ChirpStack uplink events.
+
+Default topic:
+
+```text
+application/+/device/+/event/up
+```
+
+Configured in:
+
+```text
+api/.env
+```
+
+Example:
+
+```dotenv
+MQTT_CLIENT_ID=gardenhub
+MQTT_TOPIC="application/+/device/+/event/up"
+```
+
+Production credentials are provided through the root `.env` file:
+
+```dotenv
+MQTT_HOST=mosquitto
+MQTT_PORT=1883
+MQTT_USERNAME=symfony
+MQTT_PASSWORD=<secret>
+```
+
+The `symfony` Mosquitto account is restricted by the Mosquitto ACL.
+
+Because GardenHub and Mosquitto communicate through the shared Docker network, port `1883` does not need to be published on the A6 host.
+
+---
+
+# Payload Mapping
+
+Payload fields are mapped through:
+
+```text
+api/config/services.yaml
+```
+
+Current SE01 mapping:
+
+| Payload field | Sensor type | Unit |
+|---|---|---|
+| `BatV` | `battery` | V |
+| `water_SOIL` | `soil_moisture` | % |
+| `temp_SOIL` | `soil_temperature` | °C |
+| `temp_DS18B20` | `air_temperature` | °C |
+| `conduct_SOIL` | `soil_conductivity` | µS/cm |
+
+Unknown payload fields are ignored.
+
+Non-numeric values are skipped.
+
+Devices and sensors are automatically provisioned on first sight.
+
+---
+
+# Database Model
+
+Current MySQL tables include:
+
+```text
+api_client
+device
+doctrine_migration_versions
+measurement
+sensor
+```
+
+Doctrine migrations are applied with:
+
+```bash
+docker compose exec gardenhub-api php bin/console doctrine:migrations:migrate --no-interaction
+```
+
+Measurements are persisted in MySQL and survive:
+
+- container recreation
+- Docker restart
+- server reboot
+
+because MySQL uses the persistent volume:
+
+```text
+gardenhub-mysql-data
+```
+
+---
+
+# Getting Started
+
+## Prerequisites
+
+- Docker
+- Docker Compose v2+
+- Git
+
+No host installation of PHP, Composer, Symfony CLI, nginx or MySQL is required.
+
+## Clone
 
 ```bash
 git clone <repository-url> GardenHub
 cd GardenHub
 ```
 
-### 3. Configure the environment
+## Environment
 
-The committed `.env` file contains safe development defaults (database name, user, passwords and the API port). To override any value locally, create an untracked `.env.local` file (see `.gitignore`) and start the stack with both files (the first provides defaults, the second overrides them):
+Never commit production secrets.
 
-```bash
-docker compose --env-file .env --env-file .env.local up -d
+The deployment uses a root `.env` file for Compose variables.
+
+Example development values:
+
+```dotenv
+APP_ENV=dev
+
+APP_PORT=8080
+GRAFANA_PORT=3000
+
+MYSQL_DATABASE=gardenhub
+MYSQL_USER=gardenhub
+MYSQL_PASSWORD=<password>
+MYSQL_ROOT_PASSWORD=<root-password>
+
+MQTT_HOST=mosquitto
+MQTT_PORT=1883
+MQTT_USERNAME=<username>
+MQTT_PASSWORD=<password>
 ```
 
-| Variable              | Default                   | Purpose                          |
-|-----------------------|---------------------------|----------------------------------|
-| `APP_ENV`             | `dev`                     | Symfony environment              |
-| `APP_PORT`            | `8080`                    | Host port exposing the API       |
-| `GRAFANA_PORT`        | `3000`                    | Host port exposing Grafana       |
-| `GRAFANA_ADMIN_USER`  | `admin`                   | Grafana initial admin user       |
-| `GRAFANA_ADMIN_PASSWORD` | `admin`                | Grafana initial admin password   |
-| `ADMINER_PORT`        | `8081`                    | Host port exposing Adminer (dev only) |
-| `MYSQL_DATABASE`      | `gardenhub`               | MySQL database name              |
-| `MYSQL_USER`          | `gardenhub`               | MySQL application user           |
-| `MYSQL_PASSWORD`      | `gardenhub_dev_password`  | MySQL application password       |
-| `MYSQL_ROOT_PASSWORD` | `gardenhub_dev_root_password` | MySQL root password          |
-| `MQTT_HOST`           | `lorastack-pi`            | MQTT broker host (ChirpStack)    |
-| `MQTT_PORT`           | `1883`                    | MQTT broker port                 |
-| `MQTT_USERNAME`       | *(empty)*                 | MQTT username                    |
-| `MQTT_PASSWORD`       | *(empty)*                 | MQTT password                    |
+Production on `gardenhub-server` currently uses:
 
-MQTT topology differs per environment:
+```text
+GardenHub API: 192.168.1.20:8081
+Grafana:       192.168.1.20:3000
+ChirpStack:    192.168.1.20:8080
+```
 
-* **Production** (GardenHub on its own machine): `MQTT_HOST` is the Raspberry Pi
-  hostname/IP, port 1883 — the containers talk to the Pi over the LAN.
-* **Development** (GardenHub and the broker on the same machine): point
-  `MQTT_HOST` to `host.docker.internal` in `.env.local`. The `gardenhub-worker`
-  service maps that name to the **gardenhub network gateway** (`172.22.0.1`),
-  so a broker reachable on the Docker host stays reachable from the container.
+Do not commit `.env` or `.env.local`.
 
-  > Docker's built-in `host-gateway` keyword resolves to the default `docker0`
-  > bridge (`172.17.0.1`), which containers on a custom network cannot use to
-  > reach host services. That is why `compose.yaml` maps the name explicitly
-  > and pins the `gardenhub` subnet to `172.22.0.0/16`.
-
-  To expose the Raspberry Pi MQTT broker on port 1884 of the Azure development
-  machine, run this from Windows PowerShell and keep the SSH session open:
-
-  ```powershell
-  ssh -i C:\Users\H295226\Desktop\fpasquer-dev-linux_key.pem -N -R 0.0.0.0:1884:192.168.1.16:1883 azureuser@10.145.88.202
-  ```
-
-  Two details matter here:
-
-  * The `0.0.0.0:` bind address is required. A plain `-R 1884:...` binds the
-    tunnel to the host **loopback only** (`127.0.0.1:1884`), which containers
-    cannot reach — from inside a container the host is the bridge gateway IP,
-    not loopback. Binding `0.0.0.0` requires `GatewayPorts clientspecified`
-    (or `yes`) in the VM's `/etc/ssh/sshd_config` — Azure images may ship an
-    sshd_config **without** an `Include` for `sshd_config.d/`, so put the
-    directive in the main file, then `sudo sshd -t && sudo systemctl restart ssh`
-    (verify with `sudo sshd -T | grep gatewayports`). Check the effective bind
-    with `ss -ltn | grep 1884` (want `0.0.0.0:1884`).
-  * Binding `0.0.0.0` also exposes port 1884 on the VM's external IP. Restrict
-    it with the Azure NSG, or bind only the bridge gateway instead:
-    `-R 172.22.0.1:1884:192.168.1.16:1883`.
-
-  Configure `.env.local` with `MQTT_HOST=host.docker.internal` and
-  `MQTT_PORT=1884` while this tunnel is running, and start the stack with both
-  env files (`--env-file .env --env-file .env.local`) — a single `--env-file`
-  **replaces** the defaults instead of merging them.
-
-### 4. Build the containers
+## Build
 
 ```bash
 docker compose build
 ```
 
-### 5. Start the containers
+## Start
 
 ```bash
 docker compose up -d
 ```
 
-### 6. Run the database migrations
+## Run migrations
 
 ```bash
-docker compose exec gardenhub-api bin/console doctrine:database:create --if-not-exists
-docker compose exec gardenhub-api bin/console doctrine:migrations:migrate --no-interaction --allow-no-migration
+docker compose exec gardenhub-api php bin/console doctrine:migrations:migrate --no-interaction
 ```
 
-There are no domain migrations yet (no entities have been created); this validates that the migration tooling works and creates the `doctrine_migration_versions` table.
-
-### 7. Verify Symfony
+## Check containers
 
 ```bash
 docker compose ps
-docker compose exec gardenhub-api bin/console about
 ```
 
-All four containers should be `healthy`, and `about` should report Symfony 7.4.
-
-### 8. Verify API Platform
-
-* API entrypoint: [http://localhost:8080/api](http://localhost:8080/api) (returns the JSON-LD entrypoint)
-* API documentation (Swagger UI): [http://localhost:8080/api/docs](http://localhost:8080/api/docs)
-* Health check: [http://localhost:8080/healthz](http://localhost:8080/healthz) (returns `{"status":"ok"}` only when the database is reachable)
-
-### Grafana dashboards
-
-Grafana runs at [http://localhost:3000](http://localhost:3000) (log in with
-`GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD`, default `admin` / `admin` —
-change them in `.env.local`). The **GardenHub / Garden Overview** dashboard is
-provisioned automatically on first start, together with its MySQL datasource
-(read-only SQL queries against `gardenhub-mysql`, no writes).
-
-The dashboard opens with a **Devices** table (one row per device: name,
-creation date, sensor count) — new devices appear automatically on their first
-uplink. Below it, the current value of each sensor type (soil moisture, soil
-temperature, air temperature, soil conductivity, battery) plus their history,
-with a deliberately sober, muted color palette. Edit it in the UI or replace
-`grafana/dashboards/gardenhub-overview.json` — the provisioning provider
-reloads the file every 30 seconds.
-
-### API authentication
-
-The API resources require an API key; the docs, entrypoint and health check stay public. Create a client:
-
-```bash
-# Read + write (devices, sensors, measurement creation)
-docker compose exec gardenhub-api bin/console gardenhub:api-client:create my-client
-
-# Read-only (e.g. Grafana, dashboards)
-docker compose exec gardenhub-api bin/console gardenhub:api-client:create grafana --readonly
-```
-
-The key is printed **once** — store it. Only its SHA-256 hash is kept in the database. Use it as a Bearer token (or `X-API-KEY` header):
-
-```bash
-curl -H "Authorization: Bearer gh_..." http://localhost:8080/api/devices
-```
-
-In the [Swagger UI](http://localhost:8080/api/docs), click **Authorize** and paste the `gh_...` key — every request then sends it automatically.
-
-Available resources:
-
-* `GET/POST /api/devices`, `GET/PATCH/DELETE /api/devices/{id}`
-* `GET/POST /api/sensors`, `GET/PATCH/DELETE /api/sensors/{id}`
-* `GET/POST /api/measurements`, `GET /api/measurements/{id}` (immutable: no PATCH/DELETE)
-
-### Database admin UI (Adminer, dev only)
-
-Adminer runs only in development: it is defined in `compose-dev.yaml`, which is
-merged on top of `compose.yaml`. Start the dev stack with both files:
-
-```bash
-docker compose -f compose.yaml -f compose-dev.yaml up -d
-```
-
-Production starts with `compose.yaml` alone, so the container never runs there.
-Then open [http://localhost:8081](http://localhost:8081) — the MySQL server is
-pre-filled (`gardenhub-mysql`, reachable over the internal Docker network);
-log in with `MYSQL_USER` / `MYSQL_PASSWORD` (or the root credentials) from
-`.env` / `.env.local`.
-
-### Filtering and pagination
-
-All collections are paginated (default 30 items/page, 100 for measurements) and support filters:
-
-```bash
-# Devices by name (partial match)
-/api/devices?name=SE01
-
-# Sensors of a device / of a type
-/api/sensors?device=/api/devices/1
-/api/sensors?type=soil_moisture
-
-# Measurements of a sensor, in a date range, above a value
-/api/measurements?sensor=/api/sensors/5
-/api/measurements?measuredAt[after]=2026-08-20&measuredAt[before]=2026-08-24
-/api/measurements?value[gte]=20
-
-# Ordering and pagination
-/api/measurements?order[measuredAt]=desc&page=2
-```
-
-Replace `8080` with your `APP_PORT` if you changed it.
-
-### 9. Stop the environment
-
-```bash
-docker compose down
-```
-
-MySQL data survives `docker compose down` because it is stored in the persistent `gardenhub-mysql-data` volume. To also delete the data, run `docker compose down -v`.
-
-### Useful commands
-
-```bash
-# Follow logs
-docker compose logs -f
-
-# Open a shell in the API container
-docker compose exec gardenhub-api sh
-
-# Run Composer inside the API container (no host PHP/Composer needed)
-docker compose exec gardenhub-api composer require <package>
-
-# Access MySQL (not exposed on the host network by design)
-docker compose exec gardenhub-mysql mysql -uroot -p
-
-# Follow MQTT worker logs
-docker compose logs -f gardenhub-worker
-
-# Follow Grafana logs
-docker compose logs -f gardenhub-grafana
-
-# Follow Adminer logs (dev stack)
-docker compose logs -f gardenhub-adminer
-
-# Simulate a ChirpStack uplink without a broker (same Messenger path as real MQTT)
-docker compose exec gardenhub-api bin/console gardenhub:mqtt:simulate a84041a1c182b3e0 '{"hum_SOIL":"25.34","temp_SOIL":"21.06"}'
-
-# Rebuild the image after changing composer.json/composer.lock
-docker compose up -d --build
-```
-
-The `api/src`, `api/config`, `api/public`, `api/migrations`, `api/templates` and `api/bin` directories are bind-mounted into the API container, so code changes apply immediately in `dev` mode without rebuilding.
-
----
-
-## Web Server
-
-HTTP is served by **nginx** (`gardenhub-nginx`), which is the only service exposed on the host (`APP_PORT`, default 8080). Dynamic requests are forwarded over FastCGI to the `gardenhub-api` PHP-FPM container; static assets (such as the Swagger UI files) are served directly by nginx.
-
-The nginx vhost lives in `api/docker/nginx/default.conf` and is mounted read-only into the container.
-
----
-
-## Architecture
-
-GardenHub is designed to run entirely in Docker on a **dedicated machine**, separate from the Raspberry Pi running the LoRaWAN infrastructure.
+Expected GardenHub services:
 
 ```text
-                        IoT Devices
-                            │
-                         LoRaWAN
-                            │
-                    ┌───────▼─────────┐
-                    │   LPS8N Gateway │
-                    └───────┬─────────┘
-                            │
-                         LoRaWAN
-                            │
-                    ┌───────▼─────────┐
-                    │   Raspberry Pi  │
-                    │                 │
-                    │  lorastack-pi   │
-                    │                 │
-                    │   ChirpStack    │
-                    │   MQTT Broker   │
-                    └───────┬─────────┘
-                            │
-                           MQTT
-                            │
-                  ┌─────────▼──────────┐
-                  │    GardenHub Host  │
-                  │                    │
-                  │      Docker        │
-                  │                    │
-                  │  ┌──────────────┐  │
-                  │  │    nginx     │  │
-                  │  └──────┬───────┘  │
-                  │       FastCGI      │
-                  │  ┌──────▼───────┐  │
-                  │  │   Symfony    │  │
-                  │  │ API Platform │  │
-                  │  └──────┬───────┘  │
-                  │         │          │
-                  │  ┌──────▼───────┐  │
-                  │  │   MySQL 8    │  │
-                  │  └──────▲───────┘  │
-                  │      Doctrine      │
-                  │  ┌──────┴───────┐  │
-                  │  │ MQTT Worker  │  │
-                  │  │  (Messenger) │  │
-                  │  └──────────────┘  │
-                  │                    │
-                  └─────────┬──────────┘
-                            │
-                         REST API
-                            │
-                    ┌───────▼─────────┐
-                    │ Future Frontend │
-                    │                 │
-                    │   React / TBD   │
-                    └─────────────────┘
-
-                     Optional later
-                            │
-                       ┌────▼─────┐
-                       │ Grafana  │
-                       └──────────┘
+gardenhub-nginx
+gardenhub-api
+gardenhub-worker
+gardenhub-mysql
+gardenhub-grafana
 ```
 
----
-
-## Project Responsibilities
-
-### `lorastack-pi`
-
-The Raspberry Pi project is responsible for the IoT infrastructure:
-
-* LoRaWAN gateway connectivity
-* ChirpStack
-* MQTT broker
-* LoRaWAN device communication
-* Device uplinks/downlinks
-* MQTT message transport
-
-Repository:
-
-```text
-lorastack-pi
-```
-
-GardenHub does **not** replace this infrastructure.
-
----
-
-### `GardenHub`
-
-GardenHub is responsible for the application layer:
-
-* IoT domain model
-* Sensor and device management
-* Measurement persistence
-* Business logic
-* MQTT consumption
-* REST API
-* Data validation
-* Historical data access
-* Future automation logic
-* Future integrations
-
-The backend should remain independent from the frontend.
-
----
-
-# Technology Stack
-
-## Backend
-
-* PHP 8.2+
-* Symfony 7.4 LTS
-* API Platform 4.3+
-* Doctrine ORM
-* Symfony Messenger
-* Symfony Validator
-* Symfony Serializer
-
-## Database
-
-* MySQL 8.0+
-* Doctrine Migrations
-
-MySQL is the initial persistent storage solution.
-
-The project will not introduce a dedicated time-series database unless this becomes necessary later.
-
-## Messaging
-
-GardenHub will consume IoT messages through MQTT.
-
-The MQTT broker itself remains part of the `lorastack-pi` infrastructure.
-
-The backend should therefore communicate with the existing MQTT broker over the network rather than running a second MQTT broker.
-
-## Infrastructure
-
-Everything belonging to GardenHub should run through Docker.
-
-The target machine should therefore only require the host operating system and Docker/Docker Compose.
-
----
-
-# Docker Architecture
-
-The initial GardenHub stack contains:
-
-```text
-GardenHub
-│
-├── nginx
-│
-├── Symfony / API Platform (PHP-FPM)
-│
-├── MQTT Worker
-│
-├── Grafana
-│
-└── MySQL 8
-```
-
-Additional services may be introduced later when justified.
-
-Potential future services:
-
-```text
-└── Redis
-```
-
-Services should not be added simply because they are commonly used.
-
-The architecture should remain as small as reasonably possible.
-
----
-
-# Initial Backend Architecture
-
-The first version should follow this data flow:
-
-```text
-LoRaWAN Sensor
-      │
-      ▼
-lorastack-pi
-      │
-      ▼
-   ChirpStack
-      │
-      ▼
-     MQTT
-      │
-      ▼
-GardenHub
-      │
-      ▼
-Symfony Messenger
-      │
-      ▼
-Domain / Application Logic
-      │
-      ▼
-Doctrine ORM
-      │
-      ▼
-   MySQL 8
-```
-
-API Platform exposes the stored information through HTTP:
-
-```text
-MySQL
-  ▲
-  │
-Doctrine
-  ▲
-  │
-Symfony
-  │
-  ▼
-API Platform
-  │
-  ▼
-REST API
-```
+Services with health checks should become `healthy`.
 
 ---
 
 # API
 
-API Platform will provide the main HTTP API for GardenHub.
-
-The API should expose resources such as:
+Production API base URL:
 
 ```text
+http://192.168.1.20:8081
+```
+
+Endpoints:
+
+```text
+/api
+/api/docs
 /api/devices
 /api/sensors
 /api/measurements
+/healthz
 ```
 
-The exact resources and relationships will be defined during the domain-model phase.
-
-API Platform should provide:
-
-* REST endpoints
-* OpenAPI documentation
-* Validation
-* Serialization
-* Filtering
-* Pagination
-* Resource operations
-* API security when required
-
-The API should remain independent from any future frontend.
-
----
-
-# Initial Domain Model
-
-The first domain model should remain intentionally simple.
-
-The initial concepts are expected to include:
-
-```text
-Device
-Sensor
-Measurement
-```
-
-For example:
-
-```text
-Device
- └── SE01-Avocado
-
-Sensor
- ├── Temperature
- ├── Humidity
- └── Soil Moisture
-
-Measurement
- ├── timestamp
- ├── sensor
- └── value
-```
-
-The final model should be designed before creating a large number of database tables.
-
-The model must also be flexible enough to support future devices and sensors without requiring a redesign for every new sensor type.
-
----
-
-# Data Ingestion
-
-GardenHub receives sensor data from the MQTT infrastructure hosted by `lorastack-pi`.
-
-The `gardenhub-worker` container subscribes to the ChirpStack uplink topic
-(`application/+/device/+/event/up` by default, see `MQTT_TOPIC` in `api/.env`),
-decodes the JSON payload and dispatches it to Symfony Messenger:
-
-```text
-MQTT
-  │
-  ▼
-Symfony Messenger
-  │
-  ▼
-MQTT Message Handler
-  │
-  ▼
-Validation / Transformation
-  │
-  ▼
-Domain Model
-  │
-  ▼
-Doctrine
-  │
-  ▼
-MySQL
-```
-
-MQTT ingestion is separated from HTTP/API processing: it runs in the dedicated
-`gardenhub-worker` container (`gardenhub:mqtt:consume`), which reconnects
-automatically when the broker is unreachable and logs every failure.
-
-The API is not responsible for receiving live sensor messages from ChirpStack.
-
-## Payload mapping
-
-Payload fields are mapped to sensors through the `mqtt.field_map` parameter in
-`api/config/services.yaml` (defaults match the real Dragino SE01-LB codec output):
-
-| Payload field   | Sensor type         | Unit  |
-|-----------------|---------------------|-------|
-| `BatV`          | `battery`           | V     |
-| `water_SOIL`    | `soil_moisture`     | %     |
-| `temp_SOIL`     | `soil_temperature`  | °C    |
-| `temp_DS18B20`  | `air_temperature`   | °C    |
-| `conduct_SOIL`  | `soil_conductivity` | µS/cm |
-
-Devices and sensors are auto-provisioned on the first uplink: an unknown
-`devEui` creates a `Device` named after the EUI, and each mapped field creates
-the matching `Sensor`. Unknown fields (`Node_type`, `s_flag`, `i_flag`, `Mod`,
-...) are ignored; non-numeric values (such as the `"NULL"` strings produced by
-the SE01 codec) are skipped with a warning.
-
-To test the ingestion chain without a broker:
+Examples:
 
 ```bash
-docker compose exec gardenhub-api bin/console gardenhub:mqtt:simulate a84041a1c182b3e0 '{"hum_SOIL":"25.34","temp_SOIL":"21.06"}'
+curl http://192.168.1.20:8081/healthz
 ```
+
+Authenticated API request:
+
+```bash
+curl \
+  -H "Authorization: Bearer gh_..." \
+  http://192.168.1.20:8081/api/devices
+```
+
+## API clients
+
+Read/write client:
+
+```bash
+docker compose exec gardenhub-api php bin/console gardenhub:api-client:create my-client
+```
+
+Read-only client:
+
+```bash
+docker compose exec gardenhub-api php bin/console gardenhub:api-client:create grafana --readonly
+```
+
+The API key is displayed once.
+
+Only its SHA-256 hash is persisted.
 
 ---
 
-# Frontend
+# Filtering and Pagination
 
-There is intentionally **no frontend in the initial GardenHub project**.
-
-The backend and API should be developed first.
-
-A frontend may be introduced later, potentially using React, but the technology has not yet been finalized.
-
-The frontend must consume the GardenHub API rather than accessing MySQL directly.
+Examples:
 
 ```text
-Frontend
-    │
-    ▼
-GardenHub API
-    │
-    ▼
-Symfony
-    │
-    ▼
-MySQL
+/api/devices?name=SE01
+
+/api/sensors?device=/api/devices/1
+
+/api/sensors?type=soil_moisture
+
+/api/measurements?sensor=/api/sensors/5
+
+/api/measurements?measuredAt[after]=2026-08-20
+
+/api/measurements?measuredAt[before]=2026-08-24
+
+/api/measurements?value[gte]=20
+
+/api/measurements?order[measuredAt]=desc&page=2
 ```
 
 ---
 
 # Grafana
 
-Grafana is part of the stack: it reads MySQL directly for sensor dashboards
-(see the "Grafana dashboards" section above). Additional Grafana dashboards
-can be added by dropping JSON files into `grafana/dashboards/`.
+Production URL:
+
+```text
+http://192.168.1.20:3000
+```
+
+The GardenHub dashboard and MySQL datasource are provisioned from:
+
+```text
+grafana/provisioning/
+grafana/dashboards/
+```
+
+Grafana security configuration includes:
+
+```yaml
+GF_USERS_ALLOW_SIGN_UP: "false"
+GF_AUTH_ANONYMOUS_ENABLED: "false"
+```
+
+The initial admin password must be set through environment configuration and changed after first login.
+
+Grafana data is stored in:
+
+```text
+gardenhub-grafana-data
+```
 
 ---
 
-# Deployment
+# Development Environment
 
-GardenHub will run on a dedicated machine separate from the Raspberry Pi.
+Adminer is available only in the development Compose overlay:
 
-Example:
-
-```text
-Machine 1
-────────────────────────────
-Raspberry Pi
-lorastack-pi
-├── ChirpStack
-└── MQTT
+```bash
+docker compose -f compose.yaml -f compose-dev.yaml up -d
 ```
 
-```text
-Machine 2
-────────────────────────────
-GardenHub Server
-├── nginx
-├── Symfony
-├── API Platform
-├── MQTT Worker
-└── MySQL
+Do not run `compose-dev.yaml` in production.
+
+The API source directories are bind-mounted, so most PHP source changes are immediately visible inside the running development container.
+
+Rebuild after dependency changes:
+
+```bash
+docker compose up -d --build
 ```
 
-The two machines communicate through the local network.
+---
 
-The Raspberry Pi should therefore remain focused on IoT/LoRaWAN infrastructure while GardenHub handles application and data processing.
+# MQTT Simulation
+
+A ChirpStack uplink can be simulated without a broker:
+
+```bash
+docker compose exec gardenhub-api \
+  php bin/console gardenhub:mqtt:simulate \
+  a84041a1c182b3e0 \
+  '{"water_SOIL":"25.34","temp_SOIL":"21.06"}'
+```
+
+This uses the same Messenger ingestion path as a real MQTT message.
+
+---
+
+# Useful Commands
+
+## GardenHub
+
+```bash
+cd /opt/gardenhub
+```
+
+Status:
+
+```bash
+docker compose ps
+```
+
+Logs:
+
+```bash
+docker compose logs -f
+```
+
+Worker logs:
+
+```bash
+docker compose logs -f gardenhub-worker
+```
+
+Grafana logs:
+
+```bash
+docker compose logs -f gardenhub-grafana
+```
+
+Symfony information:
+
+```bash
+docker compose exec gardenhub-api php bin/console about
+```
+
+MySQL shell:
+
+```bash
+docker compose exec gardenhub-mysql \
+  sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"'
+```
+
+Measurement count:
+
+```bash
+docker compose exec -T gardenhub-mysql \
+  sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" \
+  -e "SELECT COUNT(*) AS measurements FROM measurement;"'
+```
+
+## LoRaStack
+
+```bash
+cd /opt/lorastack
+docker compose ps
+```
+
+Mosquitto logs:
+
+```bash
+docker compose logs -f mosquitto
+```
+
+Gateway Bridge logs:
+
+```bash
+docker compose logs -f chirpstack-gateway-bridge
+```
 
 ---
 
 # Persistence
 
-MySQL data must be stored using a Docker volume or another persistent storage mechanism.
-
-Destroying and recreating the Symfony container must never destroy the database.
-
-Example:
+Persistent GardenHub volumes:
 
 ```text
-Docker
-│
-├── gardenhub-nginx
-│
-├── gardenhub-api
-│
-└── gardenhub-mysql
-        │
-        └── Persistent Volume
+gardenhub-mysql-data
+gardenhub-grafana-data
 ```
 
-Database migrations will be managed using Doctrine Migrations.
+Persistent LoRaStack volumes include:
+
+```text
+iot_postgresqldata
+iot_redisdata
+iot_mosquittodata
+iot_mosquittolog
+```
+
+Do not use:
+
+```bash
+docker compose down -v
+```
+
+unless you intentionally want to remove persistent data.
 
 ---
 
-# Configuration
+# Backup Strategy
 
-Environment-specific configuration must not be hardcoded into the repository.
+The A6 uses a dedicated external ext4 SSD mounted at:
 
-Examples include:
+```text
+/mnt/backup
+```
 
-* Database credentials
-* MQTT host
-* MQTT credentials
-* API configuration
-* Application secrets
+Persistent mount is configured in `/etc/fstab`.
 
-Development configuration should use environment variables and/or an untracked `.env.local` file.
+Backup root:
 
-Secrets must never be committed to Git.
+```text
+/mnt/backup/gardenhub-server/
+```
+
+Layout:
+
+```text
+/mnt/backup/gardenhub-server/
+├── daily/
+│   └── YYYY-MM-DD/
+└── monthly/
+    └── YYYY-MM/
+```
+
+Each successful backup contains:
+
+```text
+backup-complete
+backup-info.txt
+chirpstack-postgres.sql.gz
+gardenhub-mysql.sql.gz
+gardenhub-project.tar.gz
+lorastack-config.tar.gz
+mosquitto.db
+```
+
+Backup script:
+
+```text
+/opt/scripts/backup/gardenhub-backup.sh
+```
+
+The script:
+
+- prevents concurrent runs
+- validates PostgreSQL dumps
+- briefly stops Mosquitto before copying its persistence database
+- validates MySQL dumps
+- saves LoRaStack configuration and secrets
+- saves the GardenHub project
+- creates a monthly snapshot
+- applies retention
+
+Retention:
+
+```text
+30 daily backups
+12 monthly backups
+```
+
+Systemd service:
+
+```text
+gardenhub-backup.service
+```
+
+Systemd timer:
+
+```text
+gardenhub-backup.timer
+```
+
+Schedule:
+
+```text
+03:00 UTC every day
+```
+
+Check timer:
+
+```bash
+systemctl status gardenhub-backup.timer --no-pager
+systemctl list-timers gardenhub-backup.timer
+```
+
+Check backup logs:
+
+```bash
+journalctl -u gardenhub-backup.service
+```
+
+Run manually:
+
+```bash
+sudo /opt/scripts/backup/gardenhub-backup.sh
+```
+
+---
+
+# Security
+
+GardenHub is designed as a local-only deployment.
+
+## SSH
+
+SSH is configured for key-only access.
+
+Effective settings:
+
+```text
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+```
+
+Validate:
+
+```bash
+sudo sshd -T | grep -E \
+'passwordauthentication|kbdinteractiveauthentication|permitrootlogin'
+```
+
+UFW allows SSH only from:
+
+```text
+192.168.1.0/24
+```
+
+## Host bindings
+
+Production services are bound only to the server LAN IP:
+
+```text
+192.168.1.20
+```
+
+Published services:
+
+| Port | Service | Access |
+|---|---|---|
+| `22/tcp` | SSH | LAN only through UFW |
+| `3000/tcp` | Grafana | LAN bind |
+| `8080/tcp` | ChirpStack | LAN bind |
+| `8081/tcp` | GardenHub | LAN bind |
+| `1700/udp` | Gateway Bridge | LAN bind + source restriction |
+
+MQTT `1883` is **not published on the host**.
+
+MySQL, PostgreSQL and Redis are not published.
+
+## Gateway restriction
+
+The `DOCKER-USER` firewall chain allows UDP 1700 only from the LPS8N:
+
+```text
+192.168.1.18
+```
+
+All other inbound UDP traffic to port 1700 is dropped.
+
+The rules are persisted with:
+
+```text
+iptables-persistent
+netfilter-persistent
+```
+
+Check:
+
+```bash
+sudo iptables -L DOCKER-USER -n -v --line-numbers
+```
+
+## Router
+
+There are no NAT/PAT forwarding rules from the Internet to:
+
+```text
+192.168.1.20
+```
+
+UPnP remains enabled on the router, but no UPnP mapping currently targets the GardenHub server.
+
+## Grafana
+
+Anonymous access:
+
+```text
+disabled
+```
+
+Self-registration:
+
+```text
+disabled
+```
+
+Use a strong admin password.
+
+## Secrets
+
+Production secrets belong only in untracked environment files.
+
+Never commit:
+
+- database passwords
+- MQTT credentials
+- API keys
+- Grafana credentials
+- application secrets
+
+---
+
+# Disaster Recovery
+
+A recovery should rebuild the server from source/configuration and restore persistent data from `/mnt/backup`.
+
+High-level recovery order:
+
+```text
+1. Install Ubuntu Server + Docker
+2. Restore /opt/lorastack configuration
+3. Start PostgreSQL
+4. Restore chirpstack-postgres.sql.gz
+5. Start Redis
+6. Restore mosquitto.db
+7. Start Mosquitto
+8. Start ChirpStack
+9. Start Gateway Bridge
+10. Restore /opt/gardenhub project
+11. Start MySQL
+12. Restore gardenhub-mysql.sql.gz
+13. Start GardenHub API / worker / nginx / Grafana
+14. Verify LPS8N gateway connectivity
+15. Verify SE01 uplink
+16. Verify MySQL ingestion
+17. Verify Grafana
+```
+
+Do not consider a backup valid only because files exist. A recovery test should periodically verify that the database dumps can actually be restored.
+
+---
+
+# Production Validation
+
+The current production path has been validated end-to-end:
+
+```text
+SE01-Avocado
+      │
+      ▼
+LPS8N
+      │
+      ▼
+Gateway Bridge
+      │
+      ▼
+ChirpStack
+      │
+      ▼
+Mosquitto
+      │
+      ▼
+GardenHub Worker
+      │
+      ▼
+Symfony Messenger
+      │
+      ▼
+MySQL
+      │
+      ▼
+Grafana / REST API
+```
+
+The complete stack has also been tested across a full A6 reboot:
+
+- Docker services restart automatically.
+- ChirpStack reconnects.
+- Gateway Bridge reconnects.
+- Mosquitto restores persistence.
+- GardenHub worker reconnects to MQTT.
+- MySQL data persists.
+- Grafana data persists.
+- backup SSD remounts automatically.
+- backup systemd timer remains active.
 
 ---
 
 # Development Principles
 
-GardenHub should follow these principles:
+## Local first
 
-### Local first
+The complete production system should work without cloud dependencies.
 
-The system should remain fully functional without cloud services.
+## Docker first
 
-### Docker first
+Application and infrastructure services run in containers.
 
-Application services should run inside Docker.
+## API first
 
-### API first
+The backend remains usable independently of a future frontend.
 
-The backend API should be usable independently from any frontend.
+## Modular
 
-### Modular
+LoRaWAN infrastructure and application logic remain separate projects even when deployed on the same host.
 
-IoT infrastructure, backend application and frontend should remain loosely coupled.
+## Simple
 
-### Simple
+Do not introduce infrastructure without a demonstrated need.
 
-Do not introduce infrastructure before it is required.
+## Observable
 
-### Observable
+Health checks, logs, Grafana and explicit validation commands should make troubleshooting straightforward.
 
-Logs and health checks should make troubleshooting straightforward.
+## Persistent
 
-### Persistent
+Sensor data and configuration must survive container recreation and server reboot.
 
-Sensor data must survive container recreation and machine reboots.
+## Secure by default
 
-### Extensible
+Do not expose internal databases or MQTT unless there is a concrete requirement.
 
-The architecture should support additional sensors, devices and automation without major restructuring.
+## Extensible
 
----
-
-# Initial Development Roadmap
-
-## Phase 1 — Project foundation
-
-* [x] Create GardenHub repository
-* [x] Create Docker Compose configuration
-* [x] Add Nginx web server container
-* [x] Add PHP/Symfony container
-* [x] Add MySQL 8 container
-* [x] Configure persistent MySQL storage
-* [x] Configure Symfony environment
-* [x] Verify Symfony ↔ MySQL connectivity
-
-## Phase 2 — API foundation
-
-* [x] Install API Platform
-* [x] Configure Doctrine
-* [x] Configure Doctrine Migrations
-* [x] Create initial API resource
-* [x] Verify OpenAPI/Swagger
-* [x] Test CRUD operations
-
-## Phase 3 — Domain model
-
-* [x] Design Device entity
-* [x] Design Sensor entity
-* [x] Design Measurement entity
-* [x] Define relationships
-* [x] Define validation rules
-* [x] Create database migrations
-* [x] Test persistence
-
-## Phase 4 — MQTT integration
-
-* [x] Configure MQTT connection to `lorastack-pi`
-* [x] Configure Symfony Messenger
-* [x] Consume ChirpStack MQTT messages
-* [x] Decode/normalize payloads
-* [x] Validate measurements
-* [x] Persist measurements into MySQL
-* [x] Add error handling
-* [x] Add logging
-
-## Phase 5 — API refinement
-
-* [x] Device filtering
-* [x] Sensor filtering
-* [x] Measurement filtering
-* [x] Date/time filtering
-* [x] Pagination
-* [x] API security
-* [x] API documentation
-
-## Phase 6 — Future
-
-* [x] Grafana dashboards
-* [ ] Frontend
-* [ ] Automation
-* [ ] Alerts
-* [ ] HomeKit / Apple Home integration
-* [ ] Additional IoT devices
+The platform should support additional sensors, devices, alerts and automation without a major redesign.
 
 ---
 
-# First Success Criteria
+# Next Roadmap
 
-GardenHub's first important milestone is:
+## Infrastructure
+
+- [x] A6 production server
+- [x] LoRaStack migration from Raspberry Pi
+- [x] Persistent LoRaStack data
+- [x] GardenHub deployment
+- [x] MySQL persistence
+- [x] Grafana
+- [x] MQTT ingestion
+- [x] Automated daily/monthly backups
+- [x] Reboot validation
+- [x] SSH hardening
+- [x] MQTT internal-only networking
+- [x] Gateway UDP source restriction
+- [ ] Periodic disaster-recovery restore test
+- [ ] Optional HTTPS for LAN services
+
+## Application
+
+- [x] Device / Sensor / Measurement model
+- [x] Doctrine migrations
+- [x] MQTT ingestion
+- [x] API authentication
+- [x] API filtering and pagination
+- [x] Grafana dashboard
+- [ ] Alerting
+- [ ] Telegram notifications
+- [ ] Irrigation automation
+- [ ] Additional devices
+- [ ] Frontend
+- [ ] AI-assisted analysis
+
+---
+
+# Related Project
+
+## `lorastack-pi`
+
+`lorastack-pi` remains the repository for the LoRaWAN infrastructure.
+
+Despite the historical repository name, the production LoRaStack is now deployed on the A6 under:
 
 ```text
-SE01
- │
- ▼
-LoRaWAN
- │
- ▼
-ChirpStack
- │
- ▼
-MQTT
- │
- ▼
+/opt/lorastack
+```
+
+GardenHub and LoRaStack remain separate projects with separate responsibilities:
+
+```text
+LoRaStack
+→ LoRaWAN transport, ChirpStack, MQTT
+
 GardenHub
- │
- ▼
-Symfony Messenger
- │
- ▼
-MySQL
- │
- ▼
-API Platform
- │
- ▼
-GET /api/measurements
+→ domain model, ingestion, persistence, API, dashboards, automation
 ```
-
-A real measurement generated by the SE01 should ultimately be visible through the GardenHub API.
-
-For example:
-
-```http
-GET /api/measurements
-```
-
-should return persisted sensor measurements originating from the real IoT infrastructure.
 
 ---
 
 # Project Philosophy
 
-GardenHub is intended to evolve from a simple connected-garden backend into a general-purpose local IoT platform.
+GardenHub is intended to evolve from a connected-garden backend into a general-purpose local IoT platform.
 
-The project should therefore prioritize:
+Priorities:
 
-**Reliability → Simplicity → Extensibility → Automation**
+```text
+Reliability → Simplicity → Security → Extensibility → Automation
+```
 
-rather than introducing unnecessary infrastructure at the beginning.
-
-The system should remain completely under local control and should not depend on third-party cloud IoT platforms.
-
----
-
-## Related Project
-
-### lorastack-pi
-
-`lorastack-pi` contains the Raspberry Pi-based LoRaWAN infrastructure used by GardenHub.
-
-GardenHub and `lorastack-pi` are intentionally separate projects with separate responsibilities.
+The system should remain under local control and avoid unnecessary third-party cloud dependencies.
