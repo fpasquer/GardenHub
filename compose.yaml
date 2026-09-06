@@ -36,6 +36,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID}
     # Source code is bind-mounted for development so changes apply without
     # rebuilding. Composer dependencies live inside the image; rebuild the
     # image (`docker compose up -d --build`) after changing composer.json.
@@ -80,6 +81,7 @@ services:
       MQTT_PORT: ${MQTT_PORT:-1883}
       MQTT_USERNAME: ${MQTT_USERNAME:-}
       MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID}
     # Allows reaching a service on the Docker host itself (e.g. an MQTT
     # broker exposed on the host loopback in the dev environment) via
     # the hostname host.docker.internal.
