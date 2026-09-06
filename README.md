@@ -189,6 +189,41 @@ Responsibilities:
 - auto-provision devices and sensors
 - persist measurements
 
+After every MQTT callback, the command explicitly invokes Symfony's service
+resetter. This clears Doctrine's identity map and pending unit-of-work state,
+Doctrine SQL profiling/backtraces in debug mode, and other registered resettable
+services such as buffered logging and Messenger tracing when enabled. This
+custom synchronous loop does not run Messenger's standard worker reset hooks.
+
+MQTT client failures are logged as connection failures and retried after five
+seconds. Message-processing, persistence, or cleanup failures interrupt the MQTT
+loop and return exit code 1, allowing the existing `restart: unless-stopped`
+policy to start a fresh process with a usable entity manager. The callback must
+signal failure explicitly because the MQTT library otherwise catches callback
+exceptions. A failed worker cannot remain alive indefinitely with a closed
+entity manager while passing the process-only health check.
+
+This fixes worker lifecycle reliability, **not delivery guarantees**. MQTT QoS 0
+and synchronous dispatch are unchanged. Failed uplinks are not queued or
+replayed, and earlier auto-provisioning flushes may already have committed.
+Restart the deployed worker after updating its code to load the new lifecycle.
+
+Focused regressions use the existing `gardenhub-api` image and disposable MySQL
+and MQTT services on a separate Compose network, without production data or
+credentials and without additional Composer dependencies:
+
+```bash
+docker compose -f tests/mqtt-lifecycle/compose.yaml run --rm tests
+docker compose -f tests/mqtt-lifecycle/compose.yaml down -v
+```
+
+Build the API image first if it is not available. Tests cover repeated uplinks,
+validation rejection and pending-state cleanup, SQL debug-state cleanup, real
+MySQL flush failures, nonzero worker exits, persistence in a fresh PHP process,
+cleanup failures, and distinct MQTT reconnect behavior. Each child worker has
+a 30-second timeout. They do not interrupt the deployed worker or exercise
+Docker's live restart/health transition.
+
 The worker is connected to both:
 
 ```text
