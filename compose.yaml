@@ -153,8 +153,8 @@ services:
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
       # Passed through so the provisioned MySQL datasource can use them.
       MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_USER: ${GRAFANA_MYSQL_USER}
+      MYSQL_PASSWORD: ${GRAFANA_MYSQL_PASSWORD}
     volumes:
       - gardenhub-grafana-data:/var/lib/grafana
       # Datasources and dashboard provider are provisioned at startup;
