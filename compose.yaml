@@ -6,7 +6,7 @@ services:
     container_name: gardenhub-nginx
     restart: unless-stopped
     ports:
-      - "192.168.1.20:${APP_PORT:-8080}:80"
+      - "${BIND_ADDRESS:?BIND_ADDRESS must be set}:${APP_PORT:-8080}:80"
     volumes:
       # public/ is shared read-only: nginx serves static assets and the
       # path must match the api container for SCRIPT_FILENAME resolution.
@@ -141,7 +141,7 @@ services:
     container_name: gardenhub-grafana
     restart: unless-stopped
     ports:
-      - "192.168.1.20:${GRAFANA_PORT:-3000}:3000"
+      - "${BIND_ADDRESS:?BIND_ADDRESS must be set}:${GRAFANA_PORT:-3000}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}

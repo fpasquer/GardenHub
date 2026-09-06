@@ -11,7 +11,7 @@ services:
     container_name: gardenhub-adminer
     restart: unless-stopped
     ports:
-      - "${ADMINER_PORT:-8081}:8080"
+      - "${ADMINER_PORT:-8082}:8080"
     environment:
       # Pre-fills the server field on the login form; user and password
       # are still typed manually (no credentials in the browser).
@@ -20,6 +20,10 @@ services:
       gardenhub-mysql:
         condition: service_healthy
     networks:
+      - gardenhub
+
+  gardenhub-worker:
+    networks: !override
       - gardenhub
 
 # Reference to the shared network defined in compose.yaml so the adminer
