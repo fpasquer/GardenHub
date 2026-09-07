@@ -4,12 +4,14 @@ namespace App\Command;
 
 use App\Mqtt\ChirpStackUplink;
 use PhpMqtt\Client\ConnectionSettings;
+use PhpMqtt\Client\Exceptions\MqttClientException;
 use PhpMqtt\Client\MqttClient;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\HttpKernel\DependencyInjection\ServicesResetterInterface;
 use Symfony\Component\Messenger\MessageBusInterface;
 
 /**
@@ -33,6 +35,7 @@ class MqttConsumeCommand extends Command
         private readonly string $password,
         private readonly string $clientId,
         private readonly string $topic,
+        private readonly ServicesResetterInterface $servicesResetter,
     ) {
         parent::__construct();
     }
@@ -45,19 +48,45 @@ class MqttConsumeCommand extends Command
             ->setKeepAliveInterval(60);
 
         while (true) {
+            $processingFailure = null;
+
             try {
                 $client = new MqttClient($this->host, $this->port, $this->clientId);
                 $client->connect($settings, true);
                 $this->logger->info('Connected to MQTT broker.', ['host' => $this->host, 'topic' => $this->topic]);
 
-                $client->subscribe($this->topic, $this->handleMessage(...), MqttClient::QOS_AT_MOST_ONCE);
+                $client->subscribe($this->topic, function (string $topic, string $message) use ($client, &$processingFailure): void {
+                    if (null !== $processingFailure) {
+                        return;
+                    }
+
+                    try {
+                        try {
+                            $this->handleMessage($topic, $message);
+                        } finally {
+                            $this->servicesResetter->reset();
+                        }
+                    } catch (\Throwable $e) {
+                        $processingFailure = $e;
+                        $client->interrupt();
+                    }
+                }, MqttClient::QOS_AT_MOST_ONCE);
                 // loop() returns when the connection drops; the outer
                 // while loop then reconnects after a short delay.
                 $client->loop(true);
-            } catch (\Throwable $e) {
-                $this->logger->error('MQTT connection failed, retrying in 5s.', ['message' => $e->getMessage()]);
-                sleep(5);
+            } catch (MqttClientException $e) {
+                if (null === $processingFailure) {
+                    $this->logger->error('MQTT connection failed, retrying in 5s.', ['message' => $e->getMessage()]);
+                }
             }
+
+            if (null !== $processingFailure) {
+                $this->logger->critical('Uplink processing or service reset failed; stopping MQTT worker for restart.', ['exception' => $processingFailure]);
+
+                return Command::FAILURE;
+            }
+
+            sleep(5);
         }
     }
 

@@ -45,6 +45,7 @@ services:
             $password: '%env(MQTT_PASSWORD)%'
             $clientId: '%env(MQTT_CLIENT_ID)%'
             $topic: '%env(MQTT_TOPIC)%'
+            $servicesResetter: '@services_resetter'
 
     # add more service definitions when explicit configuration is needed
     # please note that last definitions always *replace* previous ones
