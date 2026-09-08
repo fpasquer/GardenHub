@@ -26,7 +26,7 @@ services:
 
   tests:
     image: gardenhub-api
-    entrypoint: ["php", "/tests/worker-lifecycle.php"]
+    entrypoint: ["sh", "-c", "php /tests/worker-lifecycle.php && php /tests/delivery-guarantees.php"]
     environment:
       APP_ENV: dev
       APP_DEBUG: '1'

@@ -9,6 +9,7 @@ use Doctrine\ORM\Tools\SchemaTool;
 use PhpMqtt\Client\ConnectionSettings;
 use PhpMqtt\Client\MqttClient;
 use Psr\Log\AbstractLogger;
+use Symfony\Component\Config\Loader\LoaderInterface;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\NullOutput;
@@ -35,6 +36,15 @@ final class LifecycleKernel extends Kernel
     public function getLogDir(): string
     {
         return '/tmp/gardenhub-lifecycle/log';
+    }
+
+    public function registerContainerConfiguration(LoaderInterface $loader): void
+    {
+        parent::registerContainerConfiguration($loader);
+        // These scenarios assert per-callback Doctrine state and must handle
+        // ChirpStackUplink synchronously. Async delivery is tested separately
+        // in delivery-guarantees.php.
+        $loader->load('/tests/config/packages/messenger_sync.yaml');
     }
 
     protected function build(ContainerBuilder $container): void
