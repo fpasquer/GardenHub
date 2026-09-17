@@ -141,18 +141,32 @@ try {
     $connection = $entityManager->getConnection();
     check('worker_lifecycle' === $connection->getDatabase(), 'Refusing to modify a non-test database.');
 
-    // Fresh schema. The Messenger transport table is NOT created here: the
-    // Doctrine transport auto-creates it on first use, which this suite
-    // implicitly validates. (Production uses the explicit migration instead,
-    // see migrations/Version20260908195213.php.)
+    // Fresh entity schema. Note: createSchema() also creates the
+    // messenger_messages table via Symfony's Messenger Doctrine schema
+    // listener. It is dropped again right after, so the transport table is
+    // created explicitly by the production migration instead — matching
+    // messenger.yaml (auto_setup: false).
     $metadata = $entityManager->getMetadataFactory()->getAllMetadata();
     $schema = new SchemaTool($entityManager);
     $schema->dropSchema($metadata);
-    $connection->executeStatement('DROP TABLE IF EXISTS messenger_messages');
     $schema->createSchema($metadata);
+    $connection->executeStatement('DROP TABLE IF EXISTS messenger_messages');
+    $connection->executeStatement('DROP TABLE IF EXISTS doctrine_migration_versions');
 
     $application = new \Symfony\Bundle\FrameworkBundle\Console\Application($kernel);
     $application->setAutoExit(false);
+    $migrationOutput = new \Symfony\Component\Console\Output\BufferedOutput();
+    $migrationExit = $application->run(new ArrayInput([
+        'command' => 'doctrine:migrations:execute',
+        'versions' => ['DoctrineMigrations\\Version20260908195213'],
+        '--up' => true,
+        '--no-interaction' => true,
+    ]), $migrationOutput);
+    check(0 === $migrationExit, 'Messenger migration failed: '.$migrationOutput->fetch());
+    // The migration's transactional DDL implicitly commits underneath DBAL,
+    // leaving the shared connection's transaction tracking inconsistent.
+    // Reconnect before handing the connection to the Messenger transport.
+    $connection->close();
     $consume = static function (int $limit = 1) use ($application): string {
         $output = new \Symfony\Component\Console\Output\BufferedOutput();
         $application->run(new ArrayInput([

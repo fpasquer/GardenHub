@@ -6,6 +6,8 @@ framework:
             # https://symfony.com/doc/current/messenger.html#transport-configuration
             async:
                 dsn: 'doctrine://default?queue_name=async'
+                options:
+                    auto_setup: false
                 retry_strategy:
                     max_retries: 3
                     delay: 60000

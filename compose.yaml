@@ -75,7 +75,7 @@ services:
     tty: true
     command: php bin/console gardenhub:mqtt:consume
     environment:
-      APP_ENV: ${APP_ENV:-dev}
+      APP_ENV: prod
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
       MQTT_HOST: ${MQTT_HOST}
       MQTT_PORT: ${MQTT_PORT:-1883}
@@ -120,7 +120,7 @@ services:
     tty: true
     command: php bin/console messenger:consume async --time-limit=3600
     environment:
-      APP_ENV: ${APP_ENV:-dev}
+      APP_ENV: prod
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
     volumes:
       - ./api/bin:/app/bin

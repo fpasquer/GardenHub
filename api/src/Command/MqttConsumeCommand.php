@@ -3,9 +3,8 @@
 namespace App\Command;
 
 use App\Mqtt\ChirpStackUplink;
-use PhpMqtt\Client\ConnectionSettings;
+use App\Mqtt\WorkerMqttClientFactory;
 use PhpMqtt\Client\Exceptions\MqttClientException;
-use PhpMqtt\Client\MqttClient;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -43,22 +42,18 @@ class MqttConsumeCommand extends Command
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $settings = (new ConnectionSettings())
-            ->setUsername('' !== $this->username ? $this->username : null)
-            ->setPassword('' !== $this->password ? $this->password : null)
-            ->setKeepAliveInterval(60);
+        $clientFactory = new WorkerMqttClientFactory($this->host, $this->port, $this->username, $this->password);
 
         while (true) {
             $processingFailure = null;
+            $client = null;
 
             try {
-                $client = new MqttClient($this->host, $this->port, $this->clientId);
                 // Persistent session: the broker queues QoS 1 messages for this
-                // client ID while the worker is disconnected.
-                $client->connect($settings, false);
-                $this->logger->info('Connected to MQTT broker.', ['host' => $this->host, 'topic' => $this->topic]);
-
-                $client->subscribe($this->topic, function (string $topic, string $message) use ($client, &$processingFailure): void {
+                // client ID while the worker is disconnected. The factory
+                // pre-registers the subscription so messages replayed by the
+                // broker before our SUBACK still reach the callback.
+                $client = $clientFactory->create($this->clientId, $this->topic, function (string $topic, string $message) use (&$client, &$processingFailure): void {
                     if (null !== $processingFailure) {
                         return;
                     }
@@ -71,9 +66,11 @@ class MqttConsumeCommand extends Command
                         }
                     } catch (\Throwable $e) {
                         $processingFailure = $e;
-                        $client->interrupt();
+                        $client?->interrupt();
                     }
-                }, MqttClient::QOS_AT_LEAST_ONCE);
+                });
+                $this->logger->info('Connected to MQTT broker.', ['host' => $this->host, 'topic' => $this->topic]);
+
                 // loop() returns when the connection drops; the outer
                 // while loop then reconnects after a short delay.
                 $client->loop(true);
