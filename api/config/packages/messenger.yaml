@@ -13,7 +13,10 @@ framework:
                     delay: 60000
                     multiplier: 2
                     jitter: 0.1
-            failed: 'doctrine://default?queue_name=failed'
+            failed:
+                dsn: 'doctrine://default?queue_name=failed'
+                options:
+                    auto_setup: false
             sync: 'sync://'
 
         routing:
