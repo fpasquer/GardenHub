@@ -3,15 +3,15 @@
 namespace App\Command;
 
 use App\Mqtt\ChirpStackUplink;
-use PhpMqtt\Client\ConnectionSettings;
+use App\Mqtt\WorkerMqttClientFactory;
 use PhpMqtt\Client\Exceptions\MqttClientException;
-use PhpMqtt\Client\MqttClient;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\HttpKernel\DependencyInjection\ServicesResetterInterface;
+use Symfony\Component\Messenger\Exception\TransportExceptionInterface;
 use Symfony\Component\Messenger\MessageBusInterface;
 
 /**
@@ -42,20 +42,18 @@ class MqttConsumeCommand extends Command
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $settings = (new ConnectionSettings())
-            ->setUsername('' !== $this->username ? $this->username : null)
-            ->setPassword('' !== $this->password ? $this->password : null)
-            ->setKeepAliveInterval(60);
+        $clientFactory = new WorkerMqttClientFactory($this->host, $this->port, $this->username, $this->password);
 
         while (true) {
             $processingFailure = null;
+            $client = null;
 
             try {
-                $client = new MqttClient($this->host, $this->port, $this->clientId);
-                $client->connect($settings, true);
-                $this->logger->info('Connected to MQTT broker.', ['host' => $this->host, 'topic' => $this->topic]);
-
-                $client->subscribe($this->topic, function (string $topic, string $message) use ($client, &$processingFailure): void {
+                // Persistent session: the broker queues QoS 1 messages for this
+                // client ID while the worker is disconnected. The factory
+                // pre-registers the subscription so messages replayed by the
+                // broker before our SUBACK still reach the callback.
+                $client = $clientFactory->create($this->clientId, $this->topic, function (string $topic, string $message) use (&$client, &$processingFailure): void {
                     if (null !== $processingFailure) {
                         return;
                     }
@@ -68,9 +66,11 @@ class MqttConsumeCommand extends Command
                         }
                     } catch (\Throwable $e) {
                         $processingFailure = $e;
-                        $client->interrupt();
+                        $client?->interrupt();
                     }
-                }, MqttClient::QOS_AT_MOST_ONCE);
+                });
+                $this->logger->info('Connected to MQTT broker.', ['host' => $this->host, 'topic' => $this->topic]);
+
                 // loop() returns when the connection drops; the outer
                 // while loop then reconnects after a short delay.
                 $client->loop(true);
@@ -94,7 +94,11 @@ class MqttConsumeCommand extends Command
     {
         $data = json_decode($message, true);
         if (!is_array($data)) {
-            $this->logger->error('Received malformed JSON uplink.', ['topic' => $topic]);
+            $this->logger->error('Received malformed JSON uplink; discarding.', [
+                'topic' => $topic,
+                'payload_length' => strlen($message),
+                'payload_preview' => substr($message, 0, 128),
+            ]);
             return;
         }
 
@@ -121,6 +125,18 @@ class MqttConsumeCommand extends Command
             $measuredAt = new \DateTimeImmutable();
         }
 
-        $this->messageBus->dispatch(new ChirpStackUplink($devEui, $payload, $measuredAt, $deviceName));
+        try {
+            $this->messageBus->dispatch(new ChirpStackUplink($devEui, $payload, $measuredAt, $deviceName));
+        } catch (TransportExceptionInterface $e) {
+            // php-mqtt/client catches callback exceptions internally, so we
+            // must explicitly interrupt the loop to trigger reconnection.
+            // The message may be lost if the broker already sent PUBACK.
+            $this->logger->error('Failed to enqueue uplink to Messenger transport; interrupting MQTT loop for reconnect.', [
+                'topic' => $topic,
+                'devEui' => $devEui,
+                'exception' => $e->getMessage(),
+            ]);
+            throw $e;
+        }
     }
 }
