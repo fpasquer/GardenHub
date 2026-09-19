@@ -273,11 +273,15 @@ pulling new code before draining would change the code the drain consumer runs
 — so code is pulled only after the queues are empty and the drain consumer is
 stopped.
 
-**Important:** never use `docker compose exec` against a stopped service. All
-CLI steps below run in a **one-off container** (`docker compose run --rm`),
-which starts its own throwaway container using the *currently checked-out* code
-and does **not** restart the writer services (no `depends_on` startup for the
-`run` command's own profile here — verify with `--no-deps` if unsure).
+**Important:** `gardenhub-mysql` is never stopped by this procedure — only the
+writer services are — so the two mysql commands below use `docker compose exec`
+against that already-running container; never `exec` into a stopped service.
+Every other CLI step runs in a **one-off container**
+(`docker compose run --rm --no-deps`), which starts its own throwaway container
+using the *currently checked-out* code. `--no-deps` explicitly prevents Compose
+from starting that command's dependencies (e.g. `gardenhub-mysql`) as a side
+effect — it is not an optional precaution — so the writer services stay
+stopped for the whole procedure.
 
 ```bash
 # 1. Stop MQTT ingestion and HTTP write access (measurement writers).
@@ -291,9 +295,11 @@ docker compose run --rm --no-deps gardenhub-api \
 
 # 2a. If retries are scheduled in the future, fast-forward them (scoped to the
 #     async queue) and drain again until `messenger:stats` shows 0 pending.
-docker compose run --rm --no-deps gardenhub-mysql \
-  mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" \
-  -e "UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL;"
+#     Runs inside the already-running gardenhub-mysql container so the client
+#     reaches the real server (not a fresh container's empty local socket);
+#     the single-quoted sh -c defers $MYSQL_ROOT_PASSWORD/$MYSQL_DATABASE
+#     expansion to that container's own environment, not the host shell.
+docker compose exec gardenhub-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = \"async\" AND delivered_at IS NULL;"'
 docker compose run --rm --no-deps gardenhub-api \
   php bin/console messenger:consume async --time-limit=120
 
@@ -304,10 +310,8 @@ docker compose run --rm --no-deps gardenhub-api \
 docker compose run --rm --no-deps gardenhub-api \
   php bin/console messenger:failed:retry --force
 
-# 4. Verify BOTH queues are truly empty (including delivered/un-acked rows).
-docker compose run --rm --no-deps gardenhub-mysql \
-  mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" \
-  -e "SELECT queue_name, COUNT(*) AS n FROM messenger_messages GROUP BY queue_name;"
+# 4. Verify BOTH queues are truly empty (including delayed/delivered rows).
+docker compose exec gardenhub-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "SELECT queue_name, COUNT(*) AS n FROM messenger_messages GROUP BY queue_name;"'
 #    Expect: no rows for 'async' or 'failed'. If any remain, pause here.
 
 # 5. Stop the drain consumer before touching code (it is already stopped — the

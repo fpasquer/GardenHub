@@ -12,6 +12,7 @@ use Doctrine\DBAL\Driver\Middleware\AbstractDriverMiddleware;
 use Doctrine\DBAL\Driver\Middleware\AbstractStatementMiddleware;
 use Doctrine\DBAL\Driver\Result as DriverResult;
 use Doctrine\DBAL\Driver\Statement as DriverStatement;
+use Doctrine\DBAL\ParameterType;
 
 /**
  * Test-only DBAL driver middleware that deterministically injects a competing
@@ -64,18 +65,59 @@ final class CollisionConnection extends AbstractConnectionMiddleware
     {
         $statement = parent::prepare($sql);
 
-        return str_contains($sql, 'INSERT INTO measurement')
-            ? new CollisionStatement($statement)
-            : $statement;
+        if (!preg_match('/INSERT INTO measurement\s*\(([^)]+)\)/i', $sql, $matches)) {
+            return $statement;
+        }
+
+        // Column order is parsed from the SQL text itself so this stays correct
+        // if the entity mapping ever reorders the INSERT's column list.
+        $columns = array_map('trim', explode(',', $matches[1]));
+        $deduplicationIdParam = array_search('deduplication_id', $columns, true);
+        $typeParam = array_search('type', $columns, true);
+
+        if (false === $deduplicationIdParam || false === $typeParam) {
+            return $statement;
+        }
+
+        return new CollisionStatement($statement, $deduplicationIdParam + 1, $typeParam + 1);
     }
 }
 
 final class CollisionStatement extends AbstractStatementMiddleware
 {
+    /** @var array<int|string, mixed> */
+    private array $boundValues = [];
+
+    public function __construct(
+        DriverStatement $statement,
+        private readonly int $deduplicationIdParam,
+        private readonly int $typeParam,
+    ) {
+        parent::__construct($statement);
+    }
+
+    public function bindValue(int|string $param, mixed $value, ParameterType $type): void
+    {
+        $this->boundValues[$param] = $value;
+
+        parent::bindValue($param, $value, $type);
+    }
+
     public function execute(): DriverResult
     {
         $config = CollisionMiddleware::config();
-        if (null !== $config && $config->armed) {
+        // Scoped to event A's own battery insert so a differently-ordered flush
+        // (e.g. soil_temperature persisted first) can never mis-trigger this.
+        $matchesEventA = null !== $config
+            && $config->armed
+            && ($this->boundValues[$this->deduplicationIdParam] ?? null) === $config->deduplicationId
+            && ($this->boundValues[$this->typeParam] ?? null) === 'battery';
+
+        if ($matchesEventA) {
+            // Reaching this statement proves the handler's pre-check already ran
+            // (it queries before building/persisting entities) and is about to flush.
+            ScenarioRecorder::record('a_reached_flush_after_pre_check', ['deduplicationId' => $config->deduplicationId]);
+
             // Inject the conflicting (deduplicationId, battery) row via a separate
             // PDO connection, committed immediately, so the original INSERT then
             // collides with the unique (deduplication_id, type) index. The flush's
@@ -89,6 +131,7 @@ final class CollisionStatement extends AbstractStatementMiddleware
                 $config->deduplicationId
             ));
             $config->armed = false;
+            ScenarioRecorder::record('collision_row_committed', ['deduplicationId' => $config->deduplicationId, 'value' => 9.9]);
         }
 
         return parent::execute();
