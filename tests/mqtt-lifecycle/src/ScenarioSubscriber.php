@@ -20,14 +20,25 @@ use Symfony\Component\Messenger\MessageBusInterface;
  * event B on the bus so it is processed by the SAME running worker - no
  * manual EntityManager replacement, kernel reboot, or worker restart.
  *
- * A no-op unless armed via arm(), so it stays silent for every other
- * lifecycle scenario sharing this kernel's event dispatcher.
+ * Also offers an independent failure-capture mode (armFailureCapture) used
+ * by the retry-exhaustion scenario to prove, through the real consumer, that
+ * every failed attempt for a given deduplicationId was actually caused by
+ * the intended CHECK constraint rather than an unrelated error.
+ *
+ * A no-op unless armed via arm()/armFailureCapture(), so it stays silent for
+ * every other lifecycle scenario sharing this kernel's event dispatcher.
  */
 final class ScenarioSubscriber implements EventSubscriberInterface
 {
     private ?string $armedDeduplicationId = null;
     private ?array $eventBPayload = null;
     private bool $bEnqueued = false;
+
+    private ?string $captureDeduplicationId = null;
+    private int $capturedFailureCount = 0;
+    private int $capturedRetryCount = 0;
+    /** @var list<string> */
+    private array $capturedFailureMessages = [];
 
     public function __construct(
         private readonly MessageBusInterface $bus,
@@ -48,9 +59,50 @@ final class ScenarioSubscriber implements EventSubscriberInterface
         $this->eventBPayload = null;
     }
 
+    /**
+     * Starts recording, for the given deduplicationId only, every failed
+     * processing attempt's flattened exception chain plus the number of
+     * retries actually scheduled by Messenger.
+     */
+    public function armFailureCapture(string $deduplicationId): void
+    {
+        $this->captureDeduplicationId = $deduplicationId;
+        $this->capturedFailureCount = 0;
+        $this->capturedRetryCount = 0;
+        $this->capturedFailureMessages = [];
+    }
+
+    public function disarmFailureCapture(): void
+    {
+        $this->captureDeduplicationId = null;
+    }
+
+    public function capturedFailureCount(): int
+    {
+        return $this->capturedFailureCount;
+    }
+
+    public function capturedRetryCount(): int
+    {
+        return $this->capturedRetryCount;
+    }
+
+    /** @return list<string> */
+    public function capturedFailureMessages(): array
+    {
+        return $this->capturedFailureMessages;
+    }
+
     public function onMessageFailed(WorkerMessageFailedEvent $event): void
     {
-        if (null === $this->armedDeduplicationId || !$this->matches($event->getEnvelope()->getMessage(), $this->armedDeduplicationId)) {
+        $message = $event->getEnvelope()->getMessage();
+
+        if (null !== $this->captureDeduplicationId && $this->matches($message, $this->captureDeduplicationId)) {
+            ++$this->capturedFailureCount;
+            $this->capturedFailureMessages[] = implode(' | ', $this->flattenExceptionMessages($event->getThrowable()));
+        }
+
+        if (null === $this->armedDeduplicationId || !$this->matches($message, $this->armedDeduplicationId)) {
             return;
         }
 
@@ -67,9 +119,15 @@ final class ScenarioSubscriber implements EventSubscriberInterface
 
     public function onMessageRetried(WorkerMessageRetriedEvent $event): void
     {
+        $message = $event->getEnvelope()->getMessage();
+
         // Confirms Messenger actually re-sent the envelope, not just that
         // WorkerMessageFailedEvent::willRetry() was true.
-        if (null !== $this->armedDeduplicationId && $this->matches($event->getEnvelope()->getMessage(), $this->armedDeduplicationId)) {
+        if (null !== $this->captureDeduplicationId && $this->matches($message, $this->captureDeduplicationId)) {
+            ++$this->capturedRetryCount;
+        }
+
+        if (null !== $this->armedDeduplicationId && $this->matches($message, $this->armedDeduplicationId)) {
             ScenarioRecorder::record('a_retry_scheduled');
         }
     }
@@ -131,6 +189,32 @@ final class ScenarioSubscriber implements EventSubscriberInterface
         return $throwable instanceof UniqueConstraintViolationException
             || str_contains($throwable->getMessage(), 'uniq_measurement_dedup_type')
             || str_contains($throwable->getMessage(), 'Duplicate entry');
+    }
+
+    /**
+     * Flattens a (possibly HandlerFailedException-wrapped) exception chain
+     * into every message in it, so callers can grep for a specific DB
+     * constraint name without guessing which exception class carries it.
+     *
+     * @return list<string>
+     */
+    private function flattenExceptionMessages(\Throwable $throwable): array
+    {
+        if ($throwable instanceof HandlerFailedException) {
+            $messages = [];
+            foreach ($throwable->getWrappedExceptions() as $wrapped) {
+                $messages = [...$messages, ...$this->flattenExceptionMessages($wrapped)];
+            }
+
+            return $messages;
+        }
+
+        $messages = [$throwable->getMessage()];
+        if (null !== $throwable->getPrevious()) {
+            $messages = [...$messages, ...$this->flattenExceptionMessages($throwable->getPrevious())];
+        }
+
+        return $messages;
     }
 
     public static function getSubscribedEvents(): array

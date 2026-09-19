@@ -124,10 +124,10 @@ function check(bool $condition, string $message): void
     }
 }
 
-function uplink(array $payload, string $time = '2020-01-01T12:00:00Z', string $devEui = 'delivery-device', ?string $deduplicationId = null): string
+function uplink(array $payload, string $time = '2020-01-01T12:00:00Z', string $devEui = 'delivery-device', ?string $deduplicationId = null, ?string $deviceName = null): string
 {
     return json_encode([
-        'deviceInfo' => ['devEui' => $devEui, 'deviceName' => 'Delivery sensor'],
+        'deviceInfo' => ['devEui' => $devEui, 'deviceName' => $deviceName ?? 'Delivery sensor'],
         'object' => $payload,
         'time' => $time,
         'deduplicationId' => $deduplicationId ?? (string) Uuid::v4(),
@@ -274,9 +274,20 @@ try {
 
     // -----------------------------------------------------------------
     // 5. Retry exhaustion: message lands in the failed queue.
+    //    devEui/deviceName are distinct from every other scenario's device
+    //    (device.name is unique) so processing can only fail on the intended
+    //    delivery_flush_failure CHECK constraint, never on device creation.
+    //    A test-only listener captures the real consumer's per-attempt
+    //    failure, scoped to this event's own deduplicationId, so the
+    //    assertions below prove the CHECK constraint actually fired instead
+    //    of accepting any generic (or wrong-cause) failure as sufficient.
     // -----------------------------------------------------------------
     $connection->executeStatement('ALTER TABLE measurement ADD CONSTRAINT delivery_flush_failure CHECK (value <> 8888)');
-    ingest($kernel, uplink(['BatV' => 8888], devEui: 'failed-device'));
+    $exhaustionId = (string) Uuid::v4();
+    $scenarioSubscriber = $container->get('test.scenario_subscriber');
+    $scenarioSubscriber->armFailureCapture($exhaustionId);
+
+    ingest($kernel, uplink(['BatV' => 8888], devEui: 'failed-device', deduplicationId: $exhaustionId, deviceName: 'Failed sensor'));
 
     // Force every retry to be immediately available, then burn through them.
     for ($attempt = 0; $attempt < 4; ++$attempt) {
@@ -284,11 +295,23 @@ try {
         $consume();
     }
 
-    $failed = $connection->fetchAssociative("SELECT * FROM messenger_messages WHERE queue_name = 'failed'");
-    check(false !== $failed, 'After retry exhaustion the message must move to the failed queue.');
+    $scenarioSubscriber->disarmFailureCapture();
+
+    // 3 configured retries must produce exactly 4 failed attempts (1 initial
+    // + 3 retries), with a retry actually scheduled after each of the first 3.
+    check(4 === $scenarioSubscriber->capturedFailureCount(), 'Retry exhaustion must produce exactly 4 failed processing attempts for this event.');
+    check(3 === $scenarioSubscriber->capturedRetryCount(), 'Exactly 3 retries must be scheduled for this event before it is sent to the failed transport.');
+    foreach ($scenarioSubscriber->capturedFailureMessages() as $failureMessage) {
+        check(str_contains($failureMessage, 'delivery_flush_failure'), 'Every failed attempt must be caused by the delivery_flush_failure CHECK constraint (a generic DB error or a duplicate-device-name violation is not sufficient). Got: '.$failureMessage);
+    }
+
+    $failedCount = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'failed' AND body LIKE ?", ['%'.$exhaustionId.'%']);
+    check(1 === $failedCount, 'Exactly one failed-queue message must correspond to this event.');
+    $failed = $connection->fetchAssociative("SELECT * FROM messenger_messages WHERE queue_name = 'failed' AND body LIKE ?", ['%'.$exhaustionId.'%']);
     check(str_contains($failed['body'], 'failed-device'), 'The failed queue must contain the rejected uplink.');
-    check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE value = 8888'), 'A permanently failing message must not be persisted.');
-    echo "PASS failure: exhausted retries moved the message to the failed queue\n";
+    check(0 === (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'async' AND body LIKE ?", ['%'.$exhaustionId.'%']), 'No async-queue message may remain for this event.');
+    check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ?', [$exhaustionId]), 'No measurement for this event may be persisted.');
+    echo "PASS failure: exhausted retries moved the message to the failed queue via the intended CHECK constraint\n";
 
     // -----------------------------------------------------------------
     // 6. Failed messages are inspectable with messenger:failed:show.
