@@ -13,11 +13,13 @@ final readonly class ChirpStackUplink
 {
     /**
      * @param array<string, mixed> $payload Codec-decoded payload (ChirpStack "object" field)
+     * @param string $deduplicationId ChirpStack event UUID used to store each (deduplicationId, type) at most once
      */
     public function __construct(
         public string $devEui,
         public array $payload,
         public \DateTimeImmutable $measuredAt,
+        public string $deduplicationId,
         public ?string $deviceName = null,
     ) {
     }

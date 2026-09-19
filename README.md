@@ -226,14 +226,110 @@ at-least-once processing:
   non-sensitive preview; discarded without creating a Messenger message.
 - **Per-measurement validation:** invalid measurements are skipped and logged;
   valid measurements from the same uplink still persist.
-- **Duplicates:** possible after MQTT QoS 1 redelivery or Messenger retry.
-  Accepted for now; deduplication is tracked separately.
+- **Idempotent storage:** each measurement carries the ChirpStack
+  `deduplicationId` and its type, with a unique `(deduplication_id, type)`
+  index. A replayed uplink is stored **at most once per `(deduplicationId,
+  type)`**, with bounded retries. See [Idempotency](#idempotency).
 
 **External requirement:** the GardenHub-side QoS 1 subscription only buffers
 messages during worker downtime if ChirpStack publishes application events at
 QoS 1. Verify the ChirpStack MQTT integration configuration (`qos = 1`).
 Mosquitto must also run with `persistence true` and a `persistence_location`
 for session state to survive broker restarts.
+
+### Idempotency
+
+ChirpStack attaches a unique `deduplicationId` UUID to every uplink event.
+GardenHub stores it on each measurement row together with a denormalized
+measurement `type`, and enforces a database unique index on
+`(deduplication_id, type)`.
+
+Guarantee: **at most one stored row per `(deduplicationId, type)`, with bounded
+retries.** This is not exactly-once delivery — if a message exhausts its retries
+it lands in the `failed` queue and must be retried or resolved manually.
+
+How it works:
+
+- **Pre-check / top-up:** before persisting, the handler queries which of the
+  event's measurement types are already stored for this `deduplicationId` and
+  only inserts the missing ones. A fully replayed uplink therefore no-ops.
+- **Concurrent collision:** if two consumers process the same event at once and
+  both pass the pre-check, one flush hits the unique index and throws. The
+  exception is left to propagate into Messenger's bounded retry; on retry the
+  pre-check finds the committed rows and completes only the missing types.
+- **Malformed events:** an uplink with a missing or invalid `deduplicationId`
+  is logged and discarded at the MQTT boundary, same as other malformed events.
+- **API creation:** `POST /measurements` accepts a client-supplied
+  `deduplicationId` (validated as a UUID). `type` is derived from the sensor
+  server-side and is read-only over the API.
+
+### Deploying the idempotency migration
+
+The migration makes `deduplication_id`/`type` mandatory and adds the unique
+index. Queued `ChirpStackUplink` messages serialized by the old code lack
+`deduplicationId` and would crash the new handler, so they must be drained by
+the **old** code first. Because `api/src` is bind-mounted into the containers,
+pulling new code before draining would change the code the drain consumer runs
+— so code is pulled only after the queues are empty and the drain consumer is
+stopped.
+
+**Important:** `gardenhub-mysql` is never stopped by this procedure — only the
+writer services are — so the two mysql commands below use `docker compose exec`
+against that already-running container; never `exec` into a stopped service.
+Every other CLI step runs in a **one-off container**
+(`docker compose run --rm --no-deps`), which starts its own throwaway container
+using the *currently checked-out* code. `--no-deps` explicitly prevents Compose
+from starting that command's dependencies (e.g. `gardenhub-mysql`) as a side
+effect — it is not an optional precaution — so the writer services stay
+stopped for the whole procedure.
+
+```bash
+# 1. Stop MQTT ingestion and HTTP write access (measurement writers).
+docker compose stop gardenhub-worker gardenhub-consumer gardenhub-api gardenhub-nginx
+
+# 2. Drain async with the OLD code, in a one-off container, until empty.
+#    The command exits on its own once the queue is drained and the time limit
+#    elapses; --time-limit keeps it from running forever.
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:consume async --time-limit=120
+
+# 2a. If retries are scheduled in the future, fast-forward them (scoped to the
+#     async queue) and drain again until `messenger:stats` shows 0 pending.
+#     Runs inside the already-running gardenhub-mysql container so the client
+#     reaches the real server (not a fresh container's empty local socket);
+#     the single-quoted sh -c defers $MYSQL_ROOT_PASSWORD/$MYSQL_DATABASE
+#     expansion to that container's own environment, not the host shell.
+docker compose exec gardenhub-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = \"async\" AND delivered_at IS NULL;"'
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:consume async --time-limit=120
+
+# 3. Resolve failed messages with the OLD code: retry them so their
+#    measurements are stored. Do NOT failed:remove as a routine step — a failed
+#    message may hold data you still need. If a message cannot be resolved,
+#    STOP and investigate before continuing the deployment.
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:failed:retry --force
+
+# 4. Verify BOTH queues are truly empty (including delayed/delivered rows).
+docker compose exec gardenhub-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "SELECT queue_name, COUNT(*) AS n FROM messenger_messages GROUP BY queue_name;"'
+#    Expect: no rows for 'async' or 'failed'. If any remain, pause here.
+
+# 5. Stop the drain consumer before touching code (it is already stopped — the
+#    one-off containers exited). NOW pull the new code and rebuild the image.
+git pull
+docker compose build gardenhub-api
+
+# 6. Run the migration using the NEW code (writers still stopped).
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console doctrine:migrations:migrate --no-interaction
+
+# 7. Start the updated services.
+docker compose up -d gardenhub-worker gardenhub-consumer gardenhub-api gardenhub-nginx
+```
+
+Legacy rows are backfilled: `type` is copied from the owning sensor and each
+row gets a unique `deduplication_id` (random UUID), so the new index cannot
+collide on existing data. Historical duplicates are left as-is.
 
 ## `gardenhub-consumer`
 

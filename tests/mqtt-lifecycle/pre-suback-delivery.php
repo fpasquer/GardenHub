@@ -9,13 +9,16 @@ declare(strict_types=1);
  * A minimal broker stub (child process) forces the packet order on the very
  * connection used by the client under test:
  *
- *   CONNECT -> CONNACK -> SUBSCRIBE -> PUBLISH A -> SUBACK -> PUBLISH B -> PUBLISH C (other topic)
+ *   CONNECT -> CONNACK -> SUBSCRIBE -> PUBLISH A -> SUBACK -> PUBLISH B -> PUBLISH C (other topic) -> PUBLISH D
  *
  * Assertions (client side):
  *  - marker A (pre-SUBACK) is delivered exactly once
  *  - marker B (post-SUBACK) is delivered exactly once, i.e. the SUBACK-time
  *    replacement of the pre-registered subscription causes no duplicate
  *  - marker C (unrelated topic) is never delivered
+ *  - marker D (post-C, subscribed topic) is delivered exactly once; because
+ *    the client processes packets in order, receiving D proves C's packet
+ *    was already processed, making the no-C assertion meaningful.
  *
  * Without the pre-registration in WorkerMqttClientFactory, marker A is
  * acknowledged by the client library but silently dropped (the subscription
@@ -137,6 +140,9 @@ function brokerStub(): int
     writeAll($conn, "\x90\x03".pack('n', $messageId)."\x01", $deadline); // SUBACK, QoS 1 granted
     writeAll($conn, publishPacket($topic, 'marker-b', 2), $deadline);
     writeAll($conn, publishPacket(OTHER_TOPIC, 'marker-c', 3), $deadline);
+    // Final marker on the subscribed topic: receiving it client-side proves
+    // the client has already processed the packet carrying marker C.
+    writeAll($conn, publishPacket($topic, 'marker-d', 4), $deadline);
 
     // Drain client PUBACKs/DISCONNECT until the client goes away.
     while (microtime(true) < $deadline && !feof($conn)) {
@@ -162,8 +168,21 @@ function runClient(): void
         $received[] = [$topic, $message];
     });
 
+    $hasMarker = static function (string $marker) use (&$received): bool {
+        foreach ($received as $record) {
+            if ($record[1] === $marker) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    // Wait specifically for marker D (not a callback count, which an
+    // unexpected C or a duplicate A/B could also satisfy). D arriving on
+    // the subscribed topic proves C's packet was already processed.
     $deadline = microtime(true) + 5;
-    while (microtime(true) < $deadline && count($received) < 2) {
+    while (microtime(true) < $deadline && !$hasMarker('marker-d')) {
         $client->loopOnce(microtime(true), false);
     }
     $client->disconnect();
@@ -176,9 +195,11 @@ function runClient(): void
     check(1 === count($a) && TOPIC === $a[0][0], 'Pre-SUBACK PUBLISH must reach the callback exactly once.');
     $b = $deliveries('marker-b');
     check(1 === count($b) && TOPIC === $b[0][0], 'Post-SUBACK PUBLISH must reach the callback exactly once (no duplicate).');
+    $d = $deliveries('marker-d');
+    check(1 === count($d) && TOPIC === $d[0][0], 'Post-C PUBLISH on the subscribed topic must reach the callback exactly once.');
     check([] === $deliveries('marker-c'), 'PUBLISH on an unrelated topic must not reach the callback.');
 
-    echo "PASS pre-suback-delivery: pre-SUBACK delivered once, post-SUBACK delivered once, unrelated topic ignored\n";
+    echo "PASS pre-suback-delivery: pre-SUBACK delivered once, post-SUBACK delivered once, post-C delivered once, unrelated topic ignored\n";
 }
 
 try {

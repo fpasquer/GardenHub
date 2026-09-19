@@ -13,10 +13,12 @@ declare(strict_types=1);
  *  - retry exhaustion moves the message to the failed queue
  *  - a requeued message recovers once the downstream failure is gone
  *  - malformed MQTT JSON is logged and discarded (no Messenger row)
+ *  - a replayed uplink is stored at most once per (deduplicationId, type)
+ *  - a concurrent unique-constraint collision is retried, not lost
  *
  * Not covered here (by design): worker lifecycle/reset behavior
- * (worker-lifecycle.php), deduplication (finding 6), and the MQTT
- * PUBACK → durable-enqueue loss window (documented in README).
+ * (worker-lifecycle.php) and the MQTT PUBACK → durable-enqueue loss window
+ * (documented in README).
  */
 
 use App\Command\MqttConsumeCommand;
@@ -25,12 +27,27 @@ use App\Mqtt\ChirpStackUplink;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Tools\SchemaTool;
 use Psr\Log\AbstractLogger;
+use Symfony\Component\Config\Loader\LoaderInterface;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Uid\Uuid;
+use Tests\MqttLifecycle\CollisionConfig;
+use Tests\MqttLifecycle\CollisionMiddleware;
+use Tests\MqttLifecycle\ScenarioRecorder;
+use Tests\MqttLifecycle\ScenarioSubscriber;
 
 require '/app/vendor/autoload.php';
+
+// Test-only classes under /tests/src are not in the Composer autoloader.
+spl_autoload_register(static function (string $class): void {
+    $prefix = 'Tests\\MqttLifecycle\\';
+    if (str_starts_with($class, $prefix)) {
+        require '/tests/src/'.substr($class, strlen($prefix)).'.php';
+    }
+});
 
 final class DeliveryKernel extends Kernel
 {
@@ -49,11 +66,32 @@ final class DeliveryKernel extends Kernel
         return '/tmp/gardenhub-delivery/log';
     }
 
+    public function registerContainerConfiguration(LoaderInterface $loader): void
+    {
+        parent::registerContainerConfiguration($loader);
+        // Test-only: shorten the async retry delay so a forced collision is
+        // retried promptly in-process. Production retry settings are untouched.
+        $loader->load('/tests/config/packages/messenger_test_retry.yaml');
+    }
+
     protected function build(ContainerBuilder $container): void
     {
         parent::build($container);
+        // Test-only collision hook on the shared default DBAL connection (used
+        // by both the ORM entity manager and the Messenger doctrine transport).
+        // DoctrineBundle wires it into the connection via the doctrine.middleware
+        // tag; it decorates the driver through the standard Middleware::wrap().
+        $container->register('test.collision_middleware', CollisionMiddleware::class)
+            ->addTag('doctrine.middleware');
         $container->setAlias('test.messenger.default_bus', 'messenger.default_bus')->setPublic(true);
         $container->setAlias('test.services_resetter', 'services_resetter')->setPublic(true);
+
+        // Test-only Messenger hooks recording the collision scenario's exact
+        // sequence and enqueuing event B once A succeeds (see ScenarioSubscriber).
+        $container->register('test.scenario_subscriber', ScenarioSubscriber::class)
+            ->setArguments([new Reference('messenger.default_bus'), new Reference('doctrine.orm.entity_manager')])
+            ->addTag('kernel.event_subscriber')
+            ->setPublic(true);
     }
 }
 
@@ -86,12 +124,13 @@ function check(bool $condition, string $message): void
     }
 }
 
-function uplink(array $payload, string $time = '2020-01-01T12:00:00Z', string $devEui = 'delivery-device'): string
+function uplink(array $payload, string $time = '2020-01-01T12:00:00Z', string $devEui = 'delivery-device', ?string $deduplicationId = null): string
 {
     return json_encode([
         'deviceInfo' => ['devEui' => $devEui, 'deviceName' => 'Delivery sensor'],
         'object' => $payload,
         'time' => $time,
+        'deduplicationId' => $deduplicationId ?? (string) Uuid::v4(),
     ], JSON_THROW_ON_ERROR);
 }
 
@@ -270,6 +309,10 @@ try {
     $entityManager->clear();
     $schema->dropSchema($metadata);
     $schema->createSchema($metadata);
+    // The schema reset above is DDL; the shared connection can be left in an
+    // aborted transaction after scenario 5's failed flush, so reconnect before
+    // the following scenarios rely on committed reads.
+    $connection->close();
 
     ingest($kernel, uplink([
         'BatV' => 3.1,
@@ -283,7 +326,190 @@ try {
     check(2 === (int) $connection->fetchOne("SELECT COUNT(*) FROM measurement m JOIN sensor s ON s.id = m.sensor_id JOIN device d ON d.id = s.device_id WHERE d.dev_eui = 'mixed-device'"), 'Valid measurements of a mixed uplink must persist.');
     echo "PASS validation: per-measurement validation preserved over async transport\n";
 
-    echo "PASS delivery guarantees: routing, retry, failure transport, recovery, validation\n";
+    // -----------------------------------------------------------------
+    // 8. Sequential replay: the same uplink delivered twice is stored once.
+    //    The pre-check no-ops the second delivery (no exception, fast path).
+    //    Scenario 7's schema reset left the queue empty and the connection
+    //    reconnected, so the only async message is the replay one.
+    // -----------------------------------------------------------------
+    $replayId = (string) Uuid::v4();
+    // name:null keeps the placeholder device name (replay-device) so the
+    // placeholder→name upgrade cannot collide with another device's unique name.
+    $replay = json_encode([
+        'deviceInfo' => ['devEui' => 'replay-device'],
+        'object' => ['BatV' => 3.2, 'temp_SOIL' => 18.5],
+        'time' => '2020-01-01T12:00:00Z',
+        'deduplicationId' => $replayId,
+    ], JSON_THROW_ON_ERROR);
+    $replayRow = "SELECT COUNT(*) FROM measurement WHERE deduplication_id = '$replayId'";
+
+    ingest($kernel, $replay);
+    $connection->executeStatement("UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL");
+    $consume(1);
+    check(2 === (int) $connection->fetchOne($replayRow), 'First delivery must store both mapped types.');
+
+    // Re-deliver the identical raw payload (same deduplicationId).
+    ingest($kernel, $replay);
+    $connection->executeStatement("UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL");
+    $consume(1);
+
+    check(2 === (int) $connection->fetchOne($replayRow), 'A replayed uplink must not duplicate measurements.');
+    check(0 === (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'async' AND delivered_at IS NULL"), 'The replay must be acknowledged, not left queued.');
+    check(0 === (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'failed' AND body LIKE '%replay-device%'"), 'A replayed uplink must not reach the failed queue.');
+    echo "PASS replay: identical uplink stored once per (deduplicationId, type)\n";
+
+    // -----------------------------------------------------------------
+    // 9. Boundary: an uplink with a missing or invalid deduplicationId is
+    //    logged and discarded, never dispatched.
+    // -----------------------------------------------------------------
+    [$logs, $envelope] = ingest($kernel, uplink(['BatV' => 3.3], devEui: 'noid-device', deduplicationId: 'not-a-uuid'));
+    check($logs->has('warning', 'valid deduplicationId'), 'An invalid deduplicationId must be logged as a warning.');
+    check(null === $envelope, 'An uplink without a valid deduplicationId must not be dispatched.');
+
+    $noId = json_encode(['deviceInfo' => ['devEui' => 'noid-device', 'deviceName' => 'No Id'], 'object' => ['BatV' => 3.3], 'time' => '2020-01-01T12:00:00Z'], JSON_THROW_ON_ERROR);
+    [, $envelope] = ingest($kernel, $noId);
+    check(null === $envelope, 'An uplink missing deduplicationId must not be dispatched.');
+    echo "PASS boundary: missing/invalid deduplicationId logged and discarded\n";
+
+    // -----------------------------------------------------------------
+    // 10. Concurrent collision through the REAL Messenger consumer, proven by
+    //     an explicit event sequence rather than only final row counts (a
+    //     3-pass version of this scenario could pass even if the collision
+    //     never fired). A test-only DBAL middleware injects a competing
+    //     (deduplicationId, battery) row right after the handler's pre-check
+    //     and before its flush's INSERT, forcing a real unique-constraint
+    //     violation. A test-only Messenger subscriber records that sequence
+    //     (pre-check reached, row injected, flush failed, EM observed closed
+    //     before the normal WorkerRunningEvent reset, retry scheduled) and,
+    //     only once the retry succeeds, enqueues a distinct event B — all
+    //     inside ONE `messenger:consume` invocation: no manual EntityManager
+    //     replacement, kernel reboot, worker restart, or sleeps.
+    // -----------------------------------------------------------------
+    $collisionId = (string) Uuid::v4();
+
+    // Pre-create device + battery + soil_temperature sensors so the consumer
+    // resolves them and the injected row has a sensor to reference.
+    $connection->executeStatement("INSERT INTO device (name, dev_eui, created_at) VALUES ('collision-device', 'collision-device', NOW())");
+    $collisionDevice = (int) $connection->lastInsertId();
+    $connection->executeStatement('INSERT INTO sensor (device_id, type, unit, label, created_at) VALUES (?, ?, ?, ?, NOW())', [$collisionDevice, 'battery', 'V', 'BatV']);
+    $collisionSensor = (int) $connection->lastInsertId();
+    $connection->executeStatement('INSERT INTO sensor (device_id, type, unit, label, created_at) VALUES (?, ?, ?, ?, NOW())', [$collisionDevice, 'soil_temperature', '°C', 'temp_SOIL']);
+
+    // Build a PDO DSN for the middleware's injector connection.
+    $dbParts = parse_url((string) getenv('DATABASE_URL'));
+    $pdoDsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $dbParts['host'], $dbParts['port'] ?? 3306, ltrim($dbParts['path'], '/'));
+
+    // Enqueue event A through the real async transport and arm the collision.
+    // deviceName is unique to avoid the placeholder→name upgrade colliding with
+    // another device's unique name (the default helper name is already taken).
+    $collisionUplink = json_encode([
+        'deviceInfo' => ['devEui' => 'collision-device', 'deviceName' => 'Collision sensor'],
+        'object' => ['BatV' => 3.6, 'temp_SOIL' => 20.1],
+        'time' => '2020-01-01T12:00:00Z',
+        'deduplicationId' => $collisionId,
+    ], JSON_THROW_ON_ERROR);
+    ingest($kernel, $collisionUplink);
+    CollisionMiddleware::arm(new CollisionConfig($collisionSensor, $collisionId, $pdoDsn, $dbParts['user'] ?? 'root', $dbParts['pass'] ?? ''));
+
+    // Event B is intentionally NOT enqueued here: ScenarioSubscriber dispatches
+    // it itself, only once A's retry succeeds, from inside the worker run.
+    $eventB = json_encode([
+        'deviceInfo' => ['devEui' => 'collision-device'],
+        'object' => ['BatV' => 3.7],
+        'time' => '2020-01-01T12:00:00Z',
+        'deduplicationId' => (string) Uuid::v4(),
+    ], JSON_THROW_ON_ERROR);
+    $eventBId = json_decode($eventB, true, 512, JSON_THROW_ON_ERROR)['deduplicationId'];
+
+    ScenarioRecorder::reset();
+    $scenarioSubscriber = $container->get('test.scenario_subscriber');
+    $scenarioSubscriber->arm($collisionId, $eventB);
+
+    // ONE continuous invocation covers the whole sequence: A's first attempt
+    // fails (collision), the worker's own poll loop waits out the 100ms test
+    // retry delay, A's retry succeeds, then B (enqueued by ScenarioSubscriber
+    // only after A succeeds) — 3 processed attempts, bounded by --time-limit.
+    //
+    // Prior `messenger:consume` invocations earlier in this script each add a
+    // one-shot StopWorkerOnMessageLimitListener (--limit=1) to the shared
+    // event dispatcher; in this debug-mode kernel, TraceableEventDispatcher
+    // can leave those stale listeners stuck (they never get cleanly removed
+    // by ConsumeMessagesCommand's own cleanup once wrapped for profiling).
+    // A stale --limit=1 listener would stop this run after A's first (failed)
+    // attempt, before its retry is ever polled. Real workers never hit this:
+    // production runs one long-lived `messenger:consume` process, so no prior
+    // invocation's listener can ever be left behind. Strip any stale
+    // StopWorkerOnMessageLimitListener before this invocation so only our own
+    // --limit=3 listener governs it.
+    $workerRunningEvent = \Symfony\Component\Messenger\Event\WorkerRunningEvent::class;
+    $eventDispatcher = $container->get('event_dispatcher');
+    foreach ($eventDispatcher->getListeners($workerRunningEvent) as $storedListener) {
+        $target = \is_array($storedListener) ? $storedListener[0] : $storedListener;
+        if ($target instanceof \Symfony\Component\EventDispatcher\Debug\WrappedListener) {
+            $target = $target->getWrappedListener();
+            $target = \is_array($target) ? $target[0] : $target;
+        }
+        if ($target instanceof \Symfony\Component\Messenger\EventListener\StopWorkerOnMessageLimitListener) {
+            $eventDispatcher->removeListener($workerRunningEvent, $storedListener);
+        }
+    }
+
+    $consumeOutput = new \Symfony\Component\Console\Output\BufferedOutput();
+    $consumeExitCode = $application->run(new ArrayInput([
+        'command' => 'messenger:consume',
+        'receivers' => ['async'],
+        '--limit' => 3,
+        '--time-limit' => 15,
+    ]), $consumeOutput);
+
+    CollisionMiddleware::disarm();
+    $scenarioSubscriber->disarm();
+
+    check(0 === $consumeExitCode, 'messenger:consume must exit successfully. Output: '.$consumeOutput->fetch());
+
+    // The full sequence must have happened, in order. This is what makes the
+    // test fail if collision injection is ever disabled: none of these events
+    // (nor the final row values below) would be recorded, since final counts
+    // alone cannot prove the collision/retry actually occurred.
+    $sequence = [
+        'a_reached_flush_after_pre_check',
+        'collision_row_committed',
+        'a_flush_failed_unique_violation',
+        'a_em_closed_after_failed_flush',
+        'a_retry_scheduled',
+        'a_retry_succeeded',
+        'b_enqueued',
+        'b_succeeded',
+    ];
+    $indices = array_map(static fn (string $name): int => ScenarioRecorder::indexOf($name), $sequence);
+    $sortedIndices = $indices;
+    sort($sortedIndices);
+    check($indices === $sortedIndices, 'Collision scenario events must occur in the expected order. Recorded: '.implode(',', array_column(ScenarioRecorder::all(), 0)));
+
+    $injectionCount = count(array_filter(ScenarioRecorder::all(), static fn (array $entry): bool => 'collision_row_committed' === $entry[0]));
+    check(1 === $injectionCount, 'The collision row must be injected exactly once.');
+
+    // The competing row must be preserved with its exact injected value; the
+    // retry tops up only the missing type.
+    check(9.9 === (float) $connection->fetchOne('SELECT value FROM measurement WHERE deduplication_id = ? AND type = ?', [$collisionId, 'battery']), 'The competing battery row must be preserved with value 9.9.');
+    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ? AND type = ?', [$collisionId, 'battery']), 'battery must remain stored exactly once (the competing row).');
+    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ? AND type = ?', [$collisionId, 'soil_temperature']), 'soil_temperature must be topped up exactly once by the retry.');
+
+    // Event B must persist afterward in the same consumer process.
+    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ?', [$eventBId]), 'Event B must persist after the collision retry in the same consumer process.');
+
+    // No messages from this scenario remain in async or failed queues.
+    $leftAsync = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'async' AND body LIKE '%collision-device%'");
+    $leftFailed = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'failed' AND body LIKE '%collision-device%'");
+    check(0 === $leftAsync, 'No collision event may remain in the async queue.');
+    check(0 === $leftFailed, 'No collision event may reach the failed queue.');
+    echo "PASS collision: sequence proven (pre-check -> injection -> failure -> EM closed -> retry scheduled -> retry succeeded -> B enqueued -> B succeeded), exactly-once preserved\n";
+
+    echo "PASS delivery guarantees: routing, retry, failure transport, recovery, validation, replay, boundary, collision\n";
+    $kernel->shutdown();
+    exit(0);
+
+    echo "PASS delivery guarantees: routing, retry, failure transport, recovery, validation, replay, boundary, collision\n";
     $kernel->shutdown();
     exit(0);
 } catch (Throwable $exception) {

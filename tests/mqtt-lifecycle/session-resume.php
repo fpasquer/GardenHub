@@ -161,6 +161,7 @@ try {
             'deviceInfo' => ['devEui' => $marker, 'deviceName' => 'Resume sensor'],
             'object' => ['BatV' => 3.3],
             'time' => '2020-01-01T12:00:00Z',
+            'deduplicationId' => (string) \Symfony\Component\Uid\Uuid::v4(),
         ], JSON_THROW_ON_ERROR), MqttClient::QOS_AT_LEAST_ONCE);
     }
     pollUntil(static function () use ($publisher, $publisherRepository): bool {
