@@ -13,6 +13,7 @@ use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\HttpKernel\DependencyInjection\ServicesResetterInterface;
 use Symfony\Component\Messenger\Exception\TransportExceptionInterface;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Uid\Uuid;
 
 /**
  * Subscribes to ChirpStack uplink events on the lorastack-pi MQTT broker
@@ -119,6 +120,14 @@ class MqttConsumeCommand extends Command
             return;
         }
 
+        // Reject events without a valid ChirpStack deduplicationId using the
+        // same log-and-discard policy as other malformed uplinks.
+        $deduplicationId = $data['deduplicationId'] ?? null;
+        if (!is_string($deduplicationId) || !Uuid::isValid($deduplicationId)) {
+            $this->logger->warning('Uplink without valid deduplicationId ignored.', ['topic' => $topic, 'devEui' => $devEui]);
+            return;
+        }
+
         try {
             $measuredAt = isset($data['time']) ? new \DateTimeImmutable((string) $data['time']) : new \DateTimeImmutable();
         } catch (\Throwable) {
@@ -126,7 +135,7 @@ class MqttConsumeCommand extends Command
         }
 
         try {
-            $this->messageBus->dispatch(new ChirpStackUplink($devEui, $payload, $measuredAt, $deviceName));
+            $this->messageBus->dispatch(new ChirpStackUplink($devEui, $payload, $measuredAt, $deduplicationId, $deviceName));
         } catch (TransportExceptionInterface $e) {
             // php-mqtt/client catches callback exceptions internally, so we
             // must explicitly interrupt the loop to trigger reconnection.

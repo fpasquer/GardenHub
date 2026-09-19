@@ -19,6 +19,16 @@ use Symfony\Component\Validator\Validator\ValidatorInterface;
  * devEUI creates a Device, and each mapped payload field creates the
  * matching Sensor. Payload fields not present in the field map are
  * ignored, so the codec output can grow without breaking ingestion.
+ *
+ * Idempotency: each measurement carries the ChirpStack deduplicationId and
+ * its type. A per-type pre-check skips types already stored for this event and
+ * only inserts the missing ones, so a replayed uplink is stored at most once per
+ * (deduplicationId, type). A concurrent delivery that slips past the pre-check
+ * hits the unique (deduplication_id, type) index on flush; the exception is left
+ * to propagate so Messenger retries with its bounded strategy, and the retry's
+ * pre-check then no-ops. The exception is deliberately not caught here: Doctrine
+ * closes the entity manager on a failed flush and the transaction middleware
+ * flushes after the handler returns, so catch-and-ack would be unsafe.
  */
 #[AsMessageHandler]
 final class ChirpStackUplinkHandler
@@ -48,43 +58,98 @@ final class ChirpStackUplinkHandler
             $this->entityManager->flush();
         }
 
+        $existingTypes = $this->existingTypesForEvent($device, $uplink->deduplicationId);
+        $seenTypes = [];
         $stored = 0;
         foreach ($uplink->payload as $field => $rawValue) {
-            $mapping = $this->fieldMap[$field] ?? null;
-            if (null === $mapping) {
-                $this->logger->debug('Ignoring unmapped payload field.', ['devEui' => $uplink->devEui, 'field' => $field]);
-                continue;
+            if ($this->storeFieldMeasurement($uplink, $device, (string) $field, $rawValue, $existingTypes, $seenTypes)) {
+                ++$stored;
             }
-
-            if (!is_numeric($rawValue)) {
-                $this->logger->warning('Skipping non-numeric payload value.', ['devEui' => $uplink->devEui, 'field' => $field, 'value' => $rawValue]);
-                continue;
-            }
-
-            $sensor = $this->sensorRepository->findOneBy(['device' => $device, 'type' => $mapping['type']])
-                ?? $this->createSensor($device, $mapping['type'], $mapping['unit'], $field);
-
-            $measurement = (new Measurement())
-                ->setSensor($sensor)
-                ->setValue((float) $rawValue)
-                ->setMeasuredAt($uplink->measuredAt);
-
-            $violations = $this->validator->validate($measurement);
-            if (count($violations) > 0) {
-                $this->logger->error('Measurement rejected by validation.', [
-                    'devEui' => $uplink->devEui,
-                    'field' => $field,
-                    'violations' => (string) $violations,
-                ]);
-                continue;
-            }
-
-            $this->entityManager->persist($measurement);
-            ++$stored;
         }
 
         $this->entityManager->flush();
-        $this->logger->info('Uplink processed.', ['devEui' => $uplink->devEui, 'stored' => $stored]);
+        $this->logger->info('Uplink processed.', ['devEui' => $uplink->devEui, 'deduplicationId' => $uplink->deduplicationId, 'stored' => $stored]);
+    }
+
+    /**
+     * Returns the measurement types already stored for this event on this device.
+     *
+     * @return array<string, true>
+     */
+    private function existingTypesForEvent(Device $device, string $deduplicationId): array
+    {
+        $types = $this->entityManager->createQuery(
+            'SELECT DISTINCT m.type FROM App\Entity\Measurement m JOIN m.sensor s WHERE s.device = :device AND m.deduplicationId = :id'
+        )
+            ->setParameter('device', $device)
+            ->setParameter('id', $deduplicationId)
+            ->getSingleColumnResult();
+
+        return array_fill_keys($types, true);
+    }
+
+    /**
+     * Validates and persists one payload field as a measurement.
+     *
+     * @param array<string, true> $existingTypes Types already stored for this event (pre-check)
+     * @param array<string, true> $seenTypes     Types already handled in this invocation (in-event guard)
+     */
+    private function storeFieldMeasurement(
+        ChirpStackUplink $uplink,
+        Device $device,
+        string $field,
+        mixed $rawValue,
+        array $existingTypes,
+        array &$seenTypes,
+    ): bool {
+        $mapping = $this->fieldMap[$field] ?? null;
+        if (null === $mapping) {
+            $this->logger->debug('Ignoring unmapped payload field.', ['devEui' => $uplink->devEui, 'field' => $field]);
+            return false;
+        }
+        $type = $mapping['type'];
+
+        if (!is_numeric($rawValue)) {
+            $this->logger->warning('Skipping non-numeric payload value.', ['devEui' => $uplink->devEui, 'field' => $field, 'value' => $rawValue]);
+            return false;
+        }
+
+        // Already stored for this event (replay / concurrent delivery): top-up only the missing types.
+        if (isset($existingTypes[$type])) {
+            $this->logger->info('Measurement type already processed for this event; skipping.', ['devEui' => $uplink->devEui, 'deduplicationId' => $uplink->deduplicationId, 'type' => $type]);
+            return false;
+        }
+
+        // Two fields mapping to the same type within one event: first wins, so a
+        // misconfigured field map cannot collide with the unique index.
+        if (isset($seenTypes[$type])) {
+            $this->logger->warning('Duplicate measurement type in one uplink; keeping the first value.', ['devEui' => $uplink->devEui, 'field' => $field, 'type' => $type]);
+            return false;
+        }
+        $seenTypes[$type] = true;
+
+        $sensor = $this->sensorRepository->findOneBy(['device' => $device, 'type' => $type])
+            ?? $this->createSensor($device, $type, $mapping['unit'], $field);
+
+        $measurement = (new Measurement())
+            ->setSensor($sensor)
+            ->setValue((float) $rawValue)
+            ->setMeasuredAt($uplink->measuredAt)
+            ->setDeduplicationId($uplink->deduplicationId)
+            ->setType($type);
+
+        $violations = $this->validator->validate($measurement);
+        if (count($violations) > 0) {
+            $this->logger->error('Measurement rejected by validation.', [
+                'devEui' => $uplink->devEui,
+                'field' => $field,
+                'violations' => (string) $violations,
+            ]);
+            return false;
+        }
+
+        $this->entityManager->persist($measurement);
+        return true;
     }
 
     private function createDevice(string $devEui, ?string $deviceName): Device

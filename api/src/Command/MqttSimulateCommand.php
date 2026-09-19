@@ -10,6 +10,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Uid\Uuid;
 
 /**
  * Dispatches a fake ChirpStack uplink through Symfony Messenger, following
@@ -34,7 +35,8 @@ class MqttSimulateCommand extends Command
             ->addArgument('devEui', InputArgument::REQUIRED, 'Device EUI, e.g. a84041a1c182b3e0')
             ->addArgument('payload', InputArgument::REQUIRED, 'Decoded payload as JSON object, e.g. \'{"hum_SOIL":"25.34"}\'')
             ->addOption('time', null, InputOption::VALUE_REQUIRED, 'Measurement time (default: now), e.g. 2026-08-24T12:00:00+00:00')
-            ->addOption('name', null, InputOption::VALUE_REQUIRED, 'ChirpStack device name (deviceInfo.deviceName), used to name auto-provisioned devices');
+            ->addOption('name', null, InputOption::VALUE_REQUIRED, 'ChirpStack device name (deviceInfo.deviceName), used to name auto-provisioned devices')
+            ->addOption('deduplication-id', null, InputOption::VALUE_REQUIRED, 'ChirpStack deduplicationId UUID (default: a fresh random UUID); pass a fixed value to replay an event');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -58,7 +60,14 @@ class MqttSimulateCommand extends Command
         $deviceName = $input->getOption('name');
         $deviceName = is_string($deviceName) && '' !== $deviceName ? $deviceName : null;
 
-        $this->messageBus->dispatch(new ChirpStackUplink($devEui, $payload, $measuredAt, $deviceName));
+        $deduplicationId = $input->getOption('deduplication-id');
+        $deduplicationId = null !== $deduplicationId ? (string) $deduplicationId : (string) Uuid::v4();
+        if (!Uuid::isValid($deduplicationId)) {
+            $output->writeln('<error>Invalid --deduplication-id value (must be a UUID).</error>');
+            return Command::INVALID;
+        }
+
+        $this->messageBus->dispatch(new ChirpStackUplink($devEui, $payload, $measuredAt, $deduplicationId, $deviceName));
 
         $output->writeln(sprintf('<info>Uplink dispatched for device "%s".</info>', $devEui));
 

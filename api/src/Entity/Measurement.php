@@ -25,6 +25,7 @@ use Symfony\Component\Validator\Constraints as Assert;
  */
 #[ORM\Entity(repositoryClass: MeasurementRepository::class)]
 #[ORM\Index(columns: ['sensor_id', 'measured_at'], name: 'idx_measurement_sensor_measured_at')]
+#[ORM\UniqueConstraint(name: 'uniq_measurement_dedup_type', columns: ['deduplication_id', 'type'])]
 #[ApiResource(
     operations: [
         new GetCollection(),
@@ -73,6 +74,28 @@ class Measurement
     #[Groups(['measurement:read'])]
     private ?\DateTimeImmutable $createdAt = null;
 
+    /**
+     * ChirpStack uplink event UUID. Combined with the measurement type it
+     * identifies the uplink event, so a replayed event is stored at most once.
+     * Client-supplied on API creation.
+     */
+    #[ORM\Column(length: 36)]
+    #[Assert\NotBlank]
+    #[Assert\Uuid]
+    #[Groups(['measurement:read', 'measurement:write'])]
+    private ?string $deduplicationId = null;
+
+    /**
+     * Measurement type denormalized from the sensor, used by the unique
+     * (deduplicationId, type) constraint. Derived from the sensor on every
+     * write path; read-only over the API.
+     */
+    #[ORM\Column(length: 50)]
+    #[Assert\NotBlank]
+    #[Assert\Length(max: 50)]
+    #[Groups(['measurement:read'])]
+    private ?string $type = null;
+
     public function __construct()
     {
         $this->createdAt = new \DateTimeImmutable();
@@ -91,6 +114,8 @@ class Measurement
     public function setSensor(?Sensor $sensor): static
     {
         $this->sensor = $sensor;
+        // Keep the denormalized type in sync with the sensor on every write path.
+        $this->type = $sensor?->getType();
 
         return $this;
     }
@@ -122,5 +147,33 @@ class Measurement
     public function getCreatedAt(): ?\DateTimeImmutable
     {
         return $this->createdAt;
+    }
+
+    public function getDeduplicationId(): ?string
+    {
+        return $this->deduplicationId;
+    }
+
+    public function setDeduplicationId(string $deduplicationId): static
+    {
+        $this->deduplicationId = $deduplicationId;
+
+        return $this;
+    }
+
+    public function getType(): ?string
+    {
+        return $this->type;
+    }
+
+    /**
+     * Sets the type directly. Only used by the ingestion handler, which
+     * resolves it from the field map before the sensor may exist.
+     */
+    public function setType(string $type): static
+    {
+        $this->type = $type;
+
+        return $this;
     }
 }

@@ -226,14 +226,65 @@ at-least-once processing:
   non-sensitive preview; discarded without creating a Messenger message.
 - **Per-measurement validation:** invalid measurements are skipped and logged;
   valid measurements from the same uplink still persist.
-- **Duplicates:** possible after MQTT QoS 1 redelivery or Messenger retry.
-  Accepted for now; deduplication is tracked separately.
+- **Idempotent storage:** each measurement carries the ChirpStack
+  `deduplicationId` and its type, with a unique `(deduplication_id, type)`
+  index. A replayed uplink is stored **at most once per `(deduplicationId,
+  type)`**, with bounded retries. See [Idempotency](#idempotency).
 
 **External requirement:** the GardenHub-side QoS 1 subscription only buffers
 messages during worker downtime if ChirpStack publishes application events at
 QoS 1. Verify the ChirpStack MQTT integration configuration (`qos = 1`).
 Mosquitto must also run with `persistence true` and a `persistence_location`
 for session state to survive broker restarts.
+
+### Idempotency
+
+ChirpStack attaches a unique `deduplicationId` UUID to every uplink event.
+GardenHub stores it on each measurement row together with a denormalized
+measurement `type`, and enforces a database unique index on
+`(deduplication_id, type)`.
+
+Guarantee: **at most one stored row per `(deduplicationId, type)`, with bounded
+retries.** This is not exactly-once delivery — if a message exhausts its retries
+it lands in the `failed` queue and must be retried or resolved manually.
+
+How it works:
+
+- **Pre-check / top-up:** before persisting, the handler queries which of the
+  event's measurement types are already stored for this `deduplicationId` and
+  only inserts the missing ones. A fully replayed uplink therefore no-ops.
+- **Concurrent collision:** if two consumers process the same event at once and
+  both pass the pre-check, one flush hits the unique index and throws. The
+  exception is left to propagate into Messenger's bounded retry; on retry the
+  pre-check finds the committed rows and completes only the missing types.
+- **Malformed events:** an uplink with a missing or invalid `deduplicationId`
+  is logged and discarded at the MQTT boundary, same as other malformed events.
+- **API creation:** `POST /measurements` accepts a client-supplied
+  `deduplicationId` (validated as a UUID). `type` is derived from the sensor
+  server-side and is read-only over the API.
+
+### Deploying the idempotency migration
+
+The migration makes `deduplication_id`/`type` mandatory and adds the unique
+index. Queued `ChirpStackUplink` messages serialized by the old code lack
+`deduplicationId` and would crash the new handler, so drain them first:
+
+1. Stop all measurement writers: `gardenhub-worker`, `gardenhub-consumer`, and
+   the API (`gardenhub-api`/`gardenhub-nginx`).
+2. With writers stopped, drain the queues using the OLD consumer:
+   `docker compose exec gardenhub-api php bin/console messenger:consume async`
+   until empty. Fast-forward delayed retries scoped to the async queue:
+   `UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL;`
+3. Replay any `failed` messages (`messenger:failed:retry`) so their measurements
+   are stored. Do not `failed:remove` as a routine drain step — failed messages
+   may hold measurements you still need.
+4. Confirm both `async` and `failed` queues are empty, then run the migration:
+   `docker compose exec gardenhub-api php bin/console doctrine:migrations:migrate`
+5. Start the updated `gardenhub-consumer`, `gardenhub-worker`, and API.
+
+Legacy rows are backfilled: `type` is copied from the owning sensor and each
+row gets a unique `deduplication_id` (random UUID), so the new index cannot
+collide on existing data. Historical duplicates are left as-is.
 
 ## `gardenhub-consumer`
 
