@@ -267,20 +267,61 @@ How it works:
 
 The migration makes `deduplication_id`/`type` mandatory and adds the unique
 index. Queued `ChirpStackUplink` messages serialized by the old code lack
-`deduplicationId` and would crash the new handler, so drain them first:
+`deduplicationId` and would crash the new handler, so they must be drained by
+the **old** code first. Because `api/src` is bind-mounted into the containers,
+pulling new code before draining would change the code the drain consumer runs
+— so code is pulled only after the queues are empty and the drain consumer is
+stopped.
 
-1. Stop all measurement writers: `gardenhub-worker`, `gardenhub-consumer`, and
-   the API (`gardenhub-api`/`gardenhub-nginx`).
-2. With writers stopped, drain the queues using the OLD consumer:
-   `docker compose exec gardenhub-api php bin/console messenger:consume async`
-   until empty. Fast-forward delayed retries scoped to the async queue:
-   `UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL;`
-3. Replay any `failed` messages (`messenger:failed:retry`) so their measurements
-   are stored. Do not `failed:remove` as a routine drain step — failed messages
-   may hold measurements you still need.
-4. Confirm both `async` and `failed` queues are empty, then run the migration:
-   `docker compose exec gardenhub-api php bin/console doctrine:migrations:migrate`
-5. Start the updated `gardenhub-consumer`, `gardenhub-worker`, and API.
+**Important:** never use `docker compose exec` against a stopped service. All
+CLI steps below run in a **one-off container** (`docker compose run --rm`),
+which starts its own throwaway container using the *currently checked-out* code
+and does **not** restart the writer services (no `depends_on` startup for the
+`run` command's own profile here — verify with `--no-deps` if unsure).
+
+```bash
+# 1. Stop MQTT ingestion and HTTP write access (measurement writers).
+docker compose stop gardenhub-worker gardenhub-consumer gardenhub-api gardenhub-nginx
+
+# 2. Drain async with the OLD code, in a one-off container, until empty.
+#    The command exits on its own once the queue is drained and the time limit
+#    elapses; --time-limit keeps it from running forever.
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:consume async --time-limit=120
+
+# 2a. If retries are scheduled in the future, fast-forward them (scoped to the
+#     async queue) and drain again until `messenger:stats` shows 0 pending.
+docker compose run --rm --no-deps gardenhub-mysql \
+  mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" \
+  -e "UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL;"
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:consume async --time-limit=120
+
+# 3. Resolve failed messages with the OLD code: retry them so their
+#    measurements are stored. Do NOT failed:remove as a routine step — a failed
+#    message may hold data you still need. If a message cannot be resolved,
+#    STOP and investigate before continuing the deployment.
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:failed:retry --force
+
+# 4. Verify BOTH queues are truly empty (including delivered/un-acked rows).
+docker compose run --rm --no-deps gardenhub-mysql \
+  mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" \
+  -e "SELECT queue_name, COUNT(*) AS n FROM messenger_messages GROUP BY queue_name;"
+#    Expect: no rows for 'async' or 'failed'. If any remain, pause here.
+
+# 5. Stop the drain consumer before touching code (it is already stopped — the
+#    one-off containers exited). NOW pull the new code and rebuild the image.
+git pull
+docker compose build gardenhub-api
+
+# 6. Run the migration using the NEW code (writers still stopped).
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console doctrine:migrations:migrate --no-interaction
+
+# 7. Start the updated services.
+docker compose up -d gardenhub-worker gardenhub-consumer gardenhub-api gardenhub-nginx
+```
 
 Legacy rows are backfilled: `type` is copied from the owning sensor and each
 row gets a unique `deduplication_id` (random UUID), so the new index cannot

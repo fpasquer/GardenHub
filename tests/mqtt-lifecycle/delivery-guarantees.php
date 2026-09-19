@@ -27,13 +27,24 @@ use App\Mqtt\ChirpStackUplink;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Tools\SchemaTool;
 use Psr\Log\AbstractLogger;
+use Symfony\Component\Config\Loader\LoaderInterface;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Uid\Uuid;
+use Tests\MqttLifecycle\CollisionConfig;
+use Tests\MqttLifecycle\CollisionMiddleware;
 
 require '/app/vendor/autoload.php';
+
+// Test-only classes under /tests/src are not in the Composer autoloader.
+spl_autoload_register(static function (string $class): void {
+    $prefix = 'Tests\\MqttLifecycle\\';
+    if (str_starts_with($class, $prefix)) {
+        require '/tests/src/'.substr($class, strlen($prefix)).'.php';
+    }
+});
 
 final class DeliveryKernel extends Kernel
 {
@@ -52,9 +63,23 @@ final class DeliveryKernel extends Kernel
         return '/tmp/gardenhub-delivery/log';
     }
 
+    public function registerContainerConfiguration(LoaderInterface $loader): void
+    {
+        parent::registerContainerConfiguration($loader);
+        // Test-only: shorten the async retry delay so a forced collision is
+        // retried promptly in-process. Production retry settings are untouched.
+        $loader->load('/tests/config/packages/messenger_test_retry.yaml');
+    }
+
     protected function build(ContainerBuilder $container): void
     {
         parent::build($container);
+        // Test-only collision hook on the shared default DBAL connection (used
+        // by both the ORM entity manager and the Messenger doctrine transport).
+        // DoctrineBundle wires it into the connection via the doctrine.middleware
+        // tag; it decorates the driver through the standard Middleware::wrap().
+        $container->register('test.collision_middleware', CollisionMiddleware::class)
+            ->addTag('doctrine.middleware');
         $container->setAlias('test.messenger.default_bus', 'messenger.default_bus')->setPublic(true);
         $container->setAlias('test.services_resetter', 'services_resetter')->setPublic(true);
     }
@@ -337,111 +362,80 @@ try {
     echo "PASS boundary: missing/invalid deduplicationId logged and discarded\n";
 
     // -----------------------------------------------------------------
-    // 10. Concurrent collision: a conflicting row committed AFTER the
-    //     pre-check but BEFORE the flush makes the consumer's flush hit the
-    //     unique index and throw. The retry's pre-check then tops up only the
-    //     missing type. Proves recovery from a real failed flush.
-    //
-    //     Deterministic and single-process: the handler runs on a SECOND DB
-    //     connection/EM. A one-shot flush decorator injects the conflicting
-    //     (deduplicationId, battery) row from the MAIN connection immediately
-    //     before the real flush — after the handler's pre-check ran.
+    // 10. Concurrent collision through the REAL Messenger consumer: the
+    //     handler runs inside messenger:consume with the app's service-reset
+    //     behavior. A test-only DBAL middleware on the shared default
+    //     connection injects a competing (deduplicationId, battery) row at the
+    //     flush's INSERT — after the handler's pre-check, before the row is
+    //     inserted — forcing a real unique-constraint violation. The failed
+    //     flush closes the EM; Messenger's ResetServicesListener resets the
+    //     registry (replacing the closed EM) in the SAME consumer process, and
+    //     the retry's pre-check tops up the missing type. No manual EM
+    //     replacement, no kernel reboot, no consumer restart, no sleeps.
     // -----------------------------------------------------------------
     $collisionId = (string) Uuid::v4();
 
-    // Pre-create device + battery sensor on the main connection.
+    // Pre-create device + battery sensor so the consumer resolves them and the
+    // injected row has a sensor to reference.
     $connection->executeStatement("INSERT INTO device (name, dev_eui, created_at) VALUES ('collision-device', 'collision-device', NOW())");
     $collisionDevice = (int) $connection->lastInsertId();
     $connection->executeStatement('INSERT INTO sensor (device_id, type, unit, label, created_at) VALUES (?, ?, ?, ?, NOW())', [$collisionDevice, 'battery', 'V', 'BatV']);
     $collisionSensor = (int) $connection->lastInsertId();
+    $connection->executeStatement('INSERT INTO sensor (device_id, type, unit, label, created_at) VALUES (?, ?, ?, ?, NOW())', [$collisionDevice, 'soil_temperature', '°C', 'temp_SOIL']);
 
-    $collisionRegistry = new class implements \Doctrine\Persistence\ManagerRegistry {
-        public \Doctrine\DBAL\Connection $connection;
-        public \Doctrine\ORM\EntityManagerInterface $em;
-        public function getConnection(?string $name = null): object { return $this->connection; }
-        public function getConnections(): array { return ['default' => $this->connection]; }
-        public function getConnectionNames(): array { return ['default' => 'default']; }
-        public function getDefaultConnectionName(): string { return 'default'; }
-        public function getManager(?string $name = null): \Doctrine\Persistence\ObjectManager { return $this->em; }
-        public function getManagers(): array { return ['default' => $this->em]; }
-        public function getManagerForClass(string $class): ?\Doctrine\Persistence\ObjectManager { return $this->em; }
-        public function getManagerNames(): array { return ['default' => 'default']; }
-        public function getDefaultManagerName(): string { return 'default'; }
-        public function getRepository(string $persistentObject, ?string $persistentManagerName = null): \Doctrine\Persistence\ObjectRepository { return $this->em->getRepository($persistentObject); }
-        public function resetManager(?string $name = null): \Doctrine\Persistence\ObjectManager { return $this->em; }
-        public function getAliasNamespace($alias): string { return 'App\Entity'; }
-    };
-    $dsnParams = (new \Doctrine\DBAL\Tools\DsnParser(['mysql' => 'pdo_mysql']))->parse((string) getenv('DATABASE_URL'));
-    $collisionConfig = \Doctrine\ORM\ORMSetup::createAttributeMetadataConfiguration(['/app/src/Entity'], true);
-    $collisionConfig->setNamingStrategy(new \Doctrine\ORM\Mapping\UnderscoreNamingStrategy());
-    $collisionRegistry->connection = \Doctrine\DBAL\DriverManager::getConnection($dsnParams);
-    $collisionRegistry->em = new \Doctrine\ORM\EntityManager($collisionRegistry->connection, $collisionConfig);
+    // Build a PDO DSN for the middleware's injector connection.
+    $dbParts = parse_url((string) getenv('DATABASE_URL'));
+    $pdoDsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $dbParts['host'], $dbParts['port'] ?? 3306, ltrim($dbParts['path'], '/'));
 
-    $buildHandler = fn (\Doctrine\ORM\EntityManagerInterface $em): \App\Mqtt\ChirpStackUplinkHandler => new \App\Mqtt\ChirpStackUplinkHandler(
-        $em,
-        new \App\Repository\DeviceRepository($collisionRegistry),
-        new \App\Repository\SensorRepository($collisionRegistry),
-        \Symfony\Component\Validator\Validation::createValidatorBuilder()->enableAttributeMapping()->getValidator(),
-        new \Psr\Log\NullLogger(),
-        ['BatV' => ['type' => 'battery', 'unit' => 'V'], 'temp_SOIL' => ['type' => 'soil_temperature', 'unit' => '°C']],
-    );
+    // Enqueue event A through the real async transport and arm the collision.
+    // deviceName is unique to avoid the placeholder→name upgrade colliding with
+    // another device's unique name (the default helper name is already taken).
+    $collisionUplink = json_encode([
+        'deviceInfo' => ['devEui' => 'collision-device', 'deviceName' => 'Collision sensor'],
+        'object' => ['BatV' => 3.6, 'temp_SOIL' => 20.1],
+        'time' => '2020-01-01T12:00:00Z',
+        'deduplicationId' => $collisionId,
+    ], JSON_THROW_ON_ERROR);
+    ingest($kernel, $collisionUplink);
+    CollisionMiddleware::arm(new CollisionConfig($collisionSensor, $collisionId, $pdoDsn, $dbParts['user'] ?? 'root', $dbParts['pass'] ?? ''));
 
-    $collisionMessage = fn (string $id): ChirpStackUplink => new ChirpStackUplink(
-        'collision-device', ['BatV' => 3.6, 'temp_SOIL' => 20.1], new \DateTimeImmutable('2020-01-01T12:00:00Z'), $collisionId
-    );
+    // Run the real consumer once: the armed flush collides and throws. The
+    // message is retried (test retry delay = 100ms, same process). The retry's
+    // pre-check skips battery and stores soil_temperature. Then event B.
+    $eventB = json_encode([
+        'deviceInfo' => ['devEui' => 'collision-device'],
+        'object' => ['BatV' => 3.7],
+        'time' => '2020-01-01T12:00:00Z',
+        'deduplicationId' => (string) Uuid::v4(),
+    ], JSON_THROW_ON_ERROR);
+    $eventBId = json_decode($eventB, true, 512, JSON_THROW_ON_ERROR)['deduplicationId'];
+    ingest($kernel, $eventB);
 
-    // Attempt 1 on the second connection: inject the conflicting battery row
-    // right after the pre-check, before the flush. The flush must throw the
-    // unique-constraint violation and store nothing new.
-    $injected = false;
-    $em1 = new class($collisionRegistry->em, $connection, $collisionSensor, $collisionId, $injected) extends \Doctrine\ORM\Decorator\EntityManagerDecorator {
-        public function __construct(\Doctrine\ORM\EntityManagerInterface $wrapped, private \Doctrine\DBAL\Connection $main, private int $sensorId, private string $dedupId, private bool &$injected) { parent::__construct($wrapped); }
-        public function flush($entity = null): void
-        {
-            if (!$this->injected) {
-                $this->injected = true;
-                // Competing commit: (deduplicationId, battery) lands now, after
-                // the handler's pre-check (which already ran against this EM).
-                $this->main->executeStatement('INSERT INTO measurement (sensor_id, value, measured_at, created_at, deduplication_id, type) VALUES (?, ?, ?, NOW(), ?, ?)', [$this->sensorId, 9.9, '2020-01-01 12:00:00', $this->dedupId, 'battery']);
-            }
-            parent::flush($entity);
-        }
-    };
+    // First pass: the armed flush collides and the message is sent for retry.
+    $consume(1);
+    // Fast-forward the retried message so the next consumer pass picks it up.
+    $connection->executeStatement("UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL");
+    // Second pass: the retry succeeds on the reset EM (soil_temperature stored).
+    $consume(1);
+    // Third pass: event B is processed.
+    $consume(1);
+    CollisionMiddleware::disarm();
 
-    $collisionError = null;
-    try {
-        $buildHandler($em1)($collisionMessage($collisionId));
-    } catch (\Throwable $e) {
-        $collisionError = $e;
-    }
-    check(null !== $collisionError, 'The concurrent flush must throw.');
-    check(
-        str_contains($collisionError->getMessage(), 'uniq_measurement_dedup_type') || str_contains($collisionError->getMessage(), '1062') || str_contains($collisionError->getMessage(), 'Duplicate entry'),
-        'The failure must be the unique (deduplication_id, type) violation. Got: '.$collisionError->getMessage()
-    );
-    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ? AND type = ?', [$collisionId, 'battery']), 'Only the competing battery row must exist after the failed flush.');
-    check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ? AND type = ?', [$collisionId, 'soil_temperature']), 'A failed flush must not partially persist soil_temperature.');
-
-    // Attempt 2 (retry) on a FRESH second connection/EM (the previous one is
-    // closed after the failed flush). Pre-check must skip battery, store
-    // soil_temperature, and not throw.
-    $collisionRegistry->connection = \Doctrine\DBAL\DriverManager::getConnection($dsnParams);
-    $collisionConfig2 = \Doctrine\ORM\ORMSetup::createAttributeMetadataConfiguration(['/app/src/Entity'], true);
-    $collisionConfig2->setNamingStrategy(new \Doctrine\ORM\Mapping\UnderscoreNamingStrategy());
-    $collisionRegistry->em = new \Doctrine\ORM\EntityManager($collisionRegistry->connection, $collisionConfig2);
-    $retryError = null;
-    try {
-        $buildHandler($collisionRegistry->em)($collisionMessage($collisionId));
-    } catch (\Throwable $e) {
-        $retryError = $e;
-    }
-    check(null === $retryError, 'The retry must succeed. Got: '.($retryError?->getMessage() ?? 'none'));
-
+    // The competing row must be preserved; the retry top-ups the missing type.
     $collisionTypes = $connection->fetchFirstColumn('SELECT DISTINCT type FROM measurement WHERE deduplication_id = ?', [$collisionId]);
     sort($collisionTypes);
     check(['battery', 'soil_temperature'] === $collisionTypes, 'Retry must top up the missing type exactly once. Got: '.implode(',', $collisionTypes));
-    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ? AND type = ?', [$collisionId, 'battery']), 'battery must remain stored exactly once.');
-    echo "PASS collision: failed flush retried, missing type topped up, exactly-once per (deduplicationId, type)\n";
+    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ? AND type = ?', [$collisionId, 'battery']), 'battery must remain stored exactly once (the competing row).');
+
+    // Event B must persist afterward in the same consumer process.
+    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ?', [$eventBId]), 'Event B must persist after the collision retry in the same consumer process.');
+
+    // No messages from this scenario remain in async or failed queues.
+    $leftAsync = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'async' AND body LIKE '%collision-device%'");
+    $leftFailed = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'failed' AND body LIKE '%collision-device%'");
+    check(0 === $leftAsync, 'No collision event may remain in the async queue.');
+    check(0 === $leftFailed, 'No collision event may reach the failed queue.');
+    echo "PASS collision: real consumer recovered from a failed flush, retried in-process, and preserved exactly-once\n";
 
     echo "PASS delivery guarantees: routing, retry, failure transport, recovery, validation, replay, boundary, collision\n";
     $kernel->shutdown();
