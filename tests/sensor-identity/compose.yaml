@@ -1,0 +1,34 @@
+name: gardenhub-sensor-identity-tests
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_DATABASE: sensor_identity
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=TCP", "--silent"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+
+  tests:
+    image: gardenhub-api
+    entrypoint: ["sh", "-c", "php /tests/sensor-identity.php && php /tests/concurrency.php"]
+    environment:
+      APP_ENV: dev
+      APP_DEBUG: '1'
+      APP_SECRET: sensor-identity-tests-only
+      DATABASE_URL: 'mysql://root@mysql:3306/sensor_identity?serverVersion=8.4&charset=utf8mb4'
+      DEFAULT_URI: 'http://localhost'
+      CORS_ALLOW_ORIGIN: '^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$'
+      GARDENHUB_LIFECYCLE_TESTS: '1'
+    volumes:
+      - ../../api/src:/app/src:ro
+      - ../../api/config:/app/config:ro
+      - ./:/tests:ro
+    depends_on:
+      mysql:
+        condition: service_healthy

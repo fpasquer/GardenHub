@@ -5,6 +5,7 @@ namespace App\Mqtt;
 use App\Entity\Device;
 use App\Entity\Measurement;
 use App\Entity\Sensor;
+use App\Mqtt\Exception\SensorIdentityChangedException;
 use App\Repository\DeviceRepository;
 use App\Repository\SensorRepository;
 use Doctrine\ORM\EntityManagerInterface;
@@ -27,8 +28,17 @@ use Symfony\Component\Validator\Validator\ValidatorInterface;
  * hits the unique (deduplication_id, type) index on flush; the exception is left
  * to propagate so Messenger retries with its bounded strategy, and the retry's
  * pre-check then no-ops. The exception is deliberately not caught here: Doctrine
- * closes the entity manager on a failed flush and the transaction middleware
- * flushes after the handler returns, so catch-and-ack would be unsafe.
+ * closes the entity manager whenever an exception escapes storeMeasurements()'s
+ * transaction, so catch-and-ack would be unsafe.
+ *
+ * Sensor-identity race: storeMeasurements() wraps the loop and the final
+ * flush in one explicit transaction (no ambient/messenger-provided transaction
+ * exists for this handler). Each resolved sensor is re-locked and its full
+ * (device, type, unit) identity reconfirmed under that lock; a mismatch means
+ * a concurrent API update relabeled the sensor, so it throws
+ * SensorIdentityChangedException, which rolls back this uplink's transaction
+ * and lets Messenger's bounded retry_strategy redeliver the whole message for
+ * a fresh, current-data resolution.
  */
 #[AsMessageHandler]
 final class ChirpStackUplinkHandler
@@ -59,16 +69,32 @@ final class ChirpStackUplinkHandler
         }
 
         $existingTypes = $this->existingTypesForEvent($device, $uplink->deduplicationId);
-        $seenTypes = [];
-        $stored = 0;
-        foreach ($uplink->payload as $field => $rawValue) {
-            if ($this->storeFieldMeasurement($uplink, $device, (string) $field, $rawValue, $existingTypes, $seenTypes)) {
-                ++$stored;
-            }
-        }
+        $stored = $this->storeMeasurements($uplink, $device, $existingTypes);
 
-        $this->entityManager->flush();
         $this->logger->info('Uplink processed.', ['devEui' => $uplink->devEui, 'deduplicationId' => $uplink->deduplicationId, 'stored' => $stored]);
+    }
+
+    /**
+     * Stores every mapped payload field inside one transaction, so a
+     * sensor-identity lock taken while resolving a field is still held when
+     * the final flush commits.
+     *
+     * @param array<string, true> $existingTypes Types already stored for this event (pre-check)
+     */
+    private function storeMeasurements(ChirpStackUplink $uplink, Device $device, array $existingTypes): int
+    {
+        return $this->entityManager->wrapInTransaction(function () use ($uplink, $device, $existingTypes): int {
+            $seenTypes = [];
+            $stored = 0;
+            foreach ($uplink->payload as $field => $rawValue) {
+                if ($this->storeFieldMeasurement($uplink, $device, (string) $field, $rawValue, $existingTypes, $seenTypes)) {
+                    ++$stored;
+                }
+            }
+            $this->entityManager->flush();
+
+            return $stored;
+        });
     }
 
     /**
@@ -130,6 +156,7 @@ final class ChirpStackUplinkHandler
 
         $sensor = $this->sensorRepository->findOneBy(['device' => $device, 'type' => $type])
             ?? $this->createSensor($device, $type, $mapping['unit'], $field);
+        $this->assertSensorIdentityUnchanged($sensor);
 
         $measurement = (new Measurement())
             ->setSensor($sensor)
@@ -150,6 +177,32 @@ final class ChirpStackUplinkHandler
 
         $this->entityManager->persist($measurement);
         return true;
+    }
+
+    /**
+     * Locks the sensor row and reconfirms its (device, type, unit) identity
+     * still matches what was just resolved; a mismatch means a concurrent API
+     * update relabeled it after resolution but before this lock.
+     */
+    private function assertSensorIdentityUnchanged(Sensor $sensor): void
+    {
+        $expected = [
+            'device_id' => $sensor->getDevice()?->getId(),
+            'type' => $sensor->getType(),
+            'unit' => $sensor->getUnit(),
+        ];
+
+        $locked = $this->sensorRepository->lockAndFetchIdentity($sensor->getId());
+        if (null === $locked) {
+            return;
+        }
+
+        if ($locked['device_id'] !== $expected['device_id']
+            || $locked['type'] !== $expected['type']
+            || $locked['unit'] !== $expected['unit']
+        ) {
+            throw new SensorIdentityChangedException(sprintf('Sensor #%d identity changed between resolution and locking.', $sensor->getId()));
+        }
     }
 
     private function createDevice(string $devEui, ?string $deviceName): Device
