@@ -34,8 +34,9 @@ use Symfony\Component\Validator\Validator\ValidatorInterface;
  * Sensor-identity race: storeMeasurements() wraps the loop and the final
  * flush in one explicit transaction (no ambient/messenger-provided transaction
  * exists for this handler). Each resolved sensor is re-locked and its full
- * (device, type, unit) identity reconfirmed under that lock; a mismatch means
- * a concurrent API update relabeled the sensor, so it throws
+ * (device, type, unit) identity reconfirmed under that lock, both against
+ * what was just resolved and against this field's own mapped device/type/unit;
+ * a mismatch means a concurrent API update relabeled the sensor, so it throws
  * SensorIdentityChangedException, which rolls back this uplink's transaction
  * and lets Messenger's bounded retry_strategy redeliver the whole message for
  * a fresh, current-data resolution.
@@ -156,7 +157,7 @@ final class ChirpStackUplinkHandler
 
         $sensor = $this->sensorRepository->findOneBy(['device' => $device, 'type' => $type])
             ?? $this->createSensor($device, $type, $mapping['unit'], $field);
-        $this->assertSensorIdentityUnchanged($sensor);
+        $this->assertSensorIdentityCompatible($sensor, $device, $type, $mapping['unit']);
 
         $measurement = (new Measurement())
             ->setSensor($sensor)
@@ -181,10 +182,13 @@ final class ChirpStackUplinkHandler
 
     /**
      * Locks the sensor row and reconfirms its (device, type, unit) identity
-     * still matches what was just resolved; a mismatch means a concurrent API
-     * update relabeled it after resolution but before this lock.
+     * still matches what was just resolved (a concurrent API update relabeled
+     * it after resolution but before this lock), then reconfirms the locked
+     * identity is still compatible with this uplink field's own mapping (a
+     * relabel that committed before resolution would pass the check above but
+     * still silently store this measurement under the wrong type/unit).
      */
-    private function assertSensorIdentityUnchanged(Sensor $sensor): void
+    private function assertSensorIdentityCompatible(Sensor $sensor, Device $device, string $type, string $unit): void
     {
         $expected = [
             'device_id' => $sensor->getDevice()?->getId(),
@@ -202,6 +206,19 @@ final class ChirpStackUplinkHandler
             || $locked['unit'] !== $expected['unit']
         ) {
             throw new SensorIdentityChangedException(sprintf('Sensor #%d identity changed between resolution and locking.', $sensor->getId()));
+        }
+
+        if ($locked['device_id'] !== $device->getId() || $locked['type'] !== $type || $locked['unit'] !== $unit) {
+            throw new SensorIdentityChangedException(sprintf(
+                "Sensor #%d identity is incompatible with the mapped device/type/unit for this uplink field (expected device #%d type '%s' unit '%s', found device #%d type '%s' unit '%s').",
+                $sensor->getId(),
+                $device->getId(),
+                $type,
+                $unit,
+                $locked['device_id'],
+                $locked['type'],
+                $locked['unit'],
+            ));
         }
     }
 

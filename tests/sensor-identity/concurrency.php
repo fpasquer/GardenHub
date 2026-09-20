@@ -29,6 +29,7 @@ use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Uid\Uuid;
+use Tests\SensorIdentity\ExceptionCaptureListener;
 use Tests\SensorIdentity\SensorLockObserverConfig;
 use Tests\SensorIdentity\SensorLockObserverMiddleware;
 use Tests\SensorIdentity\SensorPostLoadRelabelConfig;
@@ -70,6 +71,12 @@ final class ConcurrencyKernel extends Kernel
             ->addTag('doctrine.middleware');
         $container->register('test.sensor_postload_relabeler', SensorPostLoadRelabeler::class)
             ->addTag('doctrine.event_listener', ['event' => 'postLoad']);
+        // High priority so this observes the original throwable before any
+        // other kernel.exception listener replaces it (e.g. with a rendered
+        // HttpException), which would hide the real DBAL exception chain.
+        $container->register('test.exception_capture_listener', ExceptionCaptureListener::class)
+            ->addTag('kernel.event_listener', ['event' => 'kernel.exception', 'priority' => 2048])
+            ->setPublic(true);
     }
 }
 
@@ -134,29 +141,115 @@ function pdoParts(): array
 }
 
 /**
- * Opens an independent connection and proves a concurrent lock attempt on
- * the given sensor row genuinely blocks: it must fail with a bounded
- * lock-wait timeout, not succeed immediately.
- *
- * @param array{0: string, 1: string, 2: string} $pdoParts
+ * Fails fast, with a clear cause, if this DB user cannot read the
+ * performance_schema tables the lock-wait proof below depends on - instead
+ * of a confusing timeout deep inside a scenario.
  */
-function assertLockBlocks(array $pdoParts, int $sensorId): void
+function assertLockWaitMetadataAccessible(\Doctrine\DBAL\Connection $connection): void
 {
-    [$dsn, $user, $pass] = $pdoParts;
-    $pdo = new \PDO($dsn, $user, $pass);
-    $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
-    $pdo->exec('SET SESSION innodb_lock_wait_timeout = 2');
-    $pdo->beginTransaction();
     try {
-        $pdo->prepare('SELECT id FROM sensor WHERE id = ? FOR UPDATE')->execute([$sensorId]);
-        throw new RuntimeException('Expected the concurrent lock attempt to block and time out, but it succeeded immediately.');
-    } catch (\PDOException $exception) {
-        check(str_contains($exception->getMessage(), 'Lock wait timeout exceeded'), 'Expected a lock-wait-timeout error, got: '.$exception->getMessage());
-    } finally {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
+        $connection->fetchOne('SELECT COUNT(*) FROM performance_schema.threads');
+        $connection->fetchOne('SELECT COUNT(*) FROM performance_schema.data_lock_waits');
+    } catch (\Throwable $exception) {
+        throw new RuntimeException('Test DB user cannot read performance_schema.threads/data_lock_waits, required to prove a genuine lock wait.', 0, $exception);
     }
+}
+
+/**
+ * Walks the exception chain for a genuine InnoDB lock-wait timeout, rather
+ * than trusting a generic HTTP status or searching rendered response text.
+ */
+function isLockWaitTimeout(?\Throwable $throwable): bool
+{
+    while (null !== $throwable) {
+        if ($throwable instanceof \Doctrine\DBAL\Exception\LockWaitTimeoutException) {
+            return true;
+        }
+        if ($throwable instanceof \Doctrine\DBAL\Driver\Exception && 1205 === $throwable->getCode()) {
+            return true;
+        }
+        $throwable = $throwable->getPrevious();
+    }
+
+    return false;
+}
+
+/**
+ * Bounded-polls for the writer subprocess's coordination file and returns
+ * the MySQL connection id it reports, so the caller can prove a genuine
+ * lock wait between that specific connection and its own.
+ */
+function waitForCoordinationConnectionId(string $path, float $timeoutSeconds): int
+{
+    $deadline = microtime(true) + $timeoutSeconds;
+    while (microtime(true) < $deadline) {
+        $contents = @file_get_contents($path);
+        if (false !== $contents && '' !== $contents) {
+            $decoded = json_decode($contents, true);
+            if (is_array($decoded) && isset($decoded['connectionId'])) {
+                return (int) $decoded['connectionId'];
+            }
+        }
+        usleep(20000);
+    }
+
+    throw new RuntimeException('Timed out waiting for the writer subprocess to report its connection id.');
+}
+
+/**
+ * Bounded-polls MySQL's own lock-wait metadata until it confirms the
+ * requesting connection is genuinely blocked on a lock held by the
+ * blocking connection - no timing assumption, only the engine's own state.
+ */
+function waitForLockWait(\Doctrine\DBAL\Connection $connection, int $requestingConnectionId, int $blockingConnectionId, float $timeoutSeconds): void
+{
+    $sql = 'SELECT COUNT(*) FROM performance_schema.data_lock_waits w'
+        .' JOIN performance_schema.threads rt ON rt.THREAD_ID = w.REQUESTING_THREAD_ID'
+        .' JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID'
+        .' WHERE rt.PROCESSLIST_ID = ? AND bt.PROCESSLIST_ID = ?';
+
+    $deadline = microtime(true) + $timeoutSeconds;
+    while (microtime(true) < $deadline) {
+        if ((int) $connection->fetchOne($sql, [$requestingConnectionId, $blockingConnectionId]) > 0) {
+            return;
+        }
+        usleep(20000);
+    }
+
+    throw new RuntimeException('Timed out waiting for MySQL to report a genuine lock wait between the writer and this connection.');
+}
+
+/**
+ * Bounded-polls a proc_open()'d process until it has exited, collecting its
+ * stdout/stderr non-blockingly. Does not close pipes or the process handle;
+ * the caller owns that so cleanup happens exactly once.
+ *
+ * @param resource              $process
+ * @param array<int, resource>  $pipes
+ * @return array{exitCode: int, stdout: string, stderr: string}
+ */
+function waitForProcessExit($process, array $pipes, float $timeoutSeconds): array
+{
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+    $stdout = '';
+    $stderr = '';
+
+    $deadline = microtime(true) + $timeoutSeconds;
+    do {
+        $stdout .= stream_get_contents($pipes[1]);
+        $stderr .= stream_get_contents($pipes[2]);
+        $status = proc_get_status($process);
+        if (!$status['running']) {
+            $stdout .= stream_get_contents($pipes[1]);
+            $stderr .= stream_get_contents($pipes[2]);
+
+            return ['exitCode' => $status['exitcode'], 'stdout' => $stdout, 'stderr' => $stderr];
+        }
+        usleep(20000);
+    } while (microtime(true) < $deadline);
+
+    throw new RuntimeException('Timed out waiting for the measurement-writer subprocess to exit.');
 }
 
 try {
@@ -178,6 +271,9 @@ try {
     // Bounds this connection's own lock waits so a genuinely contended
     // request fails fast (proving blocking) instead of hanging.
     $connection->executeStatement('SET SESSION innodb_lock_wait_timeout = 2');
+    assertLockWaitMetadataAccessible($connection);
+
+    $exceptionCapture = $container->get('test.exception_capture_listener');
 
     $apiKey = 'gh_test_'.bin2hex(random_bytes(16));
     $apiClient = (new ApiClient())
@@ -208,37 +304,85 @@ try {
     // Deliberately left open/uncommitted: simulates another writer (API or
     // MQTT) that already claimed this row's lock and is about to commit.
 
+    $exceptionCapture->reset();
     [$blockedResponse] = apiRequest($kernel, $apiKey, 'PATCH', $sensor1Iri, ['type' => 'temp_b'], 'application/merge-patch+json');
     check($blockedResponse->getStatusCode() >= 500, 'A Sensor update contending for a held row lock must fail (infra-level), not silently succeed or return 422. Got: '.$blockedResponse->getStatusCode());
+    check(isLockWaitTimeout($exceptionCapture->captured()), 'The blocked request must fail because of a genuine InnoDB lock-wait timeout, not an unrelated 500. Got: '.($exceptionCapture->captured()?->getMessage() ?? 'no exception captured'));
 
     $writer->commit();
 
     [$retryResponse, $retryBody] = apiRequest($kernel, $apiKey, 'PATCH', $sensor1Iri, ['type' => 'temp_b'], 'application/merge-patch+json');
     check(Response::HTTP_UNPROCESSABLE_ENTITY === $retryResponse->getStatusCode(), 'Once uncontended, the update must see the committed measurement and reject. Got: '.$retryResponse->getContent());
     check(violationPath($retryBody, 'type'), 'The rejection must be reported on the type field.');
-    echo "PASS measurement-first: a concurrent Sensor update genuinely blocks, then correctly rejects once it observes the committed measurement\n";
+
+    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ?', [$dedup1]), 'The writer\'s committed measurement must remain stored exactly once.');
+    $sensor1Row = $connection->fetchAssociative('SELECT device_id, type, unit, label FROM sensor WHERE id = ?', [$sensor1Id]);
+    check((int) $device1['id'] === (int) $sensor1Row['device_id'], 'The rejected update must not have changed the sensor\'s device.');
+    check('temp_a' === $sensor1Row['type'], 'The rejected update must not have changed the sensor\'s type.');
+    check('°C' === $sensor1Row['unit'], 'The rejected update must not have changed the sensor\'s unit.');
+    check('S1' === $sensor1Row['label'], 'The rejected update must not have changed the sensor\'s label.');
+    echo "PASS measurement-first: a concurrent Sensor update genuinely blocks on a real lock-wait timeout, then correctly rejects once it observes the committed measurement, leaving the sensor's identity untouched\n";
 
     // -----------------------------------------------------------------
-    // 2. A Sensor update holds the lock first; a concurrent lock attempt on
-    //    an independent connection genuinely blocks while it is in flight.
+    // 2. A Sensor update holds the lock first; a concurrent Measurement
+    //    writer on an independent process genuinely blocks on the same row
+    //    lock while the update is still in flight, then correctly rejects
+    //    once it observes the update it waited on.
     // -----------------------------------------------------------------
     [, $device2] = apiRequest($kernel, $apiKey, 'POST', '/api/devices', ['name' => 'Concurrency device 2', 'devEui' => 'conc-dev-2']);
     [, $sensor2] = apiRequest($kernel, $apiKey, 'POST', '/api/sensors', ['device' => $device2['@id'], 'type' => 'temp_a', 'unit' => '°C', 'label' => 'S2']);
     $sensor2Iri = $sensor2['@id'];
     $sensor2Id = (int) $sensor2['id'];
 
-    $blockProven = false;
-    SensorLockObserverMiddleware::arm(new SensorLockObserverConfig($sensor2Id, function () use ($pdoParts, $sensor2Id, &$blockProven): void {
-        assertLockBlocks($pdoParts, $sensor2Id);
-        $blockProven = true;
-    }));
+    $dedup2 = (string) Uuid::v4();
+    $coordinationFile = tempnam(sys_get_temp_dir(), 'gardenhub-writer-');
+    @unlink($coordinationFile);
+    $parentConnectionId = (int) $connection->fetchOne('SELECT CONNECTION_ID()');
 
-    [$updateResponse] = apiRequest($kernel, $apiKey, 'PATCH', $sensor2Iri, ['type' => 'temp_b'], 'application/merge-patch+json');
-    SensorLockObserverMiddleware::disarm();
+    $writerProcess = null;
+    $pipes = [];
+    try {
+        SensorLockObserverMiddleware::arm(new SensorLockObserverConfig($sensor2Id, function () use ($apiKey, $sensor2Iri, $dedup2, $coordinationFile, $connection, $parentConnectionId, &$writerProcess, &$pipes): void {
+            $opened = proc_open(
+                ['php', '/tests/src/measurement-writer.php', $apiKey, $sensor2Iri, $dedup2, $coordinationFile],
+                [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+                $pipes,
+            );
+            check(false !== $opened, 'Failed to spawn the measurement-writer subprocess.');
+            $writerProcess = $opened;
 
-    check($blockProven, 'The concurrent lock attempt must have run and proven blocking.');
-    check(Response::HTTP_OK === $updateResponse->getStatusCode(), 'The Sensor update itself must still succeed once the observer releases control. Got: '.$updateResponse->getContent());
-    echo "PASS identity-first: a concurrent lock attempt on an independent connection genuinely blocks while the Sensor update is in flight\n";
+            $writerConnectionId = waitForCoordinationConnectionId($coordinationFile, 15.0);
+            waitForLockWait($connection, $writerConnectionId, $parentConnectionId, 5.0);
+        }));
+
+        [$updateResponse] = apiRequest($kernel, $apiKey, 'PATCH', $sensor2Iri, ['type' => 'temp_b'], 'application/merge-patch+json');
+        SensorLockObserverMiddleware::disarm();
+
+        check(Response::HTTP_OK === $updateResponse->getStatusCode(), 'The Sensor update itself must still succeed once the writer\'s lock-wait is proven. Got: '.$updateResponse->getContent());
+        check(is_resource($writerProcess), 'The measurement-writer subprocess must have been spawned.');
+
+        $writerResult = waitForProcessExit($writerProcess, $pipes, 15.0);
+        check(0 === $writerResult['exitCode'], 'The measurement-writer subprocess must exit successfully. Stderr: '.$writerResult['stderr']);
+        $writerOutput = json_decode($writerResult['stdout'], true, 512, JSON_THROW_ON_ERROR);
+
+        check($writerOutput['connectionId'] === $writerOutput['connectionIdAfter'], 'The writer must use the same MySQL connection throughout its request (no reconnect), or the lock-wait proof does not apply to the request that actually ran.');
+        check(Response::HTTP_UNPROCESSABLE_ENTITY === $writerOutput['status'], 'The blocked writer must be rejected once it observes the Sensor update it waited on. Got: '.$writerOutput['body']);
+        check(violationPath(json_decode($writerOutput['body'], true), 'sensor'), 'The rejection must be reported on the sensor field.');
+        check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ?', [$dedup2]), 'No measurement may be persisted once its sensor identity changed while it waited on the lock.');
+        echo "PASS identity-first: a concurrent Measurement writer genuinely blocks on the row lock, then correctly rejects once it observes the Sensor update it waited on\n";
+    } finally {
+        SensorLockObserverMiddleware::disarm();
+        if (is_resource($writerProcess)) {
+            proc_terminate($writerProcess);
+            foreach ($pipes as $pipe) {
+                if (is_resource($pipe)) {
+                    fclose($pipe);
+                }
+            }
+            proc_close($writerProcess);
+        }
+        @unlink($coordinationFile);
+    }
 
     // -----------------------------------------------------------------
     // 3. A Measurement-create request's sensor identity changes, via a real
