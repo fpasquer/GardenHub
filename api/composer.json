@@ -31,6 +31,7 @@
         "symfony/security-bundle": "7.4.*",
         "symfony/serializer": "7.4.*",
         "symfony/twig-bundle": "7.4.*",
+        "symfony/uid": "7.4.*",
         "symfony/validator": "7.4.*",
         "symfony/yaml": "7.4.*"
     },
@@ -86,5 +87,8 @@
             "allow-contrib": false,
             "require": "7.4.*"
         }
+    },
+    "require-dev": {
+        "symfony/maker-bundle": "^1.68"
     }
 }

@@ -18,6 +18,7 @@ use Symfony\Component\HttpKernel\DependencyInjection\ServicesResetterInterface;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\TraceableMessageBus;
+use Symfony\Component\Uid\Uuid;
 
 require '/app/vendor/autoload.php';
 
@@ -81,6 +82,7 @@ function uplink(array $payload, string $time = '2020-01-01T12:00:00Z', ?string $
         'deviceInfo' => ['devEui' => 'lifecycle-device', 'deviceName' => $name],
         'object' => $payload,
         'time' => $time,
+        'deduplicationId' => (string) Uuid::v4(),
     ], JSON_THROW_ON_ERROR);
 }
 

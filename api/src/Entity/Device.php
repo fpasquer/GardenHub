@@ -19,6 +19,7 @@ use Symfony\Component\Validator\Constraints as Assert;
  */
 #[ORM\Entity(repositoryClass: DeviceRepository::class)]
 #[UniqueEntity(fields: 'name', message: 'A device with this name already exists.')]
+#[UniqueEntity(fields: 'devEui', message: 'A device with this Eui already exists.')]
 #[ApiResource(
     normalizationContext: ['groups' => ['device:read']],
     denormalizationContext: ['groups' => ['device:write']],
@@ -44,7 +45,7 @@ class Device
      * LoRaWAN device EUI, used later to map ChirpStack MQTT payloads
      * to this device. Optional until MQTT ingestion is implemented.
      */
-    #[ORM\Column(length: 32, nullable: true)]
+    #[ORM\Column(length: 32, nullable: true, unique: true)]
     #[Assert\Length(max: 32)]
     #[Groups(['device:read', 'device:write'])]
     private ?string $devEui = null;
