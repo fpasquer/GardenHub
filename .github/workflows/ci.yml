@@ -49,6 +49,18 @@ jobs:
         if: always()
         run: docker compose -f tests/sensor-identity/compose.yaml down -v
 
+      - name: Run Telegram alert tests
+        id: telegram_tests
+        if: always()
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          docker compose -f tests/telegram-alerts/compose.yaml run --rm tests
+
+      - name: Clean up Telegram alert stack
+        if: always()
+        run: docker compose -f tests/telegram-alerts/compose.yaml down -v
+
       - name: Fail if any test suite failed
         if: always()
         run: |
@@ -59,5 +71,10 @@ jobs:
 
           if [ "${{ steps.sensor_tests.outcome }}" != "success" ]; then
             echo "Sensor identity tests failed"
+            exit 1
+          fi
+
+          if [ "${{ steps.telegram_tests.outcome }}" != "success" ]; then
+            echo "Telegram alert tests failed"
             exit 1
           fi

@@ -11,11 +11,17 @@ declare(strict_types=1);
  *     (a MySQL-generated column, only created by the real migration - see
  *     Version20260921120000) blocks a concurrent first-incident INSERT for
  *     the same key, in both writer-commits and writer-rolls-back orders.
- *  2. AlertIncidentRepository::lockOpenIncident()'s own `SELECT ... FOR
- *     UPDATE` genuinely blocks a concurrent openOrAdvance() call for an
- *     already-open incident until the holder commits.
+ *  2. AlertIncidentRepository::lockOpenIncident()'s own locking refresh
+ *     (SELECT ... FOR UPDATE with hydration) genuinely blocks a concurrent
+ *     openOrAdvance() call for an already-open incident until the holder
+ *     commits.
+ *  3. Resolution landing between the advisory read and the lock: a writer
+ *     resolves an already-open incident while the main connection still
+ *     holds a pre-resolution REPEATABLE-READ snapshot; openOrAdvance() must
+ *     see the committed resolution under the lock and create a NEW incident
+ *     instead of advancing the resolved row.
  *
- * Both use a second raw PDO connection in this same process (not a
+ * All use a second raw PDO connection in this same process (not a
  * subprocess): simpler than tests/sensor-identity/concurrency.php's
  * subprocess+performance_schema technique, and sufficient here because
  * nothing needs to observe MySQL's own lock-wait metadata mid-flight.
@@ -23,8 +29,12 @@ declare(strict_types=1);
 
 use App\Alert\AlertLifecycleService;
 use App\Alert\AlertSignal;
+use App\Alert\Message\EvaluateAlertsHandler;
+use App\Alert\Message\EvaluateAlertsMessage;
+use App\Entity\AlertEvaluationProgress;
 use App\Entity\AlertIncident;
 use App\Kernel;
+use App\Repository\AlertEvaluationProgressRepository;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception\LockWaitTimeoutException;
 use Doctrine\ORM\EntityManagerInterface;
@@ -152,7 +162,9 @@ function freshServices(ManagerRegistry $registry, MessageBusInterface $bus): arr
     /** @var EntityManagerInterface $em */
     $em = $registry->resetManager();
     $repository = $em->getRepository(AlertIncident::class);
-    $service = new AlertLifecycleService($repository, $em, $bus, new MockClock('2026-01-01T00:00:00Z'), reminderIntervalSeconds: 3600);
+    /** @var AlertEvaluationProgressRepository $progressRepository */
+    $progressRepository = $em->getRepository(AlertEvaluationProgress::class);
+    $service = new AlertLifecycleService($repository, $progressRepository, $em, $bus, new MockClock('2026-01-01T00:00:00Z'), reminderIntervalSeconds: 3600);
 
     return [$em, $service];
 }
@@ -255,6 +267,87 @@ function scenarioAlreadyOpenIncidentRace(ManagerRegistry $registry, MessageBusIn
     echo "PASS already-open-incident-race: a concurrent FOR UPDATE holder genuinely blocks the retry; once committed, the retry correctly reflects both changes\n";
 }
 
+function scenarioResolutionBeforeLock(ManagerRegistry $registry, MessageBusInterface $bus): void
+{
+    $subjectKey = 'subject-resolution-before-lock';
+    [$em, $service] = freshServices($registry, $bus);
+    // confirmation_threshold=1: activates (and notifies) on the first breach.
+    $service->openOrAdvance(ALERT_TYPE, $subjectKey, new AlertSignal(breach: true, measurementId: 1), confirmationThreshold: 1, recoveryThreshold: 1);
+    $incidentId = (int) $em->getConnection()->fetchOne('SELECT id FROM alert_incident WHERE alert_type = ? AND subject_key = ?', [ALERT_TYPE, $subjectKey]);
+
+    // Pin a REPEATABLE-READ snapshot on the main connection that still shows
+    // the incident as open.
+    $connection = $em->getConnection();
+    $connection->beginTransaction();
+    $connection->fetchOne('SELECT status FROM alert_incident WHERE id = ?', [$incidentId]);
+
+    // Another transaction resolves the incident and commits: the main
+    // connection's snapshot and identity map still say "active".
+    $writer = newWriter();
+    $writer->beginTransaction();
+    $writer->prepare("UPDATE alert_incident SET status = ?, resolved_at = NOW() WHERE id = ?")->execute([AlertIncident::STATUS_RESOLVED, $incidentId]);
+    $writer->commit();
+
+    // The open incident row was created in a prior committed transaction, so
+    // its snapshot insert was already committed before this transaction
+    // started; the same holds for the progress row. openOrAdvance() must
+    // therefore reach the incident lock, discover the resolution under the
+    // lock, and open a NEW incident for this fresh breach (id 2, newer
+    // measured_at) rather than advancing the resolved row.
+    $service->openOrAdvance(ALERT_TYPE, $subjectKey, new AlertSignal(breach: true, measuredAt: new \DateTimeImmutable('2026-01-01T00:10:00Z'), measurementId: 2), confirmationThreshold: 1, recoveryThreshold: 1);
+    $connection->commit();
+
+    $rows = $connection->fetchAllAssociative('SELECT id, status, confirmation_count, last_considered_measurement_id FROM alert_incident WHERE alert_type = ? AND subject_key = ? ORDER BY id', [ALERT_TYPE, $subjectKey]);
+    check(2 === count($rows), 'A new incident must be created for the fresh breach instead of advancing the resolved row. Got: '.json_encode($rows));
+
+    $resolved = $rows[0];
+    check((int) $resolved['id'] === $incidentId && AlertIncident::STATUS_RESOLVED === $resolved['status'], 'The original incident must remain resolved.');
+    check(1 === (int) $resolved['confirmation_count'] && 1 === (int) $resolved['last_considered_measurement_id'], 'The resolved row must be untouched by the fresh signal. Got: '.json_encode($resolved));
+
+    $new = $rows[1];
+    check(AlertIncident::STATUS_ACTIVE === $new['status'], 'The fresh breach must create an ACTIVE incident (threshold 1).');
+    check(2 === (int) $new['last_considered_measurement_id'], 'The new incident must carry the fresh signal\'s measurement id.');
+
+    $notifications = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'telegram_notifications' AND body LIKE '%subject-resolution-before-lock%'");
+    check(2 === $notifications, 'Exactly two notifications (one per opened incident) must exist for this subject.');
+
+    echo "PASS resolution-before-lock: resolution landing between the advisory read and the lock yields a new incident; the resolved row stays untouched\n";
+}
+
+function scenarioReminderAfterConcurrentResolution(ManagerRegistry $registry, MessageBusInterface $bus): void
+{
+    $subjectKey = 'subject-reminder-resolution-race';
+    [$em, $service] = freshServices($registry, $bus);
+    $service->openOrAdvance(ALERT_TYPE, $subjectKey, new AlertSignal(breach: true, value: 5.0, unit: '%', measurementId: 1), confirmationThreshold: 1, recoveryThreshold: 1);
+    $incidentId = (int) $em->getConnection()->fetchOne('SELECT id FROM alert_incident WHERE alert_type = ? AND subject_key = ?', [ALERT_TYPE, $subjectKey]);
+
+    // Make the reminder due, then let the handler's findDueForReminder() read
+    // it via a transactionless snapshot (autocommit: each read sees the
+    // latest committed state at that moment).
+    $connection = $em->getConnection();
+    $connection->executeStatement('UPDATE alert_incident SET next_reminder_at = ? WHERE id = ?', ['2020-01-01 00:00:00', $incidentId]);
+
+    $repository = $em->getRepository(AlertIncident::class);
+    $due = $repository->findDueForReminder(new \DateTimeImmutable('2026-01-01T01:00:00Z'));
+    check(1 === count($due), 'The incident must be found due before the concurrent resolution lands.');
+
+    // A concurrent transaction resolves the incident after the due-read but
+    // before the handler's per-incident lock.
+    $writer = newWriter();
+    $writer->prepare("UPDATE alert_incident SET status = ?, resolved_at = NOW() WHERE id = ?")->execute([AlertIncident::STATUS_RESOLVED, $incidentId]);
+
+    $handler = new EvaluateAlertsHandler($repository, $em, $bus, new MockClock('2026-01-01T01:00:00Z'), reminderIntervalSeconds: 3600);
+    $handler(new EvaluateAlertsMessage());
+
+    $reminders = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'telegram_notifications' AND body LIKE '%reminder%' AND body LIKE '%subject-reminder-resolution-race%'");
+    check(0 === $reminders, 'No reminder may be enqueued once the incident was resolved concurrently.');
+    $row = $connection->fetchAssociative('SELECT status, next_reminder_at, last_reminder_at FROM alert_incident WHERE id = ?', [$incidentId]);
+    check(AlertIncident::STATUS_RESOLVED === $row['status'] && null === $row['last_reminder_at'], 'The resolved row must not be mutated by the reminder pass. Got: '.json_encode($row));
+    check('2020-01-01 00:00:00' === $row['next_reminder_at'], 'The resolved row\'s next_reminder_at must be untouched.');
+
+    echo "PASS reminder-after-resolution: a concurrently resolved incident gets no stale reminder and its row stays untouched\n";
+}
+
 try {
     check('1' === getenv('GARDENHUB_LIFECYCLE_TESTS'), 'Run only with the isolated test Compose file.');
     $kernel = new AlertConcurrencyKernel('dev', true);
@@ -284,8 +377,10 @@ try {
     scenarioFirstIncidentRaceWriterCommits($registry, $messageBus);
     scenarioFirstIncidentRaceWriterRollsBack($registry, $messageBus);
     scenarioAlreadyOpenIncidentRace($registry, $messageBus);
+    scenarioResolutionBeforeLock($registry, $messageBus);
+    scenarioReminderAfterConcurrentResolution($registry, $messageBus);
 
-    echo "PASS alert concurrency: unique-index backstop and lockOpenIncident() FOR UPDATE both genuinely serialize concurrent writers\n";
+    echo "PASS alert concurrency: unique-index backstop, locking refresh, resolution-under-lock and reminder recheck all genuinely serialize concurrent writers\n";
     $kernel->shutdown();
     exit(0);
 } catch (Throwable $exception) {

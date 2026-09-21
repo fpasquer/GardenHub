@@ -338,6 +338,20 @@ Legacy rows are backfilled: `type` is copied from the owning sensor and each
 row gets a unique `deduplication_id` (random UUID), so the new index cannot
 collide on existing data. Historical duplicates are left as-is.
 
+### Deploying the alert evaluation-state migration
+
+`Version20260922000000` adds `alert_evaluation_progress` and
+`alert_processed_uplink` (durable replay protection) and backfills them:
+progress comes from each subject's incident row holding its highest
+`last_considered_measurement_id` (that row's `last_measured_at` is the same
+applied signal's timestamp, so the pair is coherent); processed uplinks come
+from the measurements' distinct `deduplication_id`s. No message formats
+change, so no queue drain is required beyond the standard
+`make deploy` order (stop writers → migrate → start). Known limitation:
+uplinks that were entirely invalid or empty before this migration left no
+rows anywhere, so one duplicate invalid-reading signal per such replayed
+uplink is possible once after deploy.
+
 ## `gardenhub-consumer`
 
 Long-running Symfony command:
@@ -452,6 +466,34 @@ Failed deliveries retry per `telegram_notifications`'s retry policy
 (5 retries, 5s initial delay, 2x multiplier) before landing in the shared
 `failed` transport, inspectable the same way as MQTT ingestion failures.
 
+### Alert incident semantics
+
+- **Manual operations** (admin-only, `ROLE_API_ADMIN`):
+  `POST /api/alert_incidents/{id}/acknowledge` records who has seen the
+  incident without changing its status; `POST /api/alert_incidents/{id}/resolve`
+  requires a `resolutionReason` (1–500 chars) and applies only to an **active
+  `processing_failure`** incident — every other alert type resolves itself
+  once the underlying condition recovers.
+- **Invalid readings** are evaluated **per uplink, not per field**: any
+  physical-range rejection or non-numeric mapped field makes the whole uplink
+  one breach; an uplink with at least one newly persisted valid measurement
+  (and no invalid field) counts as exactly one recovery; empty or
+  unmapped-only payloads emit no signal. The signal is recorded once per
+  ChirpStack `deduplicationId` (`alert_processed_uplink`), so replayed
+  deliveries — including all-invalid uplinks, which store no measurements —
+  never advance counters or recreate a resolved incident.
+- **Measurement freshness**: threshold rules skip a measurement when its age
+  is greater than the rule's `max_measurement_age_seconds` (age equal to the
+  limit is still fresh) or when it is future-dated. Stale readings remain
+  stored but never open/confirm/resolve incidents.
+- **Durable replay protection**: evaluation progress
+  (`alert_evaluation_progress`, per alert type + subject) survives incident
+  resolution. A signal is skipped when its measurement id was already
+  applied, or when its `measured_at` is strictly older than the applied
+  watermark (equal timestamps apply in arrival order) — so a replayed breach
+  after resolution, or an older reading ingested late, never opens a false
+  incident.
+
 Focused regressions use the existing `gardenhub-api` image and a disposable
 MySQL service on a separate Compose network, without production data or
 credentials:
@@ -463,11 +505,14 @@ docker compose -f tests/telegram-alerts/compose.yaml down -v
 
 Build the API image first if it is not available. Tests cover Telegram
 delivery mechanics (enable/disable, message formatting/truncation, retryable
-vs. permanent HTTP failures) against a fake HTTP client, the alert lifecycle
-(confirmation/recovery staging, idempotent replay, reminder scheduling)
-against a real migrated schema, and genuine database-level concurrency
-(the `alert_incident` unique-index backstop and its `FOR UPDATE` lock) using
-a second raw connection in the same process.
+vs. permanent HTTP failures) against a fake HTTP client; the alert lifecycle
+(confirmation/recovery staging, idempotent replay, reminder scheduling);
+durable replay protection and measured-at ordering; per-uplink invalid-reading
+aggregation; clock-based threshold freshness boundaries; the acknowledge /
+resolve HTTP operations end to end; scheduler registration plus the real
+`scheduler_default` machinery; and genuine database-level concurrency (the
+`alert_incident` unique-index backstop, the locking refresh, and
+resolution/reminder races) using a second raw connection in the same process.
 
 ## `gardenhub-scheduler`
 

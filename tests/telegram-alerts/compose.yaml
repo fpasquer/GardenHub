@@ -16,12 +16,14 @@ services:
 
   tests:
     image: gardenhub-api
-    entrypoint: ["sh", "-c", "php /tests/telegram-delivery.php && php /tests/alert-lifecycle.php && php /tests/concurrency.php"]
+    entrypoint: ["sh", "-c", "php /tests/telegram-delivery.php && php /tests/alert-lifecycle.php && php /tests/replay-protection.php && php /tests/invalid-reading-aggregation.php && php /tests/threshold-freshness.php && php /tests/incident-api.php && php /tests/scheduler.php && php /tests/concurrency.php"]
     environment:
       APP_ENV: dev
       APP_DEBUG: '1'
       APP_SECRET: telegram-alerts-tests-only
       DATABASE_URL: 'mysql://root@mysql:3306/telegram_alerts?serverVersion=8.4&charset=utf8mb4'
+      DEFAULT_URI: 'http://localhost'
+      CORS_ALLOW_ORIGIN: '^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$'
       GARDENHUB_LIFECYCLE_TESTS: '1'
     volumes:
       - ../../api/src:/app/src:ro

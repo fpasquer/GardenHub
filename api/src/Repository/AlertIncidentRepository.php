@@ -4,6 +4,7 @@ namespace App\Repository;
 
 use App\Entity\AlertIncident;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Doctrine\DBAL\LockMode;
 use Doctrine\Persistence\ManagerRegistry;
 
 /**
@@ -36,6 +37,15 @@ class AlertIncidentRepository extends ServiceEntityRepository
      * There is nothing to lock before a first incident exists: the unique
      * index on the database-generated is_open column is the backstop for
      * that race (see AlertLifecycleService).
+     *
+     * The advisory findOpenIncident() snapshot may point at a row another
+     * transaction has since resolved. The locking refresh below is a current
+     * read (SELECT ... FOR UPDATE) that hydrates the latest committed state
+     * into the entity, past the REPEATABLE-READ snapshot and the identity
+     * map; the status is then re-validated under the lock. A row that turned
+     * out to be resolved yields null, so the caller re-evaluates and can
+     * open a new incident for a fresh breach (the resolved row's is_open is
+     * NULL, so the unique index allows exactly one new open incident).
      */
     public function lockOpenIncident(string $alertType, string $subjectKey): ?AlertIncident
     {
@@ -44,14 +54,12 @@ class AlertIncidentRepository extends ServiceEntityRepository
             return null;
         }
 
-        $locked = $this->getEntityManager()->getConnection()
-            ->fetchOne('SELECT id FROM alert_incident WHERE id = ? FOR UPDATE', [$incident->getId()]);
-        if (false === $locked) {
-            // Resolved/removed concurrently between the two reads above.
+        $this->getEntityManager()->refresh($incident, LockMode::PESSIMISTIC_WRITE);
+
+        if (!in_array($incident->getStatus(), [AlertIncident::STATUS_PENDING, AlertIncident::STATUS_ACTIVE], true)) {
+            // Resolved concurrently between the advisory read and the lock.
             return null;
         }
-
-        $this->getEntityManager()->refresh($incident);
 
         return $incident;
     }

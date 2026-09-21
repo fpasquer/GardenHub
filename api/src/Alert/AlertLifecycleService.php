@@ -3,7 +3,9 @@
 namespace App\Alert;
 
 use App\Alert\Message\SendTelegramNotification;
+use App\Entity\AlertEvaluationProgress;
 use App\Entity\AlertIncident;
+use App\Repository\AlertEvaluationProgressRepository;
 use App\Repository\AlertIncidentRepository;
 use Doctrine\ORM\EntityManagerInterface;
 use Psr\Clock\ClockInterface;
@@ -15,11 +17,23 @@ use Symfony\Component\Messenger\MessageBusInterface;
  * nothing about sensors, measurements or Telegram formatting; those are
  * handled by callers (ThresholdRuleEvaluator, InvalidReadingAlertService,
  * RecordProcessingFailureAlertHandler) and SendTelegramNotificationHandler.
+ *
+ * Replay/ordering protection is durable, stored in alert_evaluation_progress
+ * (not on the open incident), so it survives incident resolution and the
+ * no-open-incident periods before the first breach. For signals carrying a
+ * measurementId, a signal is skipped when its id was already applied, or
+ * when its measured_at is strictly older than the applied watermark — a
+ * reading ingested later gets a higher id, so ids alone do not establish
+ * measurement-time order. Signals with an equal measured_at are considered
+ * (same-timestamp readings apply in arrival order). Everything below —
+ * progress update, incident change and notification enqueue — commits in
+ * one transaction.
  */
 final class AlertLifecycleService
 {
     public function __construct(
         private readonly AlertIncidentRepository $incidentRepository,
+        private readonly AlertEvaluationProgressRepository $progressRepository,
         private readonly EntityManagerInterface $entityManager,
         private readonly MessageBusInterface $messageBus,
         private readonly ClockInterface $clock,
@@ -41,12 +55,16 @@ final class AlertLifecycleService
     ): void {
         $this->entityManager->wrapInTransaction(
             function () use ($alertType, $subjectKey, $signal, $confirmationThreshold, $recoveryThreshold): void {
-                $incident = $this->incidentRepository->lockOpenIncident($alertType, $subjectKey);
+                // Lock progress first: every writer takes the progress row
+                // before the incident row, so lock order is uniform.
+                $progress = $this->progressRepository->lockOrCreate($alertType, $subjectKey);
 
-                if (null !== $incident && $this->alreadyConsidered($incident, $signal)) {
+                if ($this->alreadyConsidered($progress, $signal)) {
                     return;
                 }
+                $this->recordProgress($progress, $signal);
 
+                $incident = $this->incidentRepository->lockOpenIncident($alertType, $subjectKey);
                 if (null === $incident) {
                     if ($signal->breach) {
                         $this->create($alertType, $subjectKey, $confirmationThreshold, $signal);
@@ -62,10 +80,29 @@ final class AlertLifecycleService
         );
     }
 
-    private function alreadyConsidered(AlertIncident $incident, AlertSignal $signal): bool
+    private function alreadyConsidered(AlertEvaluationProgress $progress, AlertSignal $signal): bool
     {
-        return null !== $signal->measurementId
-            && $signal->measurementId <= ($incident->getLastConsideredMeasurementId() ?? 0);
+        if (null === $signal->measurementId) {
+            return false;
+        }
+
+        if ($signal->measurementId <= ($progress->getLastConsideredMeasurementId() ?? 0)) {
+            return true;
+        }
+
+        $watermark = $progress->getLastConsideredMeasuredAt();
+
+        return null !== $signal->measuredAt && null !== $watermark && $signal->measuredAt < $watermark;
+    }
+
+    private function recordProgress(AlertEvaluationProgress $progress, AlertSignal $signal): void
+    {
+        if (null === $signal->measurementId) {
+            return;
+        }
+
+        $progress->recordConsidered($signal->measurementId, $signal->measuredAt, $this->clock->now());
+        $this->entityManager->flush();
     }
 
     private function create(string $alertType, string $subjectKey, int $confirmationThreshold, AlertSignal $signal): void

@@ -11,6 +11,7 @@ use App\Entity\Measurement;
 use App\Entity\Sensor;
 use App\Mqtt\Exception\SensorIdentityChangedException;
 use App\Repository\DeviceRepository;
+use App\Repository\ProcessedUplinkRepository;
 use App\Repository\SensorRepository;
 use App\Validator\AssertPhysicalRange;
 use Doctrine\ORM\EntityManagerInterface;
@@ -38,6 +39,15 @@ use Symfony\Component\Validator\Validator\ValidatorInterface;
  * closes the entity manager whenever an exception escapes storeMeasurements()'s
  * transaction, so catch-and-ack would be unsafe.
  *
+ * Invalid-reading alert evaluation is per uplink, not per field: all field
+ * outcomes are aggregated, then at most one device-level signal is emitted
+ * (any physical-range rejection or non-numeric mapped field makes the whole
+ * uplink a breach; otherwise a newly persisted measurement makes it a
+ * recovery). The signal is gated by alert_processed_uplink (keyed on the
+ * deduplicationId), so a replayed delivery — including one persisting only
+ * previously-rejected readings, which have no measurement rows — never
+ * advances counters or recreates a resolved incident.
+ *
  * Sensor-identity race: storeMeasurements() wraps the loop and the final
  * flush in one explicit transaction (no ambient/messenger-provided transaction
  * exists for this handler). Each resolved sensor is re-locked and its full
@@ -63,6 +73,7 @@ final class ChirpStackUplinkHandler
         private readonly MessageBusInterface $messageBus,
         private readonly InvalidReadingAlertService $invalidReadingAlertService,
         private readonly AlertLifecycleService $alertLifecycleService,
+        private readonly ProcessedUplinkRepository $processedUplinkRepository,
         private readonly array $fieldMap,
         private readonly int $processingFailureConfirmationCount,
         private readonly int $processingFailureRecoveryCount,
@@ -104,26 +115,65 @@ final class ChirpStackUplinkHandler
      * the final flush commits. Alert evaluation for the newly stored
      * measurements is dispatched after the flush (so their ids are known)
      * but still inside this same transaction, giving it the same
-     * all-or-nothing durability as the measurements themselves.
+     * all-or-nothing durability as the measurements themselves; the
+     * per-uplink invalid-reading signal is aggregated and emitted the same
+     * way.
      *
      * @param array<string, true> $existingTypes Types already stored for this event (pre-check)
      */
     private function storeMeasurements(ChirpStackUplink $uplink, Device $device, array $existingTypes): int
     {
         return $this->entityManager->wrapInTransaction(function () use ($uplink, $device, $existingTypes): int {
+            $rejectionReasons = [];
+            $nonNumericFields = [];
             $seenTypes = [];
             $persisted = [];
             foreach ($uplink->payload as $field => $rawValue) {
-                $measurement = $this->storeFieldMeasurement($uplink, $device, (string) $field, $rawValue, $existingTypes, $seenTypes);
+                $measurement = $this->storeFieldMeasurement($uplink, $device, (string) $field, $rawValue, $existingTypes, $seenTypes, $rejectionReasons, $nonNumericFields);
                 if (null !== $measurement) {
                     $persisted[] = $measurement;
                 }
             }
             $this->entityManager->flush();
             $this->dispatchEvaluation($persisted);
+            $this->emitInvalidReadingSignal($uplink, $device, $rejectionReasons, $nonNumericFields, $persisted);
 
             return count($persisted);
         });
+    }
+
+    /**
+     * Emits at most one device-level invalid-reading signal for this uplink,
+     * gated by the durable alert_processed_uplink marker so any replay
+     * (exact, delayed, out-of-order or same-measuredAt) is a no-op.
+     *
+     * @param list<string>      $rejectionReasons
+     * @param list<string>      $nonNumericFields
+     * @param list<Measurement> $persisted
+     */
+    private function emitInvalidReadingSignal(ChirpStackUplink $uplink, Device $device, array $rejectionReasons, array $nonNumericFields, array $persisted): void
+    {
+        if (!$this->processedUplinkRepository->isFirstProcessing($uplink->deduplicationId)) {
+            $this->logger->info('Uplink already evaluated for invalid-reading; skipping signal.', ['devEui' => $uplink->devEui, 'deduplicationId' => $uplink->deduplicationId]);
+
+            return;
+        }
+
+        if ([] !== $rejectionReasons || [] !== $nonNumericFields) {
+            $reasons = $rejectionReasons;
+            foreach ($nonNumericFields as $field) {
+                $reasons[] = sprintf("Field '%s' carried a non-numeric value.", $field);
+            }
+            $this->invalidReadingAlertService->recordRejection($device, $uplink->measuredAt, implode(' | ', $reasons));
+
+            return;
+        }
+
+        if ([] !== $persisted) {
+            $this->invalidReadingAlertService->recordValidReading($device, $uplink->measuredAt);
+        }
+        // Empty payloads, unmapped-only payloads and pure duplicate
+        // deliveries emit nothing: they must not advance recovery.
     }
 
     /**
@@ -157,10 +207,14 @@ final class ChirpStackUplinkHandler
     }
 
     /**
-     * Validates and persists one payload field as a measurement.
+     * Validates and persists one payload field as a measurement. Never emits
+     * alert signals itself: outcomes are appended to $rejectionReasons /
+     * $nonNumericFields and aggregated into one per-uplink signal afterwards.
      *
-     * @param array<string, true> $existingTypes Types already stored for this event (pre-check)
-     * @param array<string, true> $seenTypes     Types already handled in this invocation (in-event guard)
+     * @param array<string, true> $existingTypes    Types already stored for this event (pre-check)
+     * @param array<string, true> $seenTypes        Types already handled in this invocation (in-event guard)
+     * @param list<string>        $rejectionReasons Accumulated physical-range rejection reasons
+     * @param list<string>        $nonNumericFields Accumulated non-numeric mapped field names
      */
     private function storeFieldMeasurement(
         ChirpStackUplink $uplink,
@@ -169,6 +223,8 @@ final class ChirpStackUplinkHandler
         mixed $rawValue,
         array $existingTypes,
         array &$seenTypes,
+        array &$rejectionReasons,
+        array &$nonNumericFields,
     ): ?Measurement {
         $mapping = $this->fieldMap[$field] ?? null;
         if (null === $mapping) {
@@ -179,6 +235,7 @@ final class ChirpStackUplinkHandler
 
         if (!is_numeric($rawValue)) {
             $this->logger->warning('Skipping non-numeric payload value.', ['devEui' => $uplink->devEui, 'field' => $field, 'value' => $rawValue]);
+            $nonNumericFields[] = $field;
             return null;
         }
 
@@ -215,14 +272,13 @@ final class ChirpStackUplinkHandler
                 'violations' => (string) $violations,
             ]);
             if (self::containsPhysicalRangeViolation($violations)) {
-                $this->invalidReadingAlertService->recordRejection($device, $uplink->measuredAt, (string) $violations);
+                $rejectionReasons[] = sprintf("Field '%s': %s", $field, (string) $violations);
             }
 
             return null;
         }
 
         $this->entityManager->persist($measurement);
-        $this->invalidReadingAlertService->recordValidReading($device, $uplink->measuredAt);
 
         return $measurement;
     }
