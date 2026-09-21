@@ -123,8 +123,21 @@ final class CollisionStatement extends AbstractStatementMiddleware
             // collides with the unique (deduplication_id, type) index. The flush's
             // INSERT always runs after the handler's pre-check, so this is the
             // deterministic post-pre-check / pre-flush window. No sleeps.
+            //
+            // The handler now re-locks (FOR UPDATE) every sensor it resolves,
+            // for the whole per-uplink transaction (see
+            // ChirpStackUplinkHandler::assertSensorIdentityUnchanged()), so by
+            // this point the main connection already holds an exclusive lock on
+            // this sensor row. InnoDB's foreign-key check on this INSERT would
+            // otherwise need a shared lock on that SAME row - which the main
+            // connection cannot release until this very call returns, a
+            // self-inflicted deadlock. Disabling FK checks on this one
+            // throwaway injector connection avoids it without weakening the
+            // assertion under test (the unique-constraint collision, not
+            // referential integrity).
             $pdo = new \PDO($config->pdoDsn, $config->pdoUser, $config->pdoPassword);
             $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+            $pdo->exec('SET FOREIGN_KEY_CHECKS = 0');
             $pdo->exec(sprintf(
                 "INSERT INTO measurement (sensor_id, value, measured_at, created_at, deduplication_id, type) VALUES (%d, 9.9, '2020-01-01 12:00:00', NOW(), '%s', 'battery')",
                 $config->sensorId,
