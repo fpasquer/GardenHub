@@ -1,0 +1,13 @@
+# Loaded ONLY by DeliveryKernel in tests/mqtt-lifecycle/delivery-guarantees.php.
+# Shortens the async retry delay so a forced unique-constraint collision is
+# retried promptly in-process during the test. Production retry settings in
+# api/config/packages/messenger.yaml are untouched.
+framework:
+    messenger:
+        transports:
+            async:
+                retry_strategy:
+                    max_retries: 3
+                    delay: 100
+                    multiplier: 1
+                    jitter: 0.0

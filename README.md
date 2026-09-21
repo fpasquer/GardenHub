@@ -182,12 +182,225 @@ php bin/console gardenhub:mqtt:consume
 
 Responsibilities:
 
-- connect to Mosquitto
-- subscribe to ChirpStack uplinks
-- decode messages
-- dispatch messages through Symfony Messenger
+- connect to Mosquitto with a **persistent session** (stable `MQTT_CLIENT_ID`)
+- subscribe to ChirpStack uplinks at **QoS 1** (at-least-once from the broker)
+- decode messages; malformed JSON is logged explicitly and discarded
+- dispatch `ChirpStackUplink` messages to the **durable Doctrine transport**
+  (`messenger_messages` table, `queue_name=async`)
+
+The MQTT worker no longer persists measurements itself; it only parses the
+MQTT envelope and enqueues a Messenger message. If the enqueue fails (e.g.
+MySQL is briefly unavailable), the worker interrupts the MQTT loop and
+reconnects after five seconds. Note the documented loss window: Mosquitto may
+already have PUBACKed the message before the enqueue fails, so that specific
+message can be lost. This is the accepted tradeoff of the current
+php-mqtt/client integration.
+
+After every MQTT callback, the command explicitly invokes Symfony's service
+resetter. This clears Doctrine's identity map and pending unit-of-work state,
+Doctrine SQL profiling/backtraces in debug mode, and other registered resettable
+services such as buffered logging and Messenger tracing when enabled. This
+custom synchronous loop does not run Messenger's standard worker reset hooks.
+
+MQTT client failures are logged as connection failures and retried after five
+seconds. Message-processing, persistence, or cleanup failures interrupt the MQTT
+loop and return exit code 1, allowing the existing `restart: unless-stopped`
+policy to start a fresh process with a usable entity manager. The callback must
+signal failure explicitly because the MQTT library otherwise catches callback
+exceptions. A failed worker cannot remain alive indefinitely with a closed
+entity manager while passing the process-only health check.
+
+### Delivery guarantees
+
+The durability boundary is the **successful insertion of `ChirpStackUplink`
+into `messenger_messages`**. From that point on, Symfony Messenger provides
+at-least-once processing:
+
+- **Retry policy:** 3 retries after the initial attempt (4 attempts total),
+  60s initial delay, 2x multiplier, 10% jitter. Expected worst-case delay
+  before failure transport: ~7 minutes (60s + 120s + 240s + processing).
+- **Failure transport:** after retry exhaustion, messages move to the same
+  `messenger_messages` table with `queue_name=failed`. They are inspectable
+  and retryable, not lost.
+- **Malformed MQTT JSON:** logged with topic, payload length, and a
+  non-sensitive preview; discarded without creating a Messenger message.
+- **Per-measurement validation:** invalid measurements are skipped and logged;
+  valid measurements from the same uplink still persist.
+- **Idempotent storage:** each measurement carries the ChirpStack
+  `deduplicationId` and its type, with a unique `(deduplication_id, type)`
+  index. A replayed uplink is stored **at most once per `(deduplicationId,
+  type)`**, with bounded retries. See [Idempotency](#idempotency).
+
+**External requirement:** the GardenHub-side QoS 1 subscription only buffers
+messages during worker downtime if ChirpStack publishes application events at
+QoS 1. Verify the ChirpStack MQTT integration configuration (`qos = 1`).
+Mosquitto must also run with `persistence true` and a `persistence_location`
+for session state to survive broker restarts.
+
+### Idempotency
+
+ChirpStack attaches a unique `deduplicationId` UUID to every uplink event.
+GardenHub stores it on each measurement row together with a denormalized
+measurement `type`, and enforces a database unique index on
+`(deduplication_id, type)`.
+
+Guarantee: **at most one stored row per `(deduplicationId, type)`, with bounded
+retries.** This is not exactly-once delivery — if a message exhausts its retries
+it lands in the `failed` queue and must be retried or resolved manually.
+
+How it works:
+
+- **Pre-check / top-up:** before persisting, the handler queries which of the
+  event's measurement types are already stored for this `deduplicationId` and
+  only inserts the missing ones. A fully replayed uplink therefore no-ops.
+- **Concurrent collision:** if two consumers process the same event at once and
+  both pass the pre-check, one flush hits the unique index and throws. The
+  exception is left to propagate into Messenger's bounded retry; on retry the
+  pre-check finds the committed rows and completes only the missing types.
+- **Malformed events:** an uplink with a missing or invalid `deduplicationId`
+  is logged and discarded at the MQTT boundary, same as other malformed events.
+- **API creation:** `POST /measurements` accepts a client-supplied
+  `deduplicationId` (validated as a UUID). `type` is derived from the sensor
+  server-side and is read-only over the API.
+
+### Deploying the idempotency migration
+
+The migration makes `deduplication_id`/`type` mandatory and adds the unique
+index. Queued `ChirpStackUplink` messages serialized by the old code lack
+`deduplicationId` and would crash the new handler, so they must be drained by
+the **old** code first. Because `api/src` is bind-mounted into the containers,
+pulling new code before draining would change the code the drain consumer runs
+— so code is pulled only after the queues are empty and the drain consumer is
+stopped.
+
+**Important:** `gardenhub-mysql` is never stopped by this procedure — only the
+writer services are — so the two mysql commands below use `docker compose exec`
+against that already-running container; never `exec` into a stopped service.
+Every other CLI step runs in a **one-off container**
+(`docker compose run --rm --no-deps`), which starts its own throwaway container
+using the *currently checked-out* code. `--no-deps` explicitly prevents Compose
+from starting that command's dependencies (e.g. `gardenhub-mysql`) as a side
+effect — it is not an optional precaution — so the writer services stay
+stopped for the whole procedure.
+
+```bash
+# 1. Stop MQTT ingestion and HTTP write access (measurement writers).
+docker compose stop gardenhub-worker gardenhub-consumer gardenhub-api gardenhub-nginx
+
+# 2. Drain async with the OLD code, in a one-off container, until empty.
+#    The command exits on its own once the queue is drained and the time limit
+#    elapses; --time-limit keeps it from running forever.
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:consume async --time-limit=120
+
+# 2a. If retries are scheduled in the future, fast-forward them (scoped to the
+#     async queue) and drain again until `messenger:stats` shows 0 pending.
+#     Runs inside the already-running gardenhub-mysql container so the client
+#     reaches the real server (not a fresh container's empty local socket);
+#     the single-quoted sh -c defers $MYSQL_ROOT_PASSWORD/$MYSQL_DATABASE
+#     expansion to that container's own environment, not the host shell.
+docker compose exec gardenhub-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = \"async\" AND delivered_at IS NULL;"'
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:consume async --time-limit=120
+
+# 3. Resolve failed messages with the OLD code: retry them so their
+#    measurements are stored. Do NOT failed:remove as a routine step — a failed
+#    message may hold data you still need. If a message cannot be resolved,
+#    STOP and investigate before continuing the deployment.
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console messenger:failed:retry --force
+
+# 4. Verify BOTH queues are truly empty (including delayed/delivered rows).
+docker compose exec gardenhub-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "SELECT queue_name, COUNT(*) AS n FROM messenger_messages GROUP BY queue_name;"'
+#    Expect: no rows for 'async' or 'failed'. If any remain, pause here.
+
+# 5. Stop the drain consumer before touching code (it is already stopped — the
+#    one-off containers exited). NOW pull the new code and rebuild the image.
+git pull
+docker compose build gardenhub-api
+
+# 6. Run the migration using the NEW code (writers still stopped).
+docker compose run --rm --no-deps gardenhub-api \
+  php bin/console doctrine:migrations:migrate --no-interaction
+
+# 7. Start the updated services.
+docker compose up -d gardenhub-worker gardenhub-consumer gardenhub-api gardenhub-nginx
+```
+
+Legacy rows are backfilled: `type` is copied from the owning sensor and each
+row gets a unique `deduplication_id` (random UUID), so the new index cannot
+collide on existing data. Historical duplicates are left as-is.
+
+## `gardenhub-consumer`
+
+Long-running Symfony command:
+
+```bash
+php bin/console messenger:consume async --time-limit=3600
+```
+
+Responsibilities:
+
+- dequeue `ChirpStackUplink` messages from the Doctrine `async` queue
 - auto-provision devices and sensors
-- persist measurements
+- validate and persist measurements
+- ack/requeue messages according to the retry policy
+
+The consumer recycles itself every hour (`--time-limit=3600`) as routine
+maintenance of a long-running PHP process. The existing
+`restart: unless-stopped` policy starts a fresh consumer automatically.
+
+### Operating the queues
+
+Inspect queued messages:
+
+```bash
+docker compose exec gardenhub-api php bin/console messenger:stats
+docker compose exec gardenhub-mysql mysql -uroot -p \
+  -e "SELECT queue_name, COUNT(*) FROM gardenhub.messenger_messages GROUP BY queue_name;"
+```
+
+Inspect failed messages:
+
+```bash
+docker compose exec gardenhub-api php bin/console messenger:failed:show
+```
+
+Retry a failed message after fixing the underlying problem:
+
+```bash
+docker compose exec gardenhub-api php bin/console messenger:failed:retry <id> --force
+```
+
+Remove a permanently bad failed message:
+
+```bash
+docker compose exec gardenhub-api php bin/console messenger:failed:remove <id> --force
+```
+
+Behavior during outages:
+
+| Component down | Behavior |
+|---|---|
+| `gardenhub-worker` | Mosquitto queues QoS 1 messages for the persistent session; the worker receives them after reconnect (if ChirpStack publishes at QoS 1). |
+| `gardenhub-consumer` | Messages accumulate in `messenger_messages` with `queue_name=async`; the consumer processes the backlog after restart. |
+| `gardenhub-mysql` | Worker enqueue fails → MQTT loop interrupted → reconnect loop. Messages PUBACKed during the outage may be lost (documented loss window). Already-queued messages retry automatically per the retry policy. |
+
+Focused regressions use the existing `gardenhub-api` image and disposable MySQL
+and MQTT services on a separate Compose network, without production data or
+credentials:
+
+```bash
+docker compose -f tests/mqtt-lifecycle/compose.yaml run --rm tests
+docker compose -f tests/mqtt-lifecycle/compose.yaml down -v
+```
+
+Build the API image first if it is not available. Tests cover repeated uplinks,
+validation rejection and pending-state cleanup, SQL debug-state cleanup, real
+MySQL flush failures, nonzero worker exits, persistence in a fresh PHP process,
+cleanup failures, and distinct MQTT reconnect behavior. Each child worker has
+a 30-second timeout. They do not interrupt the deployed worker or exercise
+Docker's live restart/health transition.
 
 The worker is connected to both:
 

@@ -60,9 +60,10 @@ services:
       gardenhub-mysql:
         condition: service_healthy
     healthcheck:
-      # Boots the Symfony kernel: proves the application is functional,
-      # not merely that a PHP process exists.
-      test: ["CMD", "php", "bin/console", "about"]
+      # PHP-FPM liveness only, runs as root; gardenhub-nginx's /healthz is the
+      # real app+DB check and never boots Symfony here. $$ escapes Compose's
+      # own interpolation so PHP sees literal $errno/$errstr, not env vars.
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000, $$errno, $$errstr, 2) ? 0 : 1);"]
       interval: 10s
       timeout: 10s
       retries: 6
@@ -121,6 +122,34 @@ services:
       - gardenhub
       - iot-lan
 
+  gardenhub-consumer:
+    image: gardenhub-api
+    container_name: gardenhub-consumer
+    restart: unless-stopped
+    tty: true
+    command: php bin/console messenger:consume async --time-limit=3600
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+    volumes:
+      - ./api/bin:/app/bin
+      - ./api/config:/app/config
+      - ./api/src:/app/src
+      - ./api/.env:/app/.env
+    depends_on:
+      gardenhub-api:
+        condition: service_healthy
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'messenger:consume async' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
   gardenhub-mysql:
     image: mysql:8.4
     container_name: gardenhub-mysql
@@ -163,8 +192,8 @@ services:
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
       # Passed through so the provisioned MySQL datasource can use them.
       MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_USER: ${GRAFANA_MYSQL_USER}
+      MYSQL_PASSWORD: ${GRAFANA_MYSQL_PASSWORD}
     volumes:
       - gardenhub-grafana-data:/var/lib/grafana
       # Datasources and dashboard provider are provisioned at startup;

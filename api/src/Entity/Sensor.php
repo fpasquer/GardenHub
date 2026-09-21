@@ -7,11 +7,13 @@ use ApiPlatform\Doctrine\Orm\Filter\SearchFilter;
 use ApiPlatform\Metadata\ApiFilter;
 use ApiPlatform\Metadata\ApiResource;
 use App\Repository\SensorRepository;
+use App\Validator\AssertSensorIdentityImmutable;
 use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\Common\Collections\Collection;
 use Doctrine\ORM\Mapping as ORM;
 use Symfony\Component\Serializer\Attribute\Groups;
 use Symfony\Component\Validator\Constraints as Assert;
+use Symfony\Bridge\Doctrine\Validator\Constraints\UniqueEntity;
 
 /**
  * A single measured quantity on a device (e.g. soil temperature on SE01).
@@ -20,6 +22,15 @@ use Symfony\Component\Validator\Constraints as Assert;
  * per sensor kind, so new sensor types can be added without schema changes.
  */
 #[ORM\Entity(repositoryClass: SensorRepository::class)]
+#[ORM\UniqueConstraint(
+    name: 'uniq_sensor_device_type',
+    columns: ['device_id', 'type'],
+)]
+#[UniqueEntity(
+    fields: ['device', 'type'],
+    message: 'This device already has a sensor of this type.',
+)]
+#[AssertSensorIdentityImmutable]
 #[ApiResource(
     normalizationContext: ['groups' => ['sensor:read']],
     denormalizationContext: ['groups' => ['sensor:write']],

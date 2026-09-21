@@ -1,0 +1,9 @@
+# Loaded only by LifecycleTestKernel in tests/mqtt-lifecycle/worker-lifecycle.php.
+# The legacy lifecycle scenarios assert per-callback Doctrine state, which
+# requires ChirpStackUplink messages to be handled synchronously in-process.
+# Delivery guarantees (async routing, retry, failure transport) are covered
+# by delivery-guarantees.php instead.
+framework:
+    messenger:
+        routing:
+            'App\Mqtt\ChirpStackUplink': sync

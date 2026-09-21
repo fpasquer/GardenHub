@@ -33,6 +33,11 @@ services:
     App\OpenApi\OpenApiFactory:
         decorates: api_platform.openapi.factory
 
+    # Rejects Sensor device/type/unit changes and drifted-sensor Measurement
+    # creates once measurements exist; see App\Validator\SensorIdentityChecker.
+    App\State\SensorIdentityGuardProcessor:
+        decorates: api_platform.doctrine.orm.state.persist_processor
+
     App\Mqtt\ChirpStackUplinkHandler:
         arguments:
             $fieldMap: '%mqtt.field_map%'
@@ -45,6 +50,7 @@ services:
             $password: '%env(MQTT_PASSWORD)%'
             $clientId: '%env(MQTT_CLIENT_ID)%'
             $topic: '%env(MQTT_TOPIC)%'
+            $servicesResetter: '@services_resetter'
 
     App\Monolog\Telegram\InterfaceTelegramTransport: '@App\Monolog\Telegram\StreamTelegramTransport'
 

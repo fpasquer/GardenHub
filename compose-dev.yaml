@@ -29,6 +29,9 @@ services:
   gardenhub-api:
     volumes:
       - ./api/tests:/app/tests
+  gardenhub-consumer:
+    networks: !override
+      - gardenhub
 
 # Reference to the shared network defined in compose.yaml so the adminer
 # container can reach gardenhub-mysql over the internal Docker network.
