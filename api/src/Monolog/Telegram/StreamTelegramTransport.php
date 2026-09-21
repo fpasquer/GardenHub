@@ -18,10 +18,14 @@ class StreamTelegramTransport implements InterfaceTelegramTransport
     {
     }
 
-    public function send(string $botToken, string $chatId, string $text): void
+    public function send(string $botToken, string $chatId, string $text, ?string $parseMode = null): void
     {
         $url = sprintf('%s/bot%s/sendMessage', $this->baseUrl, $botToken);
-        $body = http_build_query(['chat_id' => $chatId, 'text' => $text]);
+        $params = ['chat_id' => $chatId, 'text' => $text];
+        if (null !== $parseMode) {
+            $params['parse_mode'] = $parseMode;
+        }
+        $body = http_build_query($params);
 
         $context = stream_context_create([
             'http' => [

@@ -71,6 +71,15 @@ services:
             $enabled: '%env(bool:TELEGRAM_ENABLED)%'
             $minLevel: '%env(TELEGRAM_MIN_LEVEL)%'
 
+    App\Command\TelegramDailySummaryCommand:
+        arguments:
+            $enabled: '%env(bool:TELEGRAM_ENABLED)%'
+            $botToken: '%env(TELEGRAM_BOT_TOKEN)%'
+            $chatId: '%env(TELEGRAM_CHAT_ID)%'
+
+    Symfony\Component\Clock\NativeClock: ~
+    Psr\Clock\ClockInterface: '@Symfony\Component\Clock\NativeClock'
+
     # add more service definitions when explicit configuration is needed
     # please note that last definitions always *replace* previous ones
 

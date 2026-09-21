@@ -1,0 +1,3 @@
+# Sends the rolling 24h Telegram measurement summary once a day.
+# Runs under busybox crond (gardenhub-scheduler service); TZ env var controls "22:00".
+0 22 * * * php /app/bin/console gardenhub:telegram:daily-summary 24 >> /proc/1/fd/1 2>> /proc/1/fd/2

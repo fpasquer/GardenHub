@@ -43,5 +43,33 @@ class MeasurementRepository extends ServiceEntityRepository
         }
 
         return false !== $this->getEntityManager()->getConnection()->fetchOne($sql, [$sensorId]);
+     * Per-sensor row count and min/max value within a half-open time window.
+     *
+     * @return array<int, array{deviceName: string, sensorId: int, sensorType: string, sensorLabel: ?string, unit: string, rowCount: int, minValue: float, maxValue: float}>
+     */
+    public function aggregateMinMaxInWindow(\DateTimeImmutable $since, \DateTimeImmutable $until): array
+    {
+        return $this->createQueryBuilder('m')
+            ->select(
+                'd.name AS deviceName',
+                's.id AS sensorId',
+                's.type AS sensorType',
+                's.label AS sensorLabel',
+                's.unit AS unit',
+                'COUNT(m.id) AS rowCount',
+                'MIN(m.value) AS minValue',
+                'MAX(m.value) AS maxValue',
+            )
+            ->join('m.sensor', 's')
+            ->join('s.device', 'd')
+            ->andWhere('m.measuredAt >= :since')
+            ->andWhere('m.measuredAt < :until')
+            ->groupBy('s.id')
+            ->orderBy('d.name', 'ASC')
+            ->addOrderBy('s.id', 'ASC')
+            ->setParameter('since', $since)
+            ->setParameter('until', $until)
+            ->getQuery()
+            ->getArrayResult();
     }
 }
