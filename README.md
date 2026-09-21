@@ -132,12 +132,13 @@ The LoRaStack and GardenHub repositories remain logically independent, but in pr
 
 # GardenHub Stack
 
-GardenHub contains five main services:
+GardenHub contains six main services:
 
 ```text
 gardenhub-nginx
 gardenhub-api
 gardenhub-worker
+gardenhub-consumer
 gardenhub-mysql
 gardenhub-grafana
 ```
@@ -191,9 +192,9 @@ Responsibilities:
 The MQTT worker no longer persists measurements itself; it only parses the
 MQTT envelope and enqueues a Messenger message. If the enqueue fails (e.g.
 MySQL is briefly unavailable), the worker interrupts the MQTT loop and
-reconnects after five seconds. Note the documented loss window: Mosquitto may
-already have PUBACKed the message before the enqueue fails, so that specific
-message can be lost. This is the accepted tradeoff of the current
+exits with code 1 so Docker can restart it. Note the documented loss window:
+the MQTT client may already have acknowledged the message before the enqueue
+fails, so that specific message can be lost. This is the accepted tradeoff of the current
 php-mqtt/client integration.
 
 After every MQTT callback, the command explicitly invokes Symfony's service
@@ -259,7 +260,7 @@ How it works:
   pre-check finds the committed rows and completes only the missing types.
 - **Malformed events:** an uplink with a missing or invalid `deduplicationId`
   is logged and discarded at the MQTT boundary, same as other malformed events.
-- **API creation:** `POST /measurements` accepts a client-supplied
+- **API creation:** `POST /api/measurements` accepts a client-supplied
   `deduplicationId` (validated as a UUID). `type` is derived from the sensor
   server-side and is read-only over the API.
 
@@ -384,7 +385,7 @@ Behavior during outages:
 |---|---|
 | `gardenhub-worker` | Mosquitto queues QoS 1 messages for the persistent session; the worker receives them after reconnect (if ChirpStack publishes at QoS 1). |
 | `gardenhub-consumer` | Messages accumulate in `messenger_messages` with `queue_name=async`; the consumer processes the backlog after restart. |
-| `gardenhub-mysql` | Worker enqueue fails → MQTT loop interrupted → reconnect loop. Messages PUBACKed during the outage may be lost (documented loss window). Already-queued messages retry automatically per the retry policy. |
+| `gardenhub-mysql` | Worker enqueue fails → MQTT loop interrupted → process exits → Docker restart. Messages acknowledged during the outage may be lost (documented loss window). Already-queued messages retry automatically per the retry policy. |
 
 Focused regressions use the existing `gardenhub-api` image and disposable MySQL
 and MQTT services on a separate Compose network, without production data or
@@ -567,6 +568,7 @@ api_client
 device
 doctrine_migration_versions
 measurement
+messenger_messages
 sensor
 ```
 
@@ -595,15 +597,16 @@ gardenhub-mysql-data
 ## Prerequisites
 
 - Docker
-- Docker Compose v2+
+- Docker Compose v2+ with `!override` support for the development overlay
 - Git
+- Make, Bash and curl for the production deployment commands
 
 No host installation of PHP, Composer, Symfony CLI, nginx or MySQL is required.
 
 ## Clone
 
 ```bash
-git clone <repository-url> GardenHub
+git clone https://github.com/fpasquer/GardenHub.git GardenHub
 cd GardenHub
 ```
 
@@ -617,6 +620,7 @@ Example development values:
 
 ```dotenv
 APP_ENV=dev
+BIND_ADDRESS=127.0.0.1
 
 APP_PORT=8080
 GRAFANA_PORT=3000
@@ -630,7 +634,23 @@ MQTT_HOST=mosquitto
 MQTT_PORT=1883
 MQTT_USERNAME=<username>
 MQTT_PASSWORD=<password>
+MQTT_CLIENT_ID=gardenhub-dev
+
+GRAFANA_ADMIN_USER=admin
+GRAFANA_ADMIN_PASSWORD=<admin-password>
+GRAFANA_MYSQL_USER=<existing-mysql-user>
+GRAFANA_MYSQL_PASSWORD=<mysql-user-password>
 ```
+
+Set `BIND_ADDRESS` to the host LAN IP for LAN access and `APP_ENV=prod` in
+production. Use a stable, distinct `MQTT_CLIENT_ID` per environment (for
+example, `gardenhub-dev` and `gardenhub-prod`). Grafana’s datasource credentials
+must identify an existing MySQL account with read access; Compose does not
+create a separate Grafana database account.
+
+The base Compose stack requires LoRaStack’s external `iot_iot-lan` network.
+The development overlay removes the worker’s connection to that network, so
+set `MQTT_HOST` to a broker address reachable from the development container.
 
 Production on `gardenhub-server` currently uses:
 
@@ -672,11 +692,35 @@ Expected GardenHub services:
 gardenhub-nginx
 gardenhub-api
 gardenhub-worker
+gardenhub-consumer
 gardenhub-mysql
 gardenhub-grafana
 ```
 
 Services with health checks should become `healthy`.
+
+## Production updates
+
+For an existing installation with MySQL already running:
+
+```bash
+cd /opt/gardenhub
+make deploy-info
+make deploy
+```
+
+`make deploy` requires a clean checkout on `master`, validates Compose, and
+pulls `origin/master` with `--ff-only`. It builds the API image, stops the
+application services, runs migrations, restarts them, clears the production
+cache as `www-data`, and checks container health and `/healthz`. MySQL and
+Grafana remain running. A migration failure leaves the application stopped;
+diagnostics are printed and no automatic rollback is performed.
+
+The HTTP check defaults to `192.168.1.20:8081`; override `HEALTHZ_HOST` and
+`HEALTHZ_PORT` when needed. Make targets load root `.env` and then `.env.local`
+if present. For upgrades from before uplink idempotency, follow
+[the queue-draining procedure](#deploying-the-idempotency-migration) before
+pulling new code: `make deploy` does not drain old messages.
 
 ---
 
@@ -712,6 +756,12 @@ curl \
   -H "Authorization: Bearer gh_..." \
   http://192.168.1.20:8081/api/devices
 ```
+
+## Sensor updates
+
+Once a sensor has measurements, changing its `device`, `type` or `unit` through
+the API is rejected with HTTP 422. Its `label` remains editable. Before the
+first measurement, these identity fields can still be changed.
 
 ## API clients
 
@@ -804,8 +854,23 @@ The API source directories are bind-mounted, so most PHP source changes are imme
 Rebuild after dependency changes:
 
 ```bash
-docker compose up -d --build
+docker compose -f compose.yaml -f compose-dev.yaml up -d --build
 ```
+
+## Continuous integration
+
+GitHub Actions builds `gardenhub-api` and runs both integration suites on pull
+requests targeting `master` and on manual workflow runs. CI does not deploy.
+To run the sensor identity suite locally after building the API image:
+
+```bash
+docker compose -f tests/sensor-identity/compose.yaml run --rm tests
+docker compose -f tests/sensor-identity/compose.yaml down -v
+```
+
+The MQTT lifecycle suite commands are documented under
+[Operating the queues](#operating-the-queues). Both suites use disposable test
+services separate from production data.
 
 ---
 
@@ -820,7 +885,10 @@ docker compose exec gardenhub-api \
   '{"water_SOIL":"25.34","temp_SOIL":"21.06"}'
 ```
 
-This uses the same Messenger ingestion path as a real MQTT message.
+This uses the same Messenger ingestion path as a real MQTT message and requires
+`gardenhub-consumer` to persist the queued measurements. Use
+`--deduplication-id=<UUID>` to replay the same event; otherwise each invocation
+generates a new UUID.
 
 ---
 
@@ -1160,7 +1228,7 @@ High-level recovery order:
 10. Restore /opt/gardenhub project
 11. Start MySQL
 12. Restore gardenhub-mysql.sql.gz
-13. Start GardenHub API / worker / nginx / Grafana
+13. Start GardenHub API / worker / consumer / nginx / Grafana
 14. Verify LPS8N gateway connectivity
 15. Verify SE01 uplink
 16. Verify MySQL ingestion
