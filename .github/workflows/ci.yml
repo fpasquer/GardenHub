@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Build and integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build gardenhub-api image
+        env:
+          # CI-only placeholder required by root compose.yaml interpolation;
+          # no root-stack container is started, so no port is actually bound.
+          BIND_ADDRESS: 127.0.0.1
+        run: docker compose build gardenhub-api
+
+      - name: Run MQTT lifecycle tests
+        id: mqtt_tests
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          docker compose -f tests/mqtt-lifecycle/compose.yaml run --rm tests
+
+      - name: Clean up MQTT lifecycle stack
+        if: always()
+        run: docker compose -f tests/mqtt-lifecycle/compose.yaml down -v
+
+      - name: Run sensor identity tests
+        id: sensor_tests
+        if: always()
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          docker compose -f tests/sensor-identity/compose.yaml run --rm tests
+
+      - name: Clean up sensor identity stack
+        if: always()
+        run: docker compose -f tests/sensor-identity/compose.yaml down -v
+
+      - name: Fail if any test suite failed
+        if: always()
+        run: |
+          if [ "${{ steps.mqtt_tests.outcome }}" != "success" ]; then
+            echo "MQTT lifecycle tests failed"
+            exit 1
+          fi
+
+          if [ "${{ steps.sensor_tests.outcome }}" != "success" ]; then
+            echo "Sensor identity tests failed"
+            exit 1
+          fi
