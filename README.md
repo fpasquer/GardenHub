@@ -112,6 +112,11 @@ The LoRaStack and GardenHub repositories remain logically independent, but in pr
 - Automated backups to a dedicated external SSD.
 - Daily and monthly backup retention.
 - Hardened local-network deployment.
+- Telegram alerts for plant conditions (soil moisture/temperature, battery),
+  invalid sensor readings, and permanently-failed uplink processing, with a
+  persistent incident lifecycle (open → confirm → notify → recover/resolve)
+  and periodic reminders for still-active incidents. See `gardenhub-notifier`
+  and `gardenhub-scheduler` below.
 
 ### Planned
 
@@ -122,7 +127,6 @@ The LoRaStack and GardenHub repositories remain logically independent, but in pr
   - `IrrigationEvent`
   - `Alert`
 - Automation rules.
-- Telegram alerts.
 - Frontend.
 - Optional HTTPS on the LAN.
 - Additional devices and sensors.
@@ -132,13 +136,15 @@ The LoRaStack and GardenHub repositories remain logically independent, but in pr
 
 # GardenHub Stack
 
-GardenHub contains six main services:
+GardenHub contains eight main services:
 
 ```text
 gardenhub-nginx
 gardenhub-api
 gardenhub-worker
 gardenhub-consumer
+gardenhub-notifier
+gardenhub-scheduler
 gardenhub-mysql
 gardenhub-grafana
 ```
@@ -420,6 +426,68 @@ mosquitto
 
 MQTT is **not exposed on the host LAN**.
 
+## `gardenhub-notifier`
+
+Long-running Symfony command:
+
+```bash
+php bin/console messenger:consume telegram_notifications --time-limit=3600
+```
+
+Responsibilities:
+
+- dequeue `SendTelegramNotification` messages from the Doctrine
+  `telegram_notifications` queue
+- deliver them to the configured Telegram chat via the Bot API
+
+Kept as its own container, separate from `gardenhub-consumer`, so a slow or
+unreachable Telegram API only delays alert delivery and never blocks
+measurement ingestion. Disabled by default (`TELEGRAM_ALERTS_ENABLED=false`):
+with alerts disabled the handler no-ops on every message with zero network
+calls. Enabling it requires a real `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`,
+set only in the untracked `.env.local` file — use a **separate bot/chat for
+dev vs prod** so test alerts are never mixed with real ones.
+
+Failed deliveries retry per `telegram_notifications`'s retry policy
+(5 retries, 5s initial delay, 2x multiplier) before landing in the shared
+`failed` transport, inspectable the same way as MQTT ingestion failures.
+
+Focused regressions use the existing `gardenhub-api` image and a disposable
+MySQL service on a separate Compose network, without production data or
+credentials:
+
+```bash
+docker compose -f tests/telegram-alerts/compose.yaml run --rm tests
+docker compose -f tests/telegram-alerts/compose.yaml down -v
+```
+
+Build the API image first if it is not available. Tests cover Telegram
+delivery mechanics (enable/disable, message formatting/truncation, retryable
+vs. permanent HTTP failures) against a fake HTTP client, the alert lifecycle
+(confirmation/recovery staging, idempotent replay, reminder scheduling)
+against a real migrated schema, and genuine database-level concurrency
+(the `alert_incident` unique-index backstop and its `FOR UPDATE` lock) using
+a second raw connection in the same process.
+
+## `gardenhub-scheduler`
+
+Long-running Symfony command:
+
+```bash
+php bin/console messenger:consume scheduler_default --time-limit=3600
+```
+
+Responsibilities:
+
+- ticks Symfony Scheduler's recurring `EvaluateAlertsMessage` (every 5
+  minutes, see `api/src/Schedule.php`)
+- triggers `EvaluateAlertsHandler`, which sends a reminder notification for
+  every still-active alert incident whose `next_reminder_at` is due
+
+**Must remain a single instance.** Running more than one `gardenhub-scheduler`
+container would tick the same recurring message multiple times, sending
+duplicate reminders.
+
 ## `gardenhub-mysql`
 
 MySQL 8.4 database.
@@ -640,6 +708,14 @@ GRAFANA_ADMIN_USER=admin
 GRAFANA_ADMIN_PASSWORD=<admin-password>
 GRAFANA_MYSQL_USER=<existing-mysql-user>
 GRAFANA_MYSQL_PASSWORD=<mysql-user-password>
+
+# Telegram alerts: disabled by default. Enabling requires a real bot
+# token/chat id, set only in the untracked .env.local file (use a
+# separate bot/chat for dev vs prod).
+TELEGRAM_ALERTS_ENABLED=false
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+TELEGRAM_ENVIRONMENT_LABEL=dev
 ```
 
 Set `BIND_ADDRESS` to the host LAN IP for LAN access and `APP_ENV=prod` in
@@ -1352,8 +1428,8 @@ The platform should support additional sensors, devices, alerts and automation w
 - [x] API authentication
 - [x] API filtering and pagination
 - [x] Grafana dashboard
-- [ ] Alerting
-- [ ] Telegram notifications
+- [x] Alerting
+- [x] Telegram notifications
 - [ ] Irrigation automation
 - [ ] Additional devices
 - [ ] Frontend

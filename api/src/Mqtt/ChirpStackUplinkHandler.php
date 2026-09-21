@@ -2,15 +2,22 @@
 
 namespace App\Mqtt;
 
+use App\Alert\AlertLifecycleService;
+use App\Alert\AlertSignal;
+use App\Alert\InvalidReading\InvalidReadingAlertService;
+use App\Alert\Message\EvaluateUplinkMeasurements;
 use App\Entity\Device;
 use App\Entity\Measurement;
 use App\Entity\Sensor;
 use App\Mqtt\Exception\SensorIdentityChangedException;
 use App\Repository\DeviceRepository;
 use App\Repository\SensorRepository;
+use App\Validator\AssertPhysicalRange;
 use Doctrine\ORM\EntityManagerInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Messenger\Attribute\AsMessageHandler;
+use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Validator\ConstraintViolationListInterface;
 use Symfony\Component\Validator\Validator\ValidatorInterface;
 
 /**
@@ -53,7 +60,12 @@ final class ChirpStackUplinkHandler
         private readonly SensorRepository $sensorRepository,
         private readonly ValidatorInterface $validator,
         private readonly LoggerInterface $logger,
+        private readonly MessageBusInterface $messageBus,
+        private readonly InvalidReadingAlertService $invalidReadingAlertService,
+        private readonly AlertLifecycleService $alertLifecycleService,
         private readonly array $fieldMap,
+        private readonly int $processingFailureConfirmationCount,
+        private readonly int $processingFailureRecoveryCount,
     ) {
     }
 
@@ -72,13 +84,27 @@ final class ChirpStackUplinkHandler
         $existingTypes = $this->existingTypesForEvent($device, $uplink->deduplicationId);
         $stored = $this->storeMeasurements($uplink, $device, $existingTypes);
 
+        // Any successful processing of this exact uplink means whatever
+        // previously failed for it (if anything) is now resolved. A no-op
+        // when no processing_failure incident is open for it.
+        $this->alertLifecycleService->openOrAdvance(
+            'processing_failure',
+            sprintf('chirpstack_uplink:%s', $uplink->deduplicationId),
+            new AlertSignal(breach: false),
+            $this->processingFailureConfirmationCount,
+            $this->processingFailureRecoveryCount,
+        );
+
         $this->logger->info('Uplink processed.', ['devEui' => $uplink->devEui, 'deduplicationId' => $uplink->deduplicationId, 'stored' => $stored]);
     }
 
     /**
      * Stores every mapped payload field inside one transaction, so a
      * sensor-identity lock taken while resolving a field is still held when
-     * the final flush commits.
+     * the final flush commits. Alert evaluation for the newly stored
+     * measurements is dispatched after the flush (so their ids are known)
+     * but still inside this same transaction, giving it the same
+     * all-or-nothing durability as the measurements themselves.
      *
      * @param array<string, true> $existingTypes Types already stored for this event (pre-check)
      */
@@ -86,16 +112,31 @@ final class ChirpStackUplinkHandler
     {
         return $this->entityManager->wrapInTransaction(function () use ($uplink, $device, $existingTypes): int {
             $seenTypes = [];
-            $stored = 0;
+            $persisted = [];
             foreach ($uplink->payload as $field => $rawValue) {
-                if ($this->storeFieldMeasurement($uplink, $device, (string) $field, $rawValue, $existingTypes, $seenTypes)) {
-                    ++$stored;
+                $measurement = $this->storeFieldMeasurement($uplink, $device, (string) $field, $rawValue, $existingTypes, $seenTypes);
+                if (null !== $measurement) {
+                    $persisted[] = $measurement;
                 }
             }
             $this->entityManager->flush();
+            $this->dispatchEvaluation($persisted);
 
-            return $stored;
+            return count($persisted);
         });
+    }
+
+    /**
+     * @param list<Measurement> $measurements
+     */
+    private function dispatchEvaluation(array $measurements): void
+    {
+        if ([] === $measurements) {
+            return;
+        }
+
+        $ids = array_map(static fn (Measurement $measurement): int => $measurement->getId(), $measurements);
+        $this->messageBus->dispatch(new EvaluateUplinkMeasurements($ids));
     }
 
     /**
@@ -128,30 +169,30 @@ final class ChirpStackUplinkHandler
         mixed $rawValue,
         array $existingTypes,
         array &$seenTypes,
-    ): bool {
+    ): ?Measurement {
         $mapping = $this->fieldMap[$field] ?? null;
         if (null === $mapping) {
             $this->logger->debug('Ignoring unmapped payload field.', ['devEui' => $uplink->devEui, 'field' => $field]);
-            return false;
+            return null;
         }
         $type = $mapping['type'];
 
         if (!is_numeric($rawValue)) {
             $this->logger->warning('Skipping non-numeric payload value.', ['devEui' => $uplink->devEui, 'field' => $field, 'value' => $rawValue]);
-            return false;
+            return null;
         }
 
         // Already stored for this event (replay / concurrent delivery): top-up only the missing types.
         if (isset($existingTypes[$type])) {
             $this->logger->info('Measurement type already processed for this event; skipping.', ['devEui' => $uplink->devEui, 'deduplicationId' => $uplink->deduplicationId, 'type' => $type]);
-            return false;
+            return null;
         }
 
         // Two fields mapping to the same type within one event: first wins, so a
         // misconfigured field map cannot collide with the unique index.
         if (isset($seenTypes[$type])) {
             $this->logger->warning('Duplicate measurement type in one uplink; keeping the first value.', ['devEui' => $uplink->devEui, 'field' => $field, 'type' => $type]);
-            return false;
+            return null;
         }
         $seenTypes[$type] = true;
 
@@ -173,12 +214,30 @@ final class ChirpStackUplinkHandler
                 'field' => $field,
                 'violations' => (string) $violations,
             ]);
-            return false;
+            if (self::containsPhysicalRangeViolation($violations)) {
+                $this->invalidReadingAlertService->recordRejection($device, $uplink->measuredAt, (string) $violations);
+            }
+
+            return null;
         }
 
         $this->entityManager->persist($measurement);
-        return true;
+        $this->invalidReadingAlertService->recordValidReading($device, $uplink->measuredAt);
+
+        return $measurement;
     }
+
+    private static function containsPhysicalRangeViolation(ConstraintViolationListInterface $violations): bool
+    {
+        foreach ($violations as $violation) {
+            if ($violation->getConstraint() instanceof AssertPhysicalRange) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 
     /**
      * Locks the sensor row and reconfirms its (device, type, unit) identity

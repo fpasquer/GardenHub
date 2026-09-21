@@ -1,6 +1,12 @@
 monolog:
     channels:
         - deprecation # Deprecations are logged in the dedicated "deprecation" channel when it exists
+        - telegram_alerts # Alert notifications; the only handler on this channel delivers to Telegram
+    handlers:
+        telegram_alerts:
+            type: service
+            id: App\Alert\Telegram\TelegramAlertHandler
+            channels: [telegram_alerts]
 
 when@dev:
     monolog:
@@ -9,7 +15,7 @@ when@dev:
                 type: stream
                 path: "%kernel.logs_dir%/%kernel.environment%.log"
                 level: debug
-                channels: ["!event"]
+                channels: ["!event", "!telegram_alerts"]
             console:
                 type: console
                 process_psr_3_messages: false
@@ -23,7 +29,7 @@ when@test:
                 action_level: error
                 handler: nested
                 excluded_http_codes: [404, 405]
-                channels: ["!event"]
+                channels: ["!event", "!telegram_alerts"]
             nested:
                 type: stream
                 path: "%kernel.logs_dir%/%kernel.environment%.log"
@@ -37,7 +43,7 @@ when@prod:
                 action_level: error
                 handler: nested
                 excluded_http_codes: [404, 405]
-                channels: ["!deprecation"]
+                channels: ["!deprecation", "!telegram_alerts"]
                 buffer_size: 50 # How many messages should be saved? Prevent memory leaks
             nested:
                 type: stream

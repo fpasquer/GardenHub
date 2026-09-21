@@ -18,6 +18,7 @@ class ApiClient
 {
     public const string ROLE_READ = 'ROLE_API_READ';
     public const string ROLE_WRITE = 'ROLE_API_WRITE';
+    public const string ROLE_ADMIN = 'ROLE_API_ADMIN';
 
     #[ORM\Id]
     #[ORM\GeneratedValue]

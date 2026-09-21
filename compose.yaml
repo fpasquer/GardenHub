@@ -119,7 +119,11 @@ services:
     container_name: gardenhub-consumer
     restart: unless-stopped
     tty: true
-    command: php bin/console messenger:consume async --time-limit=3600
+    # alerts carries evaluation handoff + processing-failure recording (see
+    # api/config/packages/messenger.yaml); Telegram delivery itself is
+    # consumed separately by gardenhub-notifier so a Telegram outage never
+    # blocks measurement ingestion.
+    command: php bin/console messenger:consume async alerts --time-limit=3600
     environment:
       APP_ENV: ${APP_ENV:-dev}
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
@@ -134,7 +138,72 @@ services:
       gardenhub-mysql:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'messenger:consume async' || exit 1"]
+      test: ["CMD-SHELL", "pgrep -f 'messenger:consume async alerts' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
+  gardenhub-notifier:
+    image: gardenhub-api
+    container_name: gardenhub-notifier
+    restart: unless-stopped
+    tty: true
+    # Dedicated consumer for Telegram delivery, isolated from gardenhub-consumer
+    # so a slow/unreachable Telegram API only delays reminders, never ingestion.
+    command: php bin/console messenger:consume telegram_notifications --time-limit=3600
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+      TELEGRAM_ALERTS_ENABLED: ${TELEGRAM_ALERTS_ENABLED:-false}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_ENVIRONMENT_LABEL: ${TELEGRAM_ENVIRONMENT_LABEL:-dev}
+    volumes:
+      - ./api/bin:/app/bin
+      - ./api/config:/app/config
+      - ./api/src:/app/src
+      - ./api/.env:/app/.env
+    depends_on:
+      gardenhub-api:
+        condition: service_healthy
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'messenger:consume telegram_notifications' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
+  gardenhub-scheduler:
+    image: gardenhub-api
+    container_name: gardenhub-scheduler
+    restart: unless-stopped
+    tty: true
+    # Symfony Scheduler (api/src/Schedule.php) ticks reminders onto the alerts
+    # queue. Must stay a single instance: running more than one would fire
+    # the same recurring message multiple times.
+    command: php bin/console messenger:consume scheduler_default --time-limit=3600
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+    volumes:
+      - ./api/bin:/app/bin
+      - ./api/config:/app/config
+      - ./api/src:/app/src
+      - ./api/.env:/app/.env
+    depends_on:
+      gardenhub-api:
+        condition: service_healthy
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'messenger:consume scheduler_default' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6

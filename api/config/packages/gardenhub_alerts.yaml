@@ -1,0 +1,74 @@
+# Telegram alerting configuration. Every plant-condition/battery rule ships
+# disabled by default: enable and calibrate per devEui deliberately, never
+# guess thresholds for real hardware.
+parameters:
+    gardenhub_alerts.invalid_reading.confirmation_count: 1
+    gardenhub_alerts.invalid_reading.recovery_count: 3
+
+    gardenhub_alerts.processing_failure.confirmation_count: 1
+    gardenhub_alerts.processing_failure.recovery_count: 1
+
+    # How often an ACTIVE incident's Telegram alert is re-sent as a
+    # reminder, checked by the periodic scheduler (EvaluateAlertsMessage).
+    gardenhub_alerts.reminder_interval_seconds: 21600 # 6 hours
+
+    # One entry per Symfony-owned plant/battery alert type. comparison is
+    # "below" or "above" the threshold. confirmation_count/recovery_count
+    # are consecutive-reading counts (not durations); duration-based
+    # reminders/staleness handling is done by the periodic scheduler.
+    gardenhub_alerts.threshold_rules:
+        soil_too_dry:
+            enabled: false
+            measurement_type: soil_moisture
+            comparison: below
+            threshold: 20.0
+            confirmation_count: 3
+            recovery_count: 3
+            max_measurement_age_seconds: 7200
+        soil_too_wet:
+            enabled: false
+            measurement_type: soil_moisture
+            comparison: above
+            threshold: 80.0
+            confirmation_count: 3
+            recovery_count: 3
+            max_measurement_age_seconds: 7200
+        soil_temperature_low:
+            enabled: false
+            measurement_type: soil_temperature
+            comparison: below
+            threshold: 5.0
+            confirmation_count: 3
+            recovery_count: 3
+            max_measurement_age_seconds: 7200
+        soil_temperature_high:
+            enabled: false
+            measurement_type: soil_temperature
+            comparison: above
+            threshold: 35.0
+            confirmation_count: 3
+            recovery_count: 3
+            max_measurement_age_seconds: 7200
+        battery_low:
+            enabled: false
+            measurement_type: battery
+            comparison: below
+            threshold: 3.3
+            confirmation_count: 2
+            recovery_count: 2
+            max_measurement_age_seconds: 86400
+
+    # Per-devEui overrides, applied on top of the defaults above. Only listed
+    # keys are overridden; e.g.:
+    # 'AABBCCDDEEFF0011': { soil_too_dry: { threshold: 15.0 } }
+    gardenhub_alerts.threshold_rule_overrides: {}
+
+    # Physically plausible [min, max] range per measurement type, used by
+    # AssertPhysicalRange to reject nonsensical readings (sensor fault,
+    # wiring issue, codec drift). Unmapped types are not range-checked.
+    gardenhub_alerts.physical_ranges:
+        battery: [0.0, 5.0]
+        soil_moisture: [0.0, 100.0]
+        soil_temperature: [-20.0, 60.0]
+        air_temperature: [-20.0, 60.0]
+        soil_conductivity: [0.0, 10000.0]

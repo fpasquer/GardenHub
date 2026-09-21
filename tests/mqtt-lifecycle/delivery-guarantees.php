@@ -256,11 +256,14 @@ try {
     // -----------------------------------------------------------------
     // 4. Handler-time failure: message stays queued, retry recovers it.
     // -----------------------------------------------------------------
-    $connection->executeStatement('ALTER TABLE measurement ADD CONSTRAINT delivery_flush_failure CHECK (value <> 9999)');
-    ingest($kernel, uplink(['BatV' => 9999]));
+    // 4.5 is within AssertPhysicalRange's battery range ([0, 5]), so it
+    // reaches flush unlike an out-of-range value, then trips the CHECK
+    // constraint below to simulate an unexpected persistence failure.
+    $connection->executeStatement('ALTER TABLE measurement ADD CONSTRAINT delivery_flush_failure CHECK (value <> 4.5)');
+    ingest($kernel, uplink(['BatV' => 4.5]));
 
     $output = $consume();
-    check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE value = 9999'), 'A failing handler must not persist partial measurements.');
+    check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE value = 4.5'), 'A failing handler must not persist partial measurements.');
     check(false !== $connection->fetchAssociative("SELECT * FROM messenger_messages WHERE queue_name = 'async' AND delivered_at IS NULL"), 'A temporary handler failure must leave the message queued for retry.');
 
     // Remove the failure condition; the retry must recover persistence.
@@ -268,7 +271,7 @@ try {
     $connection->executeStatement("UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL");
     $consume();
 
-    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE value = 9999'), 'The retried message must persist after recovery.');
+    check(1 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE value = 4.5'), 'The retried message must persist after recovery.');
     check(0 === (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'async' AND delivered_at IS NULL"), 'The queue must be empty after the retry succeeds.');
     echo "PASS retry: temporary handler failure requeued and recovered\n";
 
@@ -282,12 +285,12 @@ try {
     //    assertions below prove the CHECK constraint actually fired instead
     //    of accepting any generic (or wrong-cause) failure as sufficient.
     // -----------------------------------------------------------------
-    $connection->executeStatement('ALTER TABLE measurement ADD CONSTRAINT delivery_flush_failure CHECK (value <> 8888)');
+    $connection->executeStatement('ALTER TABLE measurement ADD CONSTRAINT delivery_flush_failure CHECK (value <> 4.75)');
     $exhaustionId = (string) Uuid::v4();
     $scenarioSubscriber = $container->get('test.scenario_subscriber');
     $scenarioSubscriber->armFailureCapture($exhaustionId);
 
-    ingest($kernel, uplink(['BatV' => 8888], devEui: 'failed-device', deduplicationId: $exhaustionId, deviceName: 'Failed sensor'));
+    ingest($kernel, uplink(['BatV' => 4.75], devEui: 'failed-device', deduplicationId: $exhaustionId, deviceName: 'Failed sensor'));
 
     // Force every retry to be immediately available, then burn through them.
     for ($attempt = 0; $attempt < 4; ++$attempt) {

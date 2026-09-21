@@ -12,6 +12,7 @@ use ApiPlatform\Metadata\Get;
 use ApiPlatform\Metadata\GetCollection;
 use ApiPlatform\Metadata\Post;
 use App\Repository\MeasurementRepository;
+use App\Validator\AssertPhysicalRange;
 use Doctrine\ORM\Mapping as ORM;
 use Symfony\Component\Serializer\Attribute\Groups;
 use Symfony\Component\Validator\Constraints as Assert;
@@ -26,6 +27,7 @@ use Symfony\Component\Validator\Constraints as Assert;
 #[ORM\Entity(repositoryClass: MeasurementRepository::class)]
 #[ORM\Index(columns: ['sensor_id', 'measured_at'], name: 'idx_measurement_sensor_measured_at')]
 #[ORM\UniqueConstraint(name: 'uniq_measurement_dedup_type', columns: ['deduplication_id', 'type'])]
+#[AssertPhysicalRange]
 #[ApiResource(
     operations: [
         new GetCollection(),

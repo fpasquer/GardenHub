@@ -3,7 +3,14 @@
 # requires ChirpStackUplink messages to be handled synchronously in-process.
 # Delivery guarantees (async routing, retry, failure transport) are covered
 # by delivery-guarantees.php instead.
+#
+# EvaluateUplinkMeasurements is likewise routed to sync here: this suite's
+# schema is built by SchemaTool from ORM metadata only, so the raw
+# messenger_messages table backing the real "alerts" doctrine transport does
+# not exist. Handling it in-process avoids depending on that table while
+# still exercising the evaluation handler on every stored measurement batch.
 framework:
     messenger:
         routing:
             'App\Mqtt\ChirpStackUplink': sync
+            'App\Alert\Message\EvaluateUplinkMeasurements': sync

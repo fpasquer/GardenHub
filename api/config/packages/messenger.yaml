@@ -18,10 +18,36 @@ framework:
                 options:
                     auto_setup: false
             sync: 'sync://'
+            # Internal alert plumbing (evaluation handoff + processing-failure
+            # recording), consumed by the existing gardenhub-consumer worker.
+            alerts:
+                dsn: 'doctrine://default?queue_name=alerts'
+                options:
+                    auto_setup: false
+                retry_strategy:
+                    max_retries: 3
+                    delay: 30000
+                    multiplier: 2
+                    jitter: 0.1
+            # Telegram delivery, consumed by its own dedicated gardenhub-notifier
+            # worker so a Telegram outage never blocks measurement ingestion.
+            telegram_notifications:
+                dsn: 'doctrine://default?queue_name=telegram_notifications'
+                options:
+                    auto_setup: false
+                retry_strategy:
+                    max_retries: 5
+                    delay: 5000
+                    multiplier: 2
+                    jitter: 0.1
+            scheduler_default: 'schedule://default'
 
         routing:
             # Route ChirpStack uplinks to the durable async transport
             'App\Mqtt\ChirpStackUplink': async
+            'App\Alert\Message\EvaluateUplinkMeasurements': alerts
+            'App\Alert\Message\RecordProcessingFailureAlert': alerts
+            'App\Alert\Message\SendTelegramNotification': telegram_notifications
 
 # when@test:
 #    framework:

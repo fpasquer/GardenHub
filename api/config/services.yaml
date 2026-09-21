@@ -41,6 +41,8 @@ services:
     App\Mqtt\ChirpStackUplinkHandler:
         arguments:
             $fieldMap: '%mqtt.field_map%'
+            $processingFailureConfirmationCount: '%gardenhub_alerts.processing_failure.confirmation_count%'
+            $processingFailureRecoveryCount: '%gardenhub_alerts.processing_failure.recovery_count%'
 
     App\Command\MqttConsumeCommand:
         arguments:
@@ -51,6 +53,46 @@ services:
             $clientId: '%env(MQTT_CLIENT_ID)%'
             $topic: '%env(MQTT_TOPIC)%'
             $servicesResetter: '@services_resetter'
+
+    App\Alert\Telegram\TelegramConfig:
+        arguments:
+            $enabled: '%env(bool:TELEGRAM_ALERTS_ENABLED)%'
+            $botToken: '%env(TELEGRAM_BOT_TOKEN)%'
+            $chatId: '%env(TELEGRAM_CHAT_ID)%'
+            $environmentLabel: '%env(TELEGRAM_ENVIRONMENT_LABEL)%'
+            $httpTimeout: '%env(float:TELEGRAM_HTTP_TIMEOUT)%'
+            $httpMaxDuration: '%env(float:TELEGRAM_HTTP_MAX_DURATION)%'
+
+    App\Alert\Telegram\TelegramAlertHandler:
+        arguments:
+            $level: '%env(TELEGRAM_MIN_LEVEL)%'
+
+    App\Alert\AlertLifecycleService:
+        arguments:
+            $reminderIntervalSeconds: '%gardenhub_alerts.reminder_interval_seconds%'
+
+    App\Alert\Message\EvaluateAlertsHandler:
+        arguments:
+            $reminderIntervalSeconds: '%gardenhub_alerts.reminder_interval_seconds%'
+
+    App\Alert\Rule\ThresholdRuleProvider:
+        arguments:
+            $defaults: '%gardenhub_alerts.threshold_rules%'
+            $overrides: '%gardenhub_alerts.threshold_rule_overrides%'
+
+    App\Validator\AssertPhysicalRangeValidator:
+        arguments:
+            $ranges: '%gardenhub_alerts.physical_ranges%'
+
+    App\Alert\InvalidReading\InvalidReadingAlertService:
+        arguments:
+            $confirmationCount: '%gardenhub_alerts.invalid_reading.confirmation_count%'
+            $recoveryCount: '%gardenhub_alerts.invalid_reading.recovery_count%'
+
+    App\Alert\Message\RecordProcessingFailureAlertHandler:
+        arguments:
+            $confirmationCount: '%gardenhub_alerts.processing_failure.confirmation_count%'
+            $recoveryCount: '%gardenhub_alerts.processing_failure.recovery_count%'
 
     # add more service definitions when explicit configuration is needed
     # please note that last definitions always *replace* previous ones

@@ -34,7 +34,8 @@ class ApiClientCreateCommand extends Command
     {
         $this
             ->addArgument('name', InputArgument::REQUIRED, 'Client name, e.g. "grafana" or "react-frontend"')
-            ->addOption('readonly', null, InputOption::VALUE_NONE, 'Grant read-only access (no write rights)');
+            ->addOption('readonly', null, InputOption::VALUE_NONE, 'Grant read-only access (no write rights)')
+            ->addOption('admin', null, InputOption::VALUE_NONE, 'Grant admin access (acknowledge/resolve alert incidents)');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -52,6 +53,9 @@ class ApiClientCreateCommand extends Command
         $roles = [ApiClient::ROLE_READ];
         if (!$input->getOption('readonly')) {
             $roles[] = ApiClient::ROLE_WRITE;
+        }
+        if ($input->getOption('admin')) {
+            $roles[] = ApiClient::ROLE_ADMIN;
         }
 
         $client = (new ApiClient())

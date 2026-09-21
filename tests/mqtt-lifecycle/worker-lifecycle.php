@@ -160,7 +160,10 @@ function workerScenario(LifecycleKernel $kernel, string $scenario): int
         $messages[] = uplink(['BatV' => 3.3]);
     }
     if ('reset-failure' !== $scenario) {
-        $messages[] = uplink(['BatV' => 9999]);
+        // 4.5 is within AssertPhysicalRange's battery range ([0, 5]), so it
+        // reaches flush unlike an out-of-range value, then trips the CHECK
+        // constraint below to simulate an unexpected persistence failure.
+        $messages[] = uplink(['BatV' => 4.5]);
     }
     $expectedCallbacks = count($messages);
     $messages[] = uplink(['BatV' => 777]);
@@ -271,7 +274,7 @@ try {
     $schema = new SchemaTool($entityManager);
     $schema->dropSchema($metadata);
     $schema->createSchema($metadata);
-    $connection->executeStatement('ALTER TABLE measurement ADD CONSTRAINT lifecycle_flush_failure CHECK (value <> 9999)');
+    $connection->executeStatement('ALTER TABLE measurement ADD CONSTRAINT lifecycle_flush_failure CHECK (value <> 4.5)');
 
     runChild('initial');
     check(41 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement'), 'Successive uplinks must persist exactly the accepted measurements.');
@@ -279,7 +282,7 @@ try {
     check(3 === (int) $connection->fetchOne('SELECT COUNT(*) FROM sensor'), 'Sensor auto-provisioning duplicated an existing sensor.');
     check('Lifecycle sensor' === $connection->fetchOne('SELECT name FROM device'), 'Device placeholder name was not upgraded.');
     check(0 === (int) $connection->fetchOne("SELECT COUNT(*) FROM measurement WHERE measured_at > '2021-01-01'"), 'A rejected measurement leaked into a later flush.');
-    check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE value IN (42, 777, 9999)'), 'Rejected, failed, or post-failure uplinks were persisted.');
+    check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE value IN (42, 777, 4.5)'), 'Rejected, failed, or post-failure uplinks were persisted.');
     check(20 === (int) $connection->fetchOne("SELECT COUNT(*) FROM measurement m JOIN sensor s ON s.id = m.sensor_id WHERE s.type = 'soil_temperature' AND m.value = 18.5"), 'Numeric payload mapping changed.');
     check('V' === $connection->fetchOne("SELECT unit FROM sensor WHERE type = 'battery'"), 'Sensor unit mapping changed.');
 
