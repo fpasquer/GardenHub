@@ -611,7 +611,7 @@ cd GardenHub
 
 Never commit production secrets.
 
-The deployment uses a root `.env` file for Compose variables (`/opt/GardenHub/.env` in this repository's layout). Plain `docker compose` commands only read this single file automatically; they do **not** merge an untracked `.env.local` on their own. Only this repository's `Makefile` does that, via explicit `--env-file` flags:
+The deployment uses a root `.env` file for Compose variables (`/opt/gardenhub/.env` in this repository's layout). Plain `docker compose` commands only read this single file automatically; they do **not** merge an untracked `.env.local` on their own. Only this repository's `Makefile` does that, via explicit `--env-file` flags:
 
 ```make
 COMPOSE := docker compose --env-file .env
@@ -896,6 +896,48 @@ docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php te
 ```
 
 The second script exercises `StreamTelegramTransport` itself (HTTP errors, invalid JSON, `ok:false`, connection failures, and repeated calls) against a local fake server — no real Telegram access involved.
+
+## Daily summary
+
+`gardenhub:telegram:daily-summary` sends a compact rolling summary of ChirpStack
+uplink events to Telegram:
+
+```bash
+docker compose exec gardenhub-api php bin/console gardenhub:telegram:daily-summary
+docker compose exec gardenhub-api php bin/console gardenhub:telegram:daily-summary --hours=12
+```
+
+`--hours` defaults to `24` and must be a positive integer; zero, negative,
+non-numeric or malformed values (e.g. `abc`, `12abc`, `1.5`) exit with
+`Command::INVALID` and never send anything.
+
+The header counts **distinct ChirpStack uplink events**
+(`COUNT(DISTINCT deduplication_id)`), not measurement rows — a single uplink
+can produce several rows (one per sensor type), so the event count is
+normally lower than the row count. Per-sensor rows show the **min → max**
+value observed in the window (not first/latest), grouped by device:
+
+```
+🌱 24h · 72 events
+
+SE01-Avocado
+Moisture      25 → 31.2 %
+Temperature 22.9 → 23.4 °C
+```
+
+An empty window reports just `🌱 24h · 0 events`, with no table.
+
+This command has **no automatic scheduling**: it must be run manually or
+wired into external scheduling (e.g. host cron, a future
+`gardenhub-scheduler` service) — timing and timezone have not been decided
+yet, so none is configured here.
+
+Run the isolated test suite (own disposable MySQL container, never the dev database):
+
+```bash
+docker compose -f tests/telegram-summary/compose.yaml run --rm tests
+docker compose -f tests/telegram-summary/compose.yaml down -v
+```
 
 ## Failure isolation
 

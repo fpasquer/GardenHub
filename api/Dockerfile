@@ -24,8 +24,3 @@ COPY . .
 RUN composer dump-autoload --optimize \
     && composer run-script post-install-cmd --no-interaction \
     && chmod -R a+rw var
-
-# Daily Telegram summary schedule, read by busybox crond in the
-# gardenhub-scheduler service only (see docker/cron/telegram-daily-summary).
-RUN mkdir -p /etc/crontabs \
-    && cp docker/cron/telegram-daily-summary /etc/crontabs/root

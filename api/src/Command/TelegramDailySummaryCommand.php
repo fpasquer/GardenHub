@@ -7,8 +7,8 @@ use App\Repository\MeasurementRepository;
 use Psr\Clock\ClockInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
-use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
 
@@ -34,17 +34,15 @@ class TelegramDailySummaryCommand extends Command
 
     protected function configure(): void
     {
-        $this->addArgument('hours', InputArgument::REQUIRED, 'Size of the rolling window in hours, e.g. 24');
+        $this->addOption('hours', null, InputOption::VALUE_REQUIRED, 'Size of the rolling window in hours', '24');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $io = new SymfonyStyle($input, $output);
-        $hours = (int) $input->getArgument('hours');
+        $hours = $this->parseHours((string) $input->getOption('hours'), $io);
 
-        if ($hours <= 0) {
-            $io->error('The "hours" argument must be a positive integer.');
-
+        if (null === $hours) {
             return Command::INVALID;
         }
 
@@ -58,8 +56,9 @@ class TelegramDailySummaryCommand extends Command
         $until = $this->clock->now();
         $since = $until->modify("-{$hours} hours");
 
+        $eventCount = $this->measurementRepository->countDistinctEventsInWindow($since, $until);
         $rows = $this->measurementRepository->aggregateMinMaxInWindow($since, $until);
-        $message = $this->buildMessage($hours, $rows);
+        $message = $this->buildMessage($hours, $eventCount, $rows);
 
         try {
             $this->transport->send($this->botToken, $this->chatId, $message, 'HTML');
@@ -75,14 +74,30 @@ class TelegramDailySummaryCommand extends Command
     }
 
     /**
-     * @param array<int, array{deviceName: string, sensorId: int, sensorType: string, sensorLabel: ?string, unit: string, rowCount: int, minValue: float, maxValue: float}> $rows
+     * Rejects the raw option string before any int cast: a cast-first check
+     * would silently truncate malformed input like "12abc" or "1.5".
      */
-    private function buildMessage(int $hours, array $rows): string
+    private function parseHours(string $raw, SymfonyStyle $io): ?int
     {
-        $total = array_sum(array_column($rows, 'rowCount'));
-        $header = sprintf('🌱 %dh · %d measurements', $hours, $total);
+        $hours = filter_var($raw, FILTER_VALIDATE_INT);
 
-        if (0 === $total) {
+        if (false === $hours || $hours <= 0) {
+            $io->error('The "--hours" option must be a positive integer.');
+
+            return null;
+        }
+
+        return $hours;
+    }
+
+    /**
+     * @param array<int, array{deviceName: string, sensorId: int, sensorType: string, sensorLabel: ?string, unit: string, minValue: float, maxValue: float}> $rows
+     */
+    private function buildMessage(int $hours, int $eventCount, array $rows): string
+    {
+        $header = sprintf('🌱 %dh · %d events', $hours, $eventCount);
+
+        if (0 === $eventCount) {
             return $header;
         }
 
@@ -94,7 +109,7 @@ class TelegramDailySummaryCommand extends Command
     /**
      * Builds the plain-text, padded table BEFORE any HTML escaping happens.
      *
-     * @param array<int, array{deviceName: string, sensorId: int, sensorType: string, sensorLabel: ?string, unit: string, rowCount: int, minValue: float, maxValue: float}> $rows
+     * @param array<int, array{deviceName: string, sensorId: int, sensorType: string, sensorLabel: ?string, unit: string, minValue: float, maxValue: float}> $rows
      */
     private function buildTable(array $rows): string
     {
