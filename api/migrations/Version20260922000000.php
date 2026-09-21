@@ -12,10 +12,11 @@ use Doctrine\Migrations\AbstractMigration;
  *
  * alert_evaluation_progress keeps per-(alert_type, subject_key) replay and
  * ordering state independently of any alert_incident row, so protection
- * survives incident resolution. Backfill uses only the incident row holding
- * each key's max last_considered_measurement_id: that row's last_measured_at
- * is the same applied signal's timestamp, so the (id, measured_at) pair is
- * coherent and never mixes independent maxima from different rows.
+ * survives incident resolution. Its backfill moved to Version20260923000000
+ * for a deterministic tie-breaker; safe post-deploy edit, see README - this
+ * migration already ran in a real environment, and Doctrine tracks applied
+ * migrations by version id only, never re-diffs file content, so trimming
+ * this INSERT has no effect anywhere it already ran.
  *
  * alert_processed_uplink records every uplink whose device-level alert
  * evaluation has run, keyed by its ChirpStack deduplicationId. Backfilled
@@ -59,21 +60,6 @@ final class Version20260922000000 extends AbstractMigration
             ) DEFAULT CHARACTER SET utf8mb4
             SQL);
         $this->addSql('CREATE UNIQUE INDEX uniq_alert_processed_uplink_dedup ON alert_processed_uplink (deduplication_id)');
-
-        // Backfill progress from the incident row holding each key's max id;
-        // that row's last_measured_at is the same signal's timestamp.
-        $this->addSql(<<<'SQL'
-            INSERT INTO alert_evaluation_progress
-                (alert_type, subject_key, last_considered_measurement_id, last_considered_measured_at, created_at, updated_at)
-            SELECT i.alert_type, i.subject_key, i.last_considered_measurement_id, i.last_measured_at, NOW(), NOW()
-            FROM alert_incident i
-            INNER JOIN (
-                SELECT alert_type, subject_key, MAX(last_considered_measurement_id) AS max_id
-                FROM alert_incident
-                WHERE last_considered_measurement_id IS NOT NULL
-                GROUP BY alert_type, subject_key
-            ) m ON m.alert_type = i.alert_type AND m.subject_key = i.subject_key AND m.max_id = i.last_considered_measurement_id
-            SQL);
 
         // Backfill processed uplinks from measurements' distinct dedup ids.
         $this->addSql(<<<'SQL'

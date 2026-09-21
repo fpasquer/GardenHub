@@ -64,6 +64,7 @@ final class InvalidReadingKernel extends Kernel
         parent::build($container);
         $container->setAlias('test.messenger.default_bus', 'messenger.default_bus')->setPublic(true);
         $container->setAlias('test.messenger_serializer', 'messenger.default_serializer')->setPublic(true);
+        $container->setAlias('test.chirpstack_uplink_handler', ChirpStackUplinkHandler::class)->setPublic(true);
     }
 }
 
@@ -160,7 +161,7 @@ try {
     $connection->close();
 
     /** @var ChirpStackUplinkHandler $handler */
-    $handler = $container->get(ChirpStackUplinkHandler::class);
+    $handler = $container->get('test.chirpstack_uplink_handler');
     $serializer = $container->get('test.messenger_serializer');
     $messageBus = $container->get('test.messenger.default_bus');
 

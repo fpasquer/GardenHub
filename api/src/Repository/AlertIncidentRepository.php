@@ -5,6 +5,7 @@ namespace App\Repository;
 use App\Entity\AlertIncident;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
 use Doctrine\DBAL\LockMode;
+use Doctrine\ORM\Query;
 use Doctrine\Persistence\ManagerRegistry;
 
 /**
@@ -38,26 +39,30 @@ class AlertIncidentRepository extends ServiceEntityRepository
      * index on the database-generated is_open column is the backstop for
      * that race (see AlertLifecycleService).
      *
-     * The advisory findOpenIncident() snapshot may point at a row another
-     * transaction has since resolved. The locking refresh below is a current
-     * read (SELECT ... FOR UPDATE) that hydrates the latest committed state
-     * into the entity, past the REPEATABLE-READ snapshot and the identity
-     * map; the status is then re-validated under the lock. A row that turned
-     * out to be resolved yields null, so the caller re-evaluates and can
-     * open a new incident for a fresh breach (the resolved row's is_open is
-     * NULL, so the unique index allows exactly one new open incident).
+     * This is a direct locking read (SELECT ... FOR UPDATE), not an
+     * advisory read followed by a conditional lock: a plain query would
+     * reuse this transaction's REPEATABLE-READ snapshot and could miss a
+     * row another transaction inserted after that snapshot was taken,
+     * making the caller wrongly conclude no incident is open. The locking
+     * read always sees the latest committed state, and HINT_REFRESH forces
+     * the hydrated entity to reflect it even if a stale instance already
+     * sits in the identity map. The status is re-validated under the lock
+     * as a defensive check.
      */
     public function lockOpenIncident(string $alertType, string $subjectKey): ?AlertIncident
     {
-        $incident = $this->findOpenIncident($alertType, $subjectKey);
+        $incident = $this->createOpenIncidentQueryBuilder($alertType, $subjectKey)
+            ->getQuery()
+            ->setLockMode(LockMode::PESSIMISTIC_WRITE)
+            ->setHint(Query::HINT_REFRESH, true)
+            ->getOneOrNullResult();
+
         if (null === $incident) {
             return null;
         }
 
-        $this->getEntityManager()->refresh($incident, LockMode::PESSIMISTIC_WRITE);
-
         if (!in_array($incident->getStatus(), [AlertIncident::STATUS_PENDING, AlertIncident::STATUS_ACTIVE], true)) {
-            // Resolved concurrently between the advisory read and the lock.
+            // Resolved concurrently between the query parse and the lock.
             return null;
         }
 

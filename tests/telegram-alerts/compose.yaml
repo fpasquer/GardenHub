@@ -16,7 +16,7 @@ services:
 
   tests:
     image: gardenhub-api
-    entrypoint: ["sh", "-c", "php /tests/telegram-delivery.php && php /tests/alert-lifecycle.php && php /tests/replay-protection.php && php /tests/invalid-reading-aggregation.php && php /tests/threshold-freshness.php && php /tests/incident-api.php && php /tests/scheduler.php && php /tests/concurrency.php"]
+    entrypoint: ["sh", "-c", "php /tests/telegram-delivery.php && php /tests/alert-lifecycle.php && php /tests/replay-protection.php && php /tests/invalid-reading-aggregation.php && php /tests/threshold-freshness.php && php /tests/incident-api.php && php /tests/scheduler.php && php /tests/concurrency.php && php /tests/migration-upgrade.php && php /tests/marker-rollback.php"]
     environment:
       APP_ENV: dev
       APP_DEBUG: '1'

@@ -25,9 +25,12 @@ use Symfony\Bundle\FrameworkBundle\Console\Application;
 use Symfony\Component\Clock\MockClock;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\BufferedOutput;
+use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
+use Symfony\Component\DependencyInjection\Compiler\PassConfig;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
+use Symfony\Component\Scheduler\Generator\MessageContext;
 use Symfony\Component\Scheduler\RecurringMessage;
 use Symfony\Component\Scheduler\Schedule as SymfonySchedule;
 use Symfony\Component\Scheduler\ScheduleProviderInterface;
@@ -70,8 +73,65 @@ final class SchedulerTestKernel extends Kernel
         $container->setAlias('test.schedule', Schedule::class)->setPublic(true);
         $container->setAlias('test.messenger.default_bus', 'messenger.default_bus')->setPublic(true);
         $container->setAlias('test.messenger_serializer', 'messenger.default_serializer')->setPublic(true);
+    }
+}
+
+/**
+ * Test-only compiler pass removing a single service definition. Used to drop
+ * the production App\Schedule provider so FastScheduleProvider can take over
+ * the "default" schedule name without colliding with it.
+ */
+final class RemoveDefinitionCompilerPass implements CompilerPassInterface
+{
+    public function __construct(private readonly string $id)
+    {
+    }
+
+    public function process(ContainerBuilder $container): void
+    {
+        $container->removeDefinition($this->id);
+    }
+}
+
+/**
+ * Boots with the real production Schedule provider entirely removed and
+ * FastScheduleProvider registered under the "default" schedule name in its
+ * place, so messenger:consume scheduler_default genuinely receives messages
+ * from the fast (1s) test provider instead of the real 5-minute one.
+ */
+final class SchedulerMachineryKernel extends Kernel
+{
+    public function getProjectDir(): string
+    {
+        return '/app';
+    }
+
+    public function getCacheDir(): string
+    {
+        return '/tmp/gardenhub-scheduler-machinery/cache';
+    }
+
+    public function getLogDir(): string
+    {
+        return '/tmp/gardenhub-scheduler-machinery/log';
+    }
+
+    protected function build(ContainerBuilder $container): void
+    {
+        parent::build($container);
+        $container->setAlias('test.messenger.default_bus', 'messenger.default_bus')->setPublic(true);
+        $container->setAlias('test.messenger_serializer', 'messenger.default_serializer')->setPublic(true);
         $container->register('test.fast_schedule_provider', FastScheduleProvider::class)
-            ->addTag('scheduler.schedule_provider');
+            ->addTag('scheduler.schedule_provider', ['name' => 'default']);
+
+        // App\Schedule's own services.yaml-driven registration (and its
+        // #[AsSchedule] tag) only exist once App\ resources are loaded,
+        // which happens after build(). Removing it here, in a compiler pass
+        // running before AddScheduleMessengerPass (registered by
+        // FrameworkBundle at TYPE_BEFORE_OPTIMIZATION, priority 0), avoids
+        // the "can not replace already registered service" collision that
+        // would otherwise be thrown for two providers under the same name.
+        $container->addCompilerPass(new RemoveDefinitionCompilerPass(Schedule::class), PassConfig::TYPE_BEFORE_OPTIMIZATION, 10);
     }
 }
 
@@ -147,10 +207,11 @@ function scenarioScheduleRegistration(Schedule $schedule): void
     $recurring = $schedule->getSchedule()->getRecurringMessages();
     check(1 === count($recurring), sprintf('Exactly one recurring message must be registered, got %d.', count($recurring)));
 
-    $messages = $recurring[0]->getMessages();
+    $now = new \DateTimeImmutable('2026-01-01T12:00:00Z');
+    $context = new MessageContext(name: 'default', id: $recurring[0]->getId(), trigger: $recurring[0]->getTrigger(), triggeredAt: $now);
+    $messages = iterator_to_array($recurring[0]->getMessages($context));
     check(1 === count($messages) && $messages[0] instanceof EvaluateAlertsMessage, 'The recurring message must carry EvaluateAlertsMessage.');
 
-    $now = new \DateTimeImmutable('2026-01-01T12:00:00Z');
     $next = $recurring[0]->getTrigger()->getNextRunDate($now);
     check(null !== $next, 'The trigger must produce a next run date.');
     $interval = $next->getTimestamp() - $now->getTimestamp();
@@ -198,30 +259,48 @@ function scenarioSchedulerMachinery(EntityManagerInterface $em, MessageBusInterf
 
 try {
     check('1' === getenv('GARDENHUB_LIFECYCLE_TESTS'), 'Run only with the isolated test Compose file.');
-    $kernel = new SchedulerTestKernel('dev', true);
-    $kernel->boot();
-    $container = $kernel->getContainer();
+
+    // Kernel A: the real, untouched production Schedule - proves the actual
+    // registration (5-minute EvaluateAlertsMessage) is correct.
+    $kernelA = new SchedulerTestKernel('dev', true);
+    $kernelA->boot();
+    $containerA = $kernelA->getContainer();
 
     /** @var EntityManagerInterface $entityManager */
-    $entityManager = $container->get('doctrine')->getManager();
+    $entityManager = $containerA->get('doctrine')->getManager();
     $connection = $entityManager->getConnection();
     resetDatabase($connection);
 
-    $application = new Application($kernel);
-    $application->setAutoExit(false);
-    runConsole($application, ['command' => 'doctrine:migrations:migrate']);
+    $applicationA = new Application($kernelA);
+    $applicationA->setAutoExit(false);
+    runConsole($applicationA, ['command' => 'doctrine:migrations:migrate']);
     $connection->close();
 
     /** @var Schedule $schedule */
-    $schedule = $container->get('test.schedule');
+    $schedule = $containerA->get('test.schedule');
     scenarioScheduleRegistration($schedule);
+    $kernelA->shutdown();
 
-    $messageBus = $container->get('test.messenger.default_bus');
-    $serializer = $container->get('test.messenger_serializer');
-    scenarioSchedulerMachinery($entityManager, $messageBus, $connection, $serializer, $application);
+    // Kernel B: production Schedule removed, FastScheduleProvider (1s) takes
+    // over the "default" schedule name - proves messenger:consume
+    // scheduler_default genuinely drives EvaluateAlertsHandler end to end.
+    // The schema is already migrated; no need to reset or re-migrate.
+    $kernelB = new SchedulerMachineryKernel('dev', true);
+    $kernelB->boot();
+    $containerB = $kernelB->getContainer();
 
-    echo "PASS scheduler: registration verified and the real machinery reminds only due active incidents\n";
-    $kernel->shutdown();
+    /** @var EntityManagerInterface $entityManagerB */
+    $entityManagerB = $containerB->get('doctrine')->getManager();
+    $connectionB = $entityManagerB->getConnection();
+    $messageBus = $containerB->get('test.messenger.default_bus');
+    $serializer = $containerB->get('test.messenger_serializer');
+    $applicationB = new Application($kernelB);
+    $applicationB->setAutoExit(false);
+
+    scenarioSchedulerMachinery($entityManagerB, $messageBus, $connectionB, $serializer, $applicationB);
+
+    echo "PASS scheduler: registration verified against the real, unaltered production schedule; the real machinery (via a dedicated fast provider) reminds only due active incidents\n";
+    $kernelB->shutdown();
     exit(0);
 } catch (Throwable $exception) {
     fwrite(STDERR, 'FAIL: '.$exception->getMessage()."\n".$exception->getTraceAsString()."\n");

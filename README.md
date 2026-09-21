@@ -340,17 +340,41 @@ collide on existing data. Historical duplicates are left as-is.
 
 ### Deploying the alert evaluation-state migration
 
-`Version20260922000000` adds `alert_evaluation_progress` and
-`alert_processed_uplink` (durable replay protection) and backfills them:
-progress comes from each subject's incident row holding its highest
-`last_considered_measurement_id` (that row's `last_measured_at` is the same
-applied signal's timestamp, so the pair is coherent); processed uplinks come
-from the measurements' distinct `deduplication_id`s. No message formats
-change, so no queue drain is required beyond the standard
+This is split across two migrations so a crash mid-backfill on one environment
+can never block another environment that already migrated past it (Doctrine
+tracks applied migrations by version id only, never re-diffs file content):
+
+- `Version20260922000000` creates `alert_evaluation_progress` and
+  `alert_processed_uplink`, and backfills only `alert_processed_uplink` from
+  the measurements' distinct `deduplication_id`s — always safe, no tie-break
+  needed.
+- `Version20260923000000` backfills `alert_evaluation_progress` from each
+  subject's `alert_incident` row. Where multiple incidents historically share
+  an (alert_type, subject_key) — e.g. resolved-then-reopened incidents tied on
+  the same `last_considered_measurement_id` — the row with the highest
+  `last_considered_measurement_id` wins, and the highest incident `id` breaks
+  any tie deterministically. The backfill is idempotent and non-regressing: an
+  `ON DUPLICATE KEY UPDATE` guard only overwrites an existing progress row
+  when the incoming value is strictly newer, so it can be safely re-run and
+  can never clobber progress already advanced by live processing that ran
+  ahead of it.
+
+No message formats change, so no queue drain is required beyond the standard
 `make deploy` order (stop writers → migrate → start). Known limitation:
 uplinks that were entirely invalid or empty before this migration left no
 rows anywhere, so one duplicate invalid-reading signal per such replayed
 uplink is possible once after deploy.
+
+### `is_open` and `doctrine:schema:validate`
+
+`alert_incident.is_open` is a database-generated virtual column (`CASE WHEN
+status IN ('pending', 'active') THEN 1 ELSE NULL END`), backing the unique
+index that enforces at most one open incident per (alert_type, subject_key)
+at the database level. Doctrine's ORM mapping has no equivalent generated
+property, so `doctrine:schema:validate`/`doctrine:schema:update --dump-sql`
+will always report this column and its index as a mapping drift. This is
+intentional — do not "fix" it by dropping the column or index, and do not add
+an ORM-mapped property for it.
 
 ## `gardenhub-consumer`
 
@@ -509,10 +533,20 @@ vs. permanent HTTP failures) against a fake HTTP client; the alert lifecycle
 (confirmation/recovery staging, idempotent replay, reminder scheduling);
 durable replay protection and measured-at ordering; per-uplink invalid-reading
 aggregation; clock-based threshold freshness boundaries; the acknowledge /
-resolve HTTP operations end to end; scheduler registration plus the real
-`scheduler_default` machinery; and genuine database-level concurrency (the
-`alert_incident` unique-index backstop, the locking refresh, and
-resolution/reminder races) using a second raw connection in the same process.
+resolve HTTP operations end to end; scheduler registration (against the real,
+unmodified production schedule) plus the real `scheduler_default` machinery
+(a second kernel swaps in a fast recurring message so the test never waits
+out the production 5-minute interval); genuine database-level concurrency
+(the `alert_incident` unique-index backstop, the locking refresh recovering a
+phantom incident, and a reminder raced against a concurrent resolution) using
+a second raw connection in the same process; both alert evaluation-state
+migration upgrade paths (a fresh install backfilling tied historical
+incidents, and re-running the corrective migration without regressing
+progress already advanced by live processing); and a marker-flush failure
+injected between `alert_processed_uplink`'s flush and its transaction's
+commit, proving the whole uplink (measurement, marker, incident/notification)
+rolls back atomically and a genuine Messenger retry then completes it exactly
+once.
 
 ## `gardenhub-scheduler`
 

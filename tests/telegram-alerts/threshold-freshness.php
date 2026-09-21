@@ -205,16 +205,19 @@ try {
     $clock = new MockClock('2026-01-01T12:00:00Z');
     $evaluator = evaluator($entityManager, $messageBus, $clock);
 
-    // -- Fresh (age M-1) then boundary (age == M) breaches -----------------
-    $evaluator->evaluateMeasurement(persistMeasurement($entityManager, $sensor, 10.0, '2026-01-01T10:00:01Z')); // age 7199
-    $row = incidentRow($connection, $sensorId);
-    check(null !== $row && 1 === (int) $row['confirmation_count'], 'A fresh breach (age M-1) must be applied.');
-
+    // -- Boundary (age == M) then fresh (age M-1) breaches -----------------
+    // Evaluated in ascending measured_at order: AlertLifecycleService's
+    // watermark guard rejects any signal older than the last one it saw, so
+    // the older (boundary) reading must be evaluated first.
     $evaluator->evaluateMeasurement(persistMeasurement($entityManager, $sensor, 10.0, '2026-01-01T10:00:00Z')); // age exactly 7200
     $row = incidentRow($connection, $sensorId);
-    check(2 === (int) $row['confirmation_count'] && AlertIncident::STATUS_ACTIVE === $row['status'], 'A boundary-age breach (age == M) must still be fresh and reach the threshold.');
+    check(null !== $row && 1 === (int) $row['confirmation_count'], 'A boundary-age breach (age == M) must still be fresh and applied.');
+
+    $evaluator->evaluateMeasurement(persistMeasurement($entityManager, $sensor, 10.0, '2026-01-01T10:00:01Z')); // age 7199
+    $row = incidentRow($connection, $sensorId);
+    check(2 === (int) $row['confirmation_count'] && AlertIncident::STATUS_ACTIVE === $row['status'], 'A fresh breach (age M-1) must be applied and reach the threshold.');
     check(1 === count(notificationsFor($connection, $serializer, $subjectKey)), 'Activation must enqueue exactly one "opened" notification.');
-    echo "PASS fresh-and-boundary: age M-1 applies, age == M is still fresh and activates the incident\n";
+    echo "PASS fresh-and-boundary: age == M is still fresh and applies, age M-1 activates the incident\n";
 
     // -- Expired breach (age M+1): no state change -------------------------
     $before = incidentRow($connection, $sensorId);

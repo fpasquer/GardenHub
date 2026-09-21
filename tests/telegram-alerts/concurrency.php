@@ -20,6 +20,15 @@ declare(strict_types=1);
  *     holds a pre-resolution REPEATABLE-READ snapshot; openOrAdvance() must
  *     see the committed resolution under the lock and create a NEW incident
  *     instead of advancing the resolved row.
+ *  4. The mirror image of (3) for recovery: another transaction OPENS an
+ *     incident invisible to the main connection's pinned snapshot;
+ *     lockOpenIncident() must still find and recover it under the lock
+ *     instead of silently no-op'ing on a phantom "nothing open" read.
+ *  5. A reminder pass whose findDueForReminder() scan correctly finds an
+ *     incident due, but which is then resolved by another transaction
+ *     before the per-incident locking refresh() re-checks it, must not send
+ *     a stale reminder - exercised via a DBAL driver middleware that injects
+ *     the resolution deterministically between those two reads.
  *
  * All use a second raw PDO connection in this same process (not a
  * subprocess): simpler than tests/sensor-identity/concurrency.php's
@@ -45,8 +54,18 @@ use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\BufferedOutput;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Tests\TelegramAlerts\ReminderCollisionConfig;
+use Tests\TelegramAlerts\ReminderCollisionMiddleware;
 
 require '/app/vendor/autoload.php';
+
+// Test-only classes under /tests/src are not in the Composer autoloader.
+spl_autoload_register(static function (string $class): void {
+    $prefix = 'Tests\\TelegramAlerts\\';
+    if (str_starts_with($class, $prefix)) {
+        require '/tests/src/'.substr($class, strlen($prefix)).'.php';
+    }
+});
 
 const TEST_DATABASE = 'telegram_alerts';
 const ALERT_TYPE = 'concurrency_test';
@@ -72,6 +91,8 @@ final class AlertConcurrencyKernel extends Kernel
     {
         parent::build($container);
         $container->setAlias('test.messenger.default_bus', 'messenger.default_bus')->setPublic(true);
+        $container->register('test.reminder_collision_middleware', ReminderCollisionMiddleware::class)
+            ->addTag('doctrine.middleware');
     }
 }
 
@@ -314,6 +335,52 @@ function scenarioResolutionBeforeLock(ManagerRegistry $registry, MessageBusInter
     echo "PASS resolution-before-lock: resolution landing between the advisory read and the lock yields a new incident; the resolved row stays untouched\n";
 }
 
+function scenarioRecoveryMissesPhantomIncident(ManagerRegistry $registry, MessageBusInterface $bus): void
+{
+    $subjectKey = 'subject-recovery-phantom-incident';
+    [$em, $service] = freshServices($registry, $bus);
+    // A recovery signal with no incident open yet only creates the progress
+    // row (openOrAdvance() no-ops on a non-breach signal when nothing is
+    // open) - the "bare progress row, no incident" precondition.
+    $service->openOrAdvance(ALERT_TYPE, $subjectKey, new AlertSignal(breach: false, measurementId: 1), confirmationThreshold: 1, recoveryThreshold: 1);
+    check(0 === (int) $em->getConnection()->fetchOne('SELECT COUNT(*) FROM alert_incident WHERE alert_type = ? AND subject_key = ?', [ALERT_TYPE, $subjectKey]), 'No incident may exist yet.');
+
+    // Pin a REPEATABLE-READ snapshot on the main connection before any
+    // incident for this subject exists.
+    $connection = $em->getConnection();
+    $connection->beginTransaction();
+    $connection->fetchOne('SELECT id FROM alert_evaluation_progress WHERE alert_type = ? AND subject_key = ?', [ALERT_TYPE, $subjectKey]);
+
+    // Another transaction opens and commits an incident for the same key:
+    // invisible to the main connection's pinned snapshot.
+    $writer = newWriter();
+    $writer->beginTransaction();
+    $writer->prepare(
+        'INSERT INTO alert_incident (alert_type, subject_key, status, confirmation_count, recovery_count, first_detected_at, last_evaluated_at, last_considered_measurement_id, last_measured_at, created_at, updated_at) '
+        .'VALUES (?, ?, ?, 1, 0, NOW(), NOW(), 2, NOW(), NOW(), NOW())'
+    )->execute([ALERT_TYPE, $subjectKey, AlertIncident::STATUS_ACTIVE]);
+    $writer->commit();
+
+    // A recovery signal processed inside the still-open outer transaction
+    // must still find and recover this incident: lockOpenIncident() must not
+    // rely on the advisory snapshot, which shows nothing here.
+    $service->openOrAdvance(ALERT_TYPE, $subjectKey, new AlertSignal(breach: false, measuredAt: new \DateTimeImmutable('2026-01-01T00:05:00Z'), measurementId: 3), confirmationThreshold: 1, recoveryThreshold: 1);
+    $connection->commit();
+
+    $row = $connection->fetchAssociative('SELECT status, recovery_count, resolved_at FROM alert_incident WHERE alert_type = ? AND subject_key = ?', [ALERT_TYPE, $subjectKey]);
+    check(1 === (int) $row['recovery_count'], 'The phantom incident must be recovered despite the stale snapshot. Got: '.json_encode($row));
+    check(AlertIncident::STATUS_RESOLVED === $row['status'] && null !== $row['resolved_at'], 'A recovery_threshold of 1 must resolve the incident. Got: '.json_encode($row));
+
+    // Replaying the same signal must be a no-op (replay protection via the
+    // progress watermark).
+    [$em2, $service2] = freshServices($registry, $bus);
+    $service2->openOrAdvance(ALERT_TYPE, $subjectKey, new AlertSignal(breach: false, measuredAt: new \DateTimeImmutable('2026-01-01T00:05:00Z'), measurementId: 3), confirmationThreshold: 1, recoveryThreshold: 1);
+    $replayed = $em2->getConnection()->fetchAssociative('SELECT recovery_count FROM alert_incident WHERE alert_type = ? AND subject_key = ?', [ALERT_TYPE, $subjectKey]);
+    check(1 === (int) $replayed['recovery_count'], 'Replaying the same recovery signal must not change the incident again. Got: '.json_encode($replayed));
+
+    echo "PASS recovery-misses-phantom-incident: a recovery signal correctly recovers an incident opened by another transaction after this transaction's snapshot was pinned\n";
+}
+
 function scenarioReminderAfterConcurrentResolution(ManagerRegistry $registry, MessageBusInterface $bus): void
 {
     $subjectKey = 'subject-reminder-resolution-race';
@@ -321,23 +388,19 @@ function scenarioReminderAfterConcurrentResolution(ManagerRegistry $registry, Me
     $service->openOrAdvance(ALERT_TYPE, $subjectKey, new AlertSignal(breach: true, value: 5.0, unit: '%', measurementId: 1), confirmationThreshold: 1, recoveryThreshold: 1);
     $incidentId = (int) $em->getConnection()->fetchOne('SELECT id FROM alert_incident WHERE alert_type = ? AND subject_key = ?', [ALERT_TYPE, $subjectKey]);
 
-    // Make the reminder due, then let the handler's findDueForReminder() read
-    // it via a transactionless snapshot (autocommit: each read sees the
-    // latest committed state at that moment).
     $connection = $em->getConnection();
     $connection->executeStatement('UPDATE alert_incident SET next_reminder_at = ? WHERE id = ?', ['2020-01-01 00:00:00', $incidentId]);
 
+    [$dsn, $user, $pass] = pdoParts();
+    ReminderCollisionMiddleware::arm(new ReminderCollisionConfig($incidentId, $dsn, $user, $pass));
+
     $repository = $em->getRepository(AlertIncident::class);
-    $due = $repository->findDueForReminder(new \DateTimeImmutable('2026-01-01T01:00:00Z'));
-    check(1 === count($due), 'The incident must be found due before the concurrent resolution lands.');
-
-    // A concurrent transaction resolves the incident after the due-read but
-    // before the handler's per-incident lock.
-    $writer = newWriter();
-    $writer->prepare("UPDATE alert_incident SET status = ?, resolved_at = NOW() WHERE id = ?")->execute([AlertIncident::STATUS_RESOLVED, $incidentId]);
-
     $handler = new EvaluateAlertsHandler($repository, $em, $bus, new MockClock('2026-01-01T01:00:00Z'), reminderIntervalSeconds: 3600);
+    // The middleware resolves the incident right after this handler's own
+    // findDueForReminder() SELECT returns it as due, but before its
+    // per-incident locking refresh() re-checks it under FOR UPDATE.
     $handler(new EvaluateAlertsMessage());
+    ReminderCollisionMiddleware::disarm();
 
     $reminders = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'telegram_notifications' AND body LIKE '%reminder%' AND body LIKE '%subject-reminder-resolution-race%'");
     check(0 === $reminders, 'No reminder may be enqueued once the incident was resolved concurrently.');
@@ -345,7 +408,7 @@ function scenarioReminderAfterConcurrentResolution(ManagerRegistry $registry, Me
     check(AlertIncident::STATUS_RESOLVED === $row['status'] && null === $row['last_reminder_at'], 'The resolved row must not be mutated by the reminder pass. Got: '.json_encode($row));
     check('2020-01-01 00:00:00' === $row['next_reminder_at'], 'The resolved row\'s next_reminder_at must be untouched.');
 
-    echo "PASS reminder-after-resolution: a concurrently resolved incident gets no stale reminder and its row stays untouched\n";
+    echo "PASS reminder-after-resolution: a concurrent resolution landing between findDueForReminder() and the locking refresh() is caught; no stale reminder is sent\n";
 }
 
 try {
@@ -378,6 +441,7 @@ try {
     scenarioFirstIncidentRaceWriterRollsBack($registry, $messageBus);
     scenarioAlreadyOpenIncidentRace($registry, $messageBus);
     scenarioResolutionBeforeLock($registry, $messageBus);
+    scenarioRecoveryMissesPhantomIncident($registry, $messageBus);
     scenarioReminderAfterConcurrentResolution($registry, $messageBus);
 
     echo "PASS alert concurrency: unique-index backstop, locking refresh, resolution-under-lock and reminder recheck all genuinely serialize concurrent writers\n";
