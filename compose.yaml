@@ -55,9 +55,10 @@ services:
       gardenhub-mysql:
         condition: service_healthy
     healthcheck:
-      # Boots the Symfony kernel: proves the application is functional,
-      # not merely that a PHP process exists.
-      test: ["CMD", "php", "bin/console", "about"]
+      # PHP-FPM liveness only, runs as root; gardenhub-nginx's /healthz is the
+      # real app+DB check and never boots Symfony here. $$ escapes Compose's
+      # own interpolation so PHP sees literal $errno/$errstr, not env vars.
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000, $$errno, $$errstr, 2) ? 0 : 1);"]
       interval: 10s
       timeout: 10s
       retries: 6
