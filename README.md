@@ -398,7 +398,7 @@ cd GardenHub
 
 Never commit production secrets.
 
-The deployment uses a root `.env` file for Compose variables.
+The deployment uses a root `.env` file for Compose variables (`/opt/GardenHub/.env` in this repository's layout). Docker Compose reads it (plus an optional untracked `.env.local` next to it) and injects the resulting values as real container environment variables — these always take precedence over `api/.env`, which is Symfony's own tracked, safe-placeholder fallback file used only when running the app outside Docker.
 
 Example development values:
 
@@ -417,6 +417,11 @@ MQTT_HOST=mosquitto
 MQTT_PORT=1883
 MQTT_USERNAME=<username>
 MQTT_PASSWORD=<password>
+
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN=<bot-token>
+TELEGRAM_CHAT_ID=<chat-id>
+TELEGRAM_MIN_LEVEL=warning
 ```
 
 Production on `gardenhub-server` currently uses:
@@ -428,6 +433,8 @@ ChirpStack:    192.168.1.20:8080
 ```
 
 Do not commit `.env` or `.env.local`.
+
+To verify a Telegram configuration with real credentials, put them in the untracked root `.env.local` (never in `.env`), recreate the stack, and run the test command described in [Telegram Logging](#telegram-logging).
 
 ## Build
 
@@ -608,6 +615,60 @@ docker compose exec gardenhub-api \
 ```
 
 This uses the same Messenger ingestion path as a real MQTT message.
+
+---
+
+# Telegram Logging
+
+A dedicated Monolog `telegram` channel can forward log records to a Telegram chat. This is logging infrastructure only — it is distinct from the still-unimplemented "Telegram notifications" / alerting feature on the roadmap (no rules, thresholds, or scheduling here).
+
+## Configuration
+
+Four environment variables control it (see [Environment](#environment)):
+
+| Variable              | Default   | Purpose                                   |
+| --------------------- | --------- | ------------------------------------------ |
+| `TELEGRAM_ENABLED`    | `false`   | Enables the channel                        |
+| `TELEGRAM_BOT_TOKEN`  | *(empty)* | Telegram bot token                         |
+| `TELEGRAM_CHAT_ID`    | *(empty)* | Target chat id                             |
+| `TELEGRAM_MIN_LEVEL`  | `warning` | Minimum PSR-3 level forwarded              |
+
+Set real values only in the untracked root `.env.local` (dev) or the production server's own root `.env` — never in a committed file. Use a **separate bot/chat per environment**; every message is prefixed with the app name and `APP_ENV` so the source is always clear.
+
+## Usage
+
+Inject the channel logger with the `WithMonologChannel` attribute:
+
+```php
+use Monolog\Attribute\WithMonologChannel;
+use Psr\Log\LoggerInterface;
+
+#[WithMonologChannel('telegram')]
+class MyService
+{
+    public function __construct(private readonly LoggerInterface $logger) {}
+}
+```
+
+Pass fully-formed strings — the channel does not support PSR-3 `{placeholder}` interpolation, and only the message itself is sent (never the context/extra arrays).
+
+## Manual verification
+
+```bash
+docker compose exec gardenhub-api php bin/console gardenhub:telegram:test
+```
+
+This reports whether a record was *dispatched*, never *delivered*: delivery failures are swallowed by design (see below), so check the target Telegram chat to confirm receipt.
+
+Run the automated test script (dev stack only, requires the `compose-dev.yaml` bind mount):
+
+```bash
+docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/telegram_handler_test.php
+```
+
+## Failure isolation
+
+Telegram delivery is best-effort: any failure (missing configuration, network error, API error) is logged to the normal application logs instead and never propagates, so Telegram outages can never break requests, MQTT ingestion, or Messenger processing. The connection has a 5-second **read** timeout (bounds the connection and each read), not a guaranteed total delivery deadline.
 
 ---
 
