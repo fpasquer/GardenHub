@@ -37,6 +37,12 @@ services:
       APP_ENV: ${APP_ENV:-dev}
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
       MQTT_CLIENT_ID: ${MQTT_CLIENT_ID}
+      # Telegram logging channel. Any future Messenger consumer container
+      # must receive these same 4 variables too.
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
     # Source code is bind-mounted for development so changes apply without
     # rebuilding. Composer dependencies live inside the image; rebuild the
     # image (`docker compose up -d --build`) after changing composer.json.
@@ -83,6 +89,10 @@ services:
       MQTT_USERNAME: ${MQTT_USERNAME:-}
       MQTT_PASSWORD: ${MQTT_PASSWORD:-}
       MQTT_CLIENT_ID: ${MQTT_CLIENT_ID}
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
     # Allows reaching a service on the Docker host itself (e.g. an MQTT
     # broker exposed on the host loopback in the dev environment) via
     # the hostname host.docker.internal.
@@ -123,6 +133,10 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
     volumes:
       - ./api/bin:/app/bin
       - ./api/config:/app/config

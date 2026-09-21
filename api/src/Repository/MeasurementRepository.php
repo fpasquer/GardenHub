@@ -44,4 +44,50 @@ class MeasurementRepository extends ServiceEntityRepository
 
         return false !== $this->getEntityManager()->getConnection()->fetchOne($sql, [$sensorId]);
     }
+
+    /**
+     * Counts distinct ChirpStack uplink events (not measurement rows: one
+     * uplink yields one row per sensor type) within a half-open time window.
+     */
+    public function countDistinctEventsInWindow(\DateTimeImmutable $since, \DateTimeImmutable $until): int
+    {
+        return (int) $this->createQueryBuilder('m')
+            ->select('COUNT(DISTINCT m.deduplicationId)')
+            ->andWhere('m.measuredAt >= :since')
+            ->andWhere('m.measuredAt < :until')
+            ->setParameter('since', $since)
+            ->setParameter('until', $until)
+            ->getQuery()
+            ->getSingleScalarResult();
+    }
+
+    /**
+     * Per-sensor min/max value within the same half-open time window.
+     *
+     * @return array<int, array{deviceName: string, sensorId: int, sensorType: string, sensorLabel: ?string, unit: string, minValue: float, maxValue: float}>
+     */
+    public function aggregateMinMaxInWindow(\DateTimeImmutable $since, \DateTimeImmutable $until): array
+    {
+        return $this->createQueryBuilder('m')
+            ->select(
+                'd.name AS deviceName',
+                's.id AS sensorId',
+                's.type AS sensorType',
+                's.label AS sensorLabel',
+                's.unit AS unit',
+                'MIN(m.value) AS minValue',
+                'MAX(m.value) AS maxValue',
+            )
+            ->join('m.sensor', 's')
+            ->join('s.device', 'd')
+            ->andWhere('m.measuredAt >= :since')
+            ->andWhere('m.measuredAt < :until')
+            ->groupBy('s.id')
+            ->orderBy('d.name', 'ASC')
+            ->addOrderBy('s.id', 'ASC')
+            ->setParameter('since', $since)
+            ->setParameter('until', $until)
+            ->getQuery()
+            ->getArrayResult();
+    }
 }

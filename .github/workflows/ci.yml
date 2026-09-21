@@ -49,6 +49,31 @@ jobs:
         if: always()
         run: docker compose -f tests/sensor-identity/compose.yaml down -v
 
+      - name: Run Telegram unit tests
+        id: telegram_unit_tests
+        if: always()
+        continue-on-error: true
+        env:
+          # Same CI-only placeholder as the build step; --no-deps means
+          # gardenhub-mysql/nginx are never started, so no port is bound.
+          BIND_ADDRESS: 127.0.0.1
+        run: |
+          set -Eeuo pipefail
+          docker compose -f compose.yaml -f compose-dev.yaml run --rm --no-deps gardenhub-api php tests/telegram_handler_test.php
+          docker compose -f compose.yaml -f compose-dev.yaml run --rm --no-deps gardenhub-api php tests/stream_telegram_transport_test.php
+
+      - name: Run Telegram daily-summary tests
+        id: telegram_summary_tests
+        if: always()
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          docker compose -f tests/telegram-summary/compose.yaml run --rm tests
+
+      - name: Clean up Telegram daily-summary stack
+        if: always()
+        run: docker compose -f tests/telegram-summary/compose.yaml down -v
+
       - name: Fail if any test suite failed
         if: always()
         run: |
@@ -59,5 +84,15 @@ jobs:
 
           if [ "${{ steps.sensor_tests.outcome }}" != "success" ]; then
             echo "Sensor identity tests failed"
+            exit 1
+          fi
+
+          if [ "${{ steps.telegram_unit_tests.outcome }}" != "success" ]; then
+            echo "Telegram unit tests failed"
+            exit 1
+          fi
+
+          if [ "${{ steps.telegram_summary_tests.outcome }}" != "success" ]; then
+            echo "Telegram daily-summary tests failed"
             exit 1
           fi

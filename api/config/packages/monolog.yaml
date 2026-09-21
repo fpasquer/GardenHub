@@ -1,6 +1,13 @@
 monolog:
     channels:
         - deprecation # Deprecations are logged in the dedicated "deprecation" channel when it exists
+        - telegram
+    handlers:
+        # Env-agnostic: pushed only on the "telegram" channel logger, never on the default one.
+        telegram:
+            type: service
+            id: App\Monolog\Handler\TelegramHandler
+            channels: [telegram]
 
 when@dev:
     monolog:

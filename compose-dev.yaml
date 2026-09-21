@@ -26,6 +26,9 @@ services:
     networks: !override
       - gardenhub
 
+  gardenhub-api:
+    volumes:
+      - ./api/tests:/app/tests
   gardenhub-consumer:
     networks: !override
       - gardenhub

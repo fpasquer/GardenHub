@@ -52,5 +52,41 @@ services:
             $topic: '%env(MQTT_TOPIC)%'
             $servicesResetter: '@services_resetter'
 
+    App\Monolog\Telegram\InterfaceTelegramTransport: '@App\Monolog\Telegram\StreamTelegramTransport'
+
+    App\Monolog\Handler\TelegramHandler:
+        arguments:
+            $enabled: '%env(bool:TELEGRAM_ENABLED)%'
+            $botToken: '%env(TELEGRAM_BOT_TOKEN)%'
+            $chatId: '%env(TELEGRAM_CHAT_ID)%'
+            $minLevel: '%env(TELEGRAM_MIN_LEVEL)%'
+            $appName: 'GardenHub'
+            $environment: '%kernel.environment%'
+            # Deliberately the default channel logger, never the telegram
+            # channel, so a broken fallback sink cannot recurse into Telegram.
+            $fallbackLogger: '@logger'
+
+    App\Command\TelegramTestCommand:
+        arguments:
+            $enabled: '%env(bool:TELEGRAM_ENABLED)%'
+            $minLevel: '%env(TELEGRAM_MIN_LEVEL)%'
+
+    App\Command\TelegramDailySummaryCommand:
+        arguments:
+            $enabled: '%env(bool:TELEGRAM_ENABLED)%'
+            $botToken: '%env(TELEGRAM_BOT_TOKEN)%'
+            $chatId: '%env(TELEGRAM_CHAT_ID)%'
+
+    Symfony\Component\Clock\NativeClock: ~
+    Psr\Clock\ClockInterface: '@Symfony\Component\Clock\NativeClock'
+
     # add more service definitions when explicit configuration is needed
     # please note that last definitions always *replace* previous ones
+
+when@test:
+    services:
+        App\Tests\Monolog\FakeTelegramTransport:
+            autowire: true
+
+        # Test doubles must never be able to reach the real Telegram API.
+        App\Monolog\Telegram\InterfaceTelegramTransport: '@App\Tests\Monolog\FakeTelegramTransport'

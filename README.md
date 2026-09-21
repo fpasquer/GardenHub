@@ -611,7 +611,22 @@ cd GardenHub
 
 Never commit production secrets.
 
-The deployment uses a root `.env` file for Compose variables.
+The deployment uses a root `.env` file for Compose variables (`/opt/gardenhub/.env` in this repository's layout). Plain `docker compose` commands only read this single file automatically; they do **not** merge an untracked `.env.local` on their own. Only this repository's `Makefile` does that, via explicit `--env-file` flags:
+
+```make
+COMPOSE := docker compose --env-file .env
+ifneq ($(wildcard .env.local),)
+COMPOSE += --env-file .env.local
+endif
+```
+
+Use `make start` (base stack) or `make dev` (base stack + `compose-dev.yaml`) to get this behavior. To reproduce it with plain Compose, pass both files explicitly:
+
+```bash
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml up -d --build
+```
+
+Whichever mechanism is used, the resulting values are injected as real container environment variables, which always take precedence over `api/.env` — Symfony's own tracked, safe-placeholder fallback file used only when running the app outside Docker.
 
 Example development values:
 
@@ -630,6 +645,11 @@ MQTT_HOST=mosquitto
 MQTT_PORT=1883
 MQTT_USERNAME=<username>
 MQTT_PASSWORD=<password>
+
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN=<bot-token>
+TELEGRAM_CHAT_ID=<chat-id>
+TELEGRAM_MIN_LEVEL=warning
 ```
 
 Production on `gardenhub-server` currently uses:
@@ -641,6 +661,8 @@ ChirpStack:    192.168.1.20:8080
 ```
 
 Do not commit `.env` or `.env.local`.
+
+To verify a Telegram configuration with real credentials, put them in the untracked root `.env.local` (never in `.env`), recreate the stack with `make dev` (or the explicit `--env-file` command above), and run the test command described in [Telegram Logging](#telegram-logging).
 
 ## Build
 
@@ -821,6 +843,105 @@ docker compose exec gardenhub-api \
 ```
 
 This uses the same Messenger ingestion path as a real MQTT message.
+
+---
+
+# Telegram Logging
+
+A dedicated Monolog `telegram` channel can forward log records to a Telegram chat. This is logging infrastructure only — it is distinct from the still-unimplemented "Telegram notifications" / alerting feature on the roadmap (no rules, thresholds, or scheduling here).
+
+## Configuration
+
+Four environment variables control it (see [Environment](#environment)):
+
+| Variable              | Default   | Purpose                                   |
+| --------------------- | --------- | ------------------------------------------ |
+| `TELEGRAM_ENABLED`    | `false`   | Enables the channel                        |
+| `TELEGRAM_BOT_TOKEN`  | *(empty)* | Telegram bot token                         |
+| `TELEGRAM_CHAT_ID`    | *(empty)* | Target chat id                             |
+| `TELEGRAM_MIN_LEVEL`  | `warning` | Minimum PSR-3 level forwarded              |
+
+Set real values only in the untracked root `.env.local` (dev) or the production server's own root `.env` — never in a committed file. Use a **separate bot/chat per environment**; every message is prefixed with the app name and `APP_ENV` so the source is always clear.
+
+## Usage
+
+Inject the channel logger with the `WithMonologChannel` attribute:
+
+```php
+use Monolog\Attribute\WithMonologChannel;
+use Psr\Log\LoggerInterface;
+
+#[WithMonologChannel('telegram')]
+class MyService
+{
+    public function __construct(private readonly LoggerInterface $logger) {}
+}
+```
+
+Pass fully-formed strings — the channel does not support PSR-3 `{placeholder}` interpolation, and only the message itself is sent (never the context/extra arrays).
+
+## Manual verification
+
+```bash
+docker compose exec gardenhub-api php bin/console gardenhub:telegram:test
+```
+
+This reports whether a record was *dispatched*, never *delivered*: delivery failures are swallowed by design (see below), so check the target Telegram chat to confirm receipt.
+
+Run the automated test scripts (dev stack only, requires the `compose-dev.yaml` bind mount):
+
+```bash
+docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/telegram_handler_test.php
+docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/stream_telegram_transport_test.php
+```
+
+The second script exercises `StreamTelegramTransport` itself (HTTP errors, invalid JSON, `ok:false`, connection failures, and repeated calls) against a local fake server — no real Telegram access involved.
+
+## Daily summary
+
+`gardenhub:telegram:daily-summary` sends a compact rolling summary of ChirpStack
+uplink events to Telegram:
+
+```bash
+docker compose exec gardenhub-api php bin/console gardenhub:telegram:daily-summary
+docker compose exec gardenhub-api php bin/console gardenhub:telegram:daily-summary --hours=12
+```
+
+`--hours` defaults to `24` and must be a positive integer; zero, negative,
+non-numeric or malformed values (e.g. `abc`, `12abc`, `1.5`) exit with
+`Command::INVALID` and never send anything.
+
+The header counts **distinct ChirpStack uplink events**
+(`COUNT(DISTINCT deduplication_id)`), not measurement rows — a single uplink
+can produce several rows (one per sensor type), so the event count is
+normally lower than the row count. Per-sensor rows show the **min → max**
+value observed in the window (not first/latest), grouped by device:
+
+```
+🌱 24h · 72 events
+
+SE01-Avocado
+Moisture      25 → 31.2 %
+Temperature 22.9 → 23.4 °C
+```
+
+An empty window reports just `🌱 24h · 0 events`, with no table.
+
+This command has **no automatic scheduling**: it must be run manually or
+wired into external scheduling (e.g. host cron, a future
+`gardenhub-scheduler` service) — timing and timezone have not been decided
+yet, so none is configured here.
+
+Run the isolated test suite (own disposable MySQL container, never the dev database):
+
+```bash
+docker compose -f tests/telegram-summary/compose.yaml run --rm tests
+docker compose -f tests/telegram-summary/compose.yaml down -v
+```
+
+## Failure isolation
+
+Telegram delivery is best-effort: any failure (missing configuration, network error, API error) is logged to the normal application logs instead and never propagates, so Telegram outages can never break requests, MQTT ingestion, or Messenger processing. The connection has a 5-second **read** timeout (bounds the connection and each read), not a guaranteed total delivery deadline.
 
 ---
 
