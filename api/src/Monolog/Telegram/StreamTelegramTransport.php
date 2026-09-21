@@ -13,9 +13,14 @@ class StreamTelegramTransport implements InterfaceTelegramTransport
     // guarantee for the whole request (see README).
     private const TIMEOUT_SECONDS = 5.0;
 
+    // Overridable only by tests, to point at a local fake server instead of the real API.
+    public function __construct(private readonly string $baseUrl = self::API_BASE_URL)
+    {
+    }
+
     public function send(string $botToken, string $chatId, string $text): void
     {
-        $url = sprintf('%s/bot%s/sendMessage', self::API_BASE_URL, $botToken);
+        $url = sprintf('%s/bot%s/sendMessage', $this->baseUrl, $botToken);
         $body = http_build_query(['chat_id' => $chatId, 'text' => $text]);
 
         $context = stream_context_create([
@@ -53,7 +58,7 @@ class StreamTelegramTransport implements InterfaceTelegramTransport
      */
     private function fetch(string $url, $context): array
     {
-        $previousHandler = set_error_handler(static fn (): bool => true);
+        set_error_handler(static fn (): bool => true);
 
         try {
             $response = @file_get_contents($url, false, $context);
@@ -61,7 +66,7 @@ class StreamTelegramTransport implements InterfaceTelegramTransport
             // $http_response_header is populated in this scope by the call above.
             return [$response, $http_response_header ?? []];
         } finally {
-            set_error_handler($previousHandler);
+            restore_error_handler();
         }
     }
 

@@ -398,7 +398,22 @@ cd GardenHub
 
 Never commit production secrets.
 
-The deployment uses a root `.env` file for Compose variables (`/opt/GardenHub/.env` in this repository's layout). Docker Compose reads it (plus an optional untracked `.env.local` next to it) and injects the resulting values as real container environment variables — these always take precedence over `api/.env`, which is Symfony's own tracked, safe-placeholder fallback file used only when running the app outside Docker.
+The deployment uses a root `.env` file for Compose variables (`/opt/GardenHub/.env` in this repository's layout). Plain `docker compose` commands only read this single file automatically; they do **not** merge an untracked `.env.local` on their own. Only this repository's `Makefile` does that, via explicit `--env-file` flags:
+
+```make
+COMPOSE := docker compose --env-file .env
+ifneq ($(wildcard .env.local),)
+COMPOSE += --env-file .env.local
+endif
+```
+
+Use `make start` (base stack) or `make dev` (base stack + `compose-dev.yaml`) to get this behavior. To reproduce it with plain Compose, pass both files explicitly:
+
+```bash
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml up -d --build
+```
+
+Whichever mechanism is used, the resulting values are injected as real container environment variables, which always take precedence over `api/.env` — Symfony's own tracked, safe-placeholder fallback file used only when running the app outside Docker.
 
 Example development values:
 
@@ -434,7 +449,7 @@ ChirpStack:    192.168.1.20:8080
 
 Do not commit `.env` or `.env.local`.
 
-To verify a Telegram configuration with real credentials, put them in the untracked root `.env.local` (never in `.env`), recreate the stack, and run the test command described in [Telegram Logging](#telegram-logging).
+To verify a Telegram configuration with real credentials, put them in the untracked root `.env.local` (never in `.env`), recreate the stack with `make dev` (or the explicit `--env-file` command above), and run the test command described in [Telegram Logging](#telegram-logging).
 
 ## Build
 
@@ -660,11 +675,14 @@ docker compose exec gardenhub-api php bin/console gardenhub:telegram:test
 
 This reports whether a record was *dispatched*, never *delivered*: delivery failures are swallowed by design (see below), so check the target Telegram chat to confirm receipt.
 
-Run the automated test script (dev stack only, requires the `compose-dev.yaml` bind mount):
+Run the automated test scripts (dev stack only, requires the `compose-dev.yaml` bind mount):
 
 ```bash
 docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/telegram_handler_test.php
+docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/stream_telegram_transport_test.php
 ```
+
+The second script exercises `StreamTelegramTransport` itself (HTTP errors, invalid JSON, `ok:false`, connection failures, and repeated calls) against a local fake server — no real Telegram access involved.
 
 ## Failure isolation
 
