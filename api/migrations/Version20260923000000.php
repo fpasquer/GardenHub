@@ -38,7 +38,7 @@ final class Version20260923000000 extends AbstractMigration
     public function up(Schema $schema): void
     {
         $this->addSql(<<<'SQL'
-            INSERT INTO alert_evaluation_progress
+            INSERT INTO alert_evaluation_progress AS target
                 (alert_type, subject_key, last_considered_measurement_id, last_considered_measured_at, created_at, updated_at)
             SELECT ranked.alert_type, ranked.subject_key, ranked.last_considered_measurement_id, ranked.last_measured_at, NOW(), NOW()
             FROM (
@@ -51,14 +51,14 @@ final class Version20260923000000 extends AbstractMigration
             WHERE ranked.rn = 1
             ON DUPLICATE KEY UPDATE
                 last_considered_measurement_id = CASE
-                    WHEN last_considered_measurement_id IS NULL OR VALUES(last_considered_measurement_id) > last_considered_measurement_id
-                    THEN VALUES(last_considered_measurement_id) ELSE last_considered_measurement_id END,
+                    WHEN target.last_considered_measurement_id IS NULL OR VALUES(last_considered_measurement_id) > target.last_considered_measurement_id
+                    THEN VALUES(last_considered_measurement_id) ELSE target.last_considered_measurement_id END,
                 last_considered_measured_at = CASE
-                    WHEN last_considered_measurement_id IS NULL OR VALUES(last_considered_measurement_id) > last_considered_measurement_id
-                    THEN VALUES(last_considered_measured_at) ELSE last_considered_measured_at END,
+                    WHEN target.last_considered_measurement_id IS NULL OR VALUES(last_considered_measurement_id) > target.last_considered_measurement_id
+                    THEN VALUES(last_considered_measured_at) ELSE target.last_considered_measured_at END,
                 updated_at = CASE
-                    WHEN last_considered_measurement_id IS NULL OR VALUES(last_considered_measurement_id) > last_considered_measurement_id
-                    THEN VALUES(updated_at) ELSE updated_at END
+                    WHEN target.last_considered_measurement_id IS NULL OR VALUES(last_considered_measurement_id) > target.last_considered_measurement_id
+                    THEN VALUES(updated_at) ELSE target.updated_at END
             SQL);
     }
 
