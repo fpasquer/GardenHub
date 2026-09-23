@@ -22,7 +22,7 @@ dev: start
 
 DEPLOY_REMOTE ?= origin
 DEPLOY_BRANCH ?= master
-DEPLOY_SERVICES := gardenhub-nginx gardenhub-api gardenhub-worker gardenhub-consumer
+DEPLOY_SERVICES := gardenhub-nginx gardenhub-api gardenhub-worker gardenhub-consumer gardenhub-scheduler
 HEALTHZ_HOST ?= 192.168.1.20
 HEALTHZ_PORT ?= 8081
 DEPLOY_HEALTH_TIMEOUT ?= 120
@@ -145,6 +145,7 @@ deploy-logs: ## Best-effort diagnostics: container status and recent logs (last 
 	-@echo "==> [deploy-logs] gardenhub-api (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-api
 	-@echo "==> [deploy-logs] gardenhub-worker (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-worker
 	-@echo "==> [deploy-logs] gardenhub-consumer (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-consumer
+	-@echo "==> [deploy-logs] gardenhub-scheduler (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-scheduler
 	-@echo "==> [deploy-logs] gardenhub-nginx (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-nginx
 
 deploy-info: ## Show current git/image/container state (read-only, safe anytime)

@@ -74,6 +74,18 @@ jobs:
         if: always()
         run: docker compose -f tests/telegram-summary/compose.yaml down -v
 
+      - name: Run scheduler-cron tests
+        id: scheduler_tests
+        if: always()
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          docker compose -f tests/scheduler-cron/compose.yaml run --rm tests
+
+      - name: Clean up scheduler-cron stack
+        if: always()
+        run: docker compose -f tests/scheduler-cron/compose.yaml down -v
+
       - name: Fail if any test suite failed
         if: always()
         run: |
@@ -94,5 +106,10 @@ jobs:
 
           if [ "${{ steps.telegram_summary_tests.outcome }}" != "success" ]; then
             echo "Telegram daily-summary tests failed"
+            exit 1
+          fi
+
+          if [ "${{ steps.scheduler_tests.outcome }}" != "success" ]; then
+            echo "Scheduler-cron tests failed"
             exit 1
           fi

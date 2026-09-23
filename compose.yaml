@@ -156,6 +156,45 @@ services:
     networks:
       - gardenhub
 
+  # Runs the Symfony Scheduler's "default" schedule, which dispatches the
+  # `gardenhub:telegram:daily-summary` command every day at 22:00 UTC (see
+  # the #[AsCronTask] attribute on TelegramDailySummaryCommand). Opt-in via
+  # `docker compose --profile scheduler up -d gardenhub-scheduler`; it is
+  # not started by a plain `docker compose up`.
+  gardenhub-scheduler:
+    image: gardenhub-api
+    container_name: gardenhub-scheduler
+    restart: unless-stopped
+    tty: true
+    user: www-data
+    profiles: ["scheduler"]
+    command: php bin/console messenger:consume scheduler_default --no-interaction -v
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
+    volumes:
+      - ./api/bin:/app/bin
+      - ./api/config:/app/config
+      - ./api/src:/app/src
+      - ./api/.env:/app/.env
+    depends_on:
+      gardenhub-api:
+        condition: service_healthy
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'messenger:consume scheduler_default' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
   gardenhub-mysql:
     image: mysql:8.4
     container_name: gardenhub-mysql
