@@ -43,7 +43,6 @@ use Symfony\Component\Messenger\Exception\HandlerFailedException;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Scheduler\Generator\MessageGenerator;
 use Symfony\Component\Scheduler\ScheduleProviderInterface;
-use Symfony\Component\Scheduler\Trigger\CronExpressionTrigger;
 
 const TEST_DATABASE = 'scheduler_cron';
 const CRON_EXPRESSION = '0 22 * * *';
@@ -208,10 +207,15 @@ function test_wiring_registers_exactly_one_cron_task(ContainerInterface $contain
     );
 }
 
-function test_next_run_is_always_22_00_utc_across_dst_changes(): void
+function test_next_run_is_always_22_00_utc_across_dst_changes(ContainerInterface $container): void
 {
     echo "Scenario: 22:00 UTC next-run correctness, including across DST changes\n";
-    $trigger = CronExpressionTrigger::fromSpec(CRON_EXPRESSION, timezone: 'UTC');
+    /** @var ScheduleProviderInterface $provider */
+    $provider = $container->get('test.scheduler_provider_default');
+    $messages = $provider->getSchedule()->getRecurringMessages();
+    // The real registered trigger, not a hand-built one: a timezone typo in
+    // the #[AsCronTask] attribute would fail these assertions.
+    $trigger = $messages[array_key_first($messages)]->getTrigger();
 
     // The ambient PHP timezone is deliberately set to one that observes
     // DST: if the trigger leaked the ambient zone instead of using the
@@ -222,19 +226,19 @@ function test_next_run_is_always_22_00_utc_across_dst_changes(): void
 
     try {
         $cases = [
-            '2026-01-15 08:00:00' => 'mid-winter',
-            '2026-03-28 10:00:00' => 'day before the EU spring-forward change',
-            '2026-03-29 23:30:00' => 'the EU spring-forward day itself',
-            '2026-07-01 12:00:00' => 'mid-summer',
-            '2026-10-24 10:00:00' => 'day before the EU fall-back change',
-            '2026-10-25 23:30:00' => 'the EU fall-back day itself',
+            '2026-01-15 08:00:00' => ['2026-01-15 22:00:00', 'mid-winter'],
+            '2026-03-28 10:00:00' => ['2026-03-28 22:00:00', 'day before the EU spring-forward change'],
+            '2026-03-29 23:30:00' => ['2026-03-30 22:00:00', 'the EU spring-forward day itself'],
+            '2026-07-01 12:00:00' => ['2026-07-01 22:00:00', 'mid-summer'],
+            '2026-10-24 10:00:00' => ['2026-10-24 22:00:00', 'day before the EU fall-back change'],
+            '2026-10-25 23:30:00' => ['2026-10-26 22:00:00', 'the EU fall-back day itself'],
         ];
 
-        foreach ($cases as $instant => $label) {
+        foreach ($cases as $instant => [$expected, $label]) {
             $next = $trigger->getNextRunDate(utc($instant));
             check(
-                '22:00:00' === $next->setTimezone(new \DateTimeZone('UTC'))->format('H:i:s'),
-                "next run after {$instant} ({$label}) is 22:00:00 UTC"
+                $expected === $next->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s'),
+                "next run after {$instant} ({$label}) is {$expected} UTC"
             );
         }
     } finally {
@@ -242,28 +246,22 @@ function test_next_run_is_always_22_00_utc_across_dst_changes(): void
     }
 }
 
-function test_no_immediate_execution_on_startup(): void
+function test_no_immediate_execution_on_startup(ContainerInterface $container): void
 {
     echo "Scenario: no immediate execution on startup\n";
-    $trigger = CronExpressionTrigger::fromSpec(CRON_EXPRESSION, timezone: 'UTC');
+    /** @var ScheduleProviderInterface $provider */
+    $provider = $container->get('test.scheduler_provider_default');
 
-    $justBefore = $trigger->getNextRunDate(utc('2026-09-21 21:59:59'));
-    check(
-        '2026-09-21 22:00:00' === $justBefore->format('Y-m-d H:i:s'),
-        'starting just before 22:00 UTC waits until later the same day, it does not fire immediately'
-    );
+    // Each is a freshly started generator, mirroring a worker process that
+    // starts at exactly that instant, polled once immediately.
+    $justBefore = pollScheduler(makeGenerator($provider), utc('2026-09-24 21:59:59'));
+    check([] === $justBefore, 'starting just before 22:00 UTC does not fire immediately');
 
-    $atDue = $trigger->getNextRunDate(utc('2026-09-21 22:00:00'));
-    check(
-        '2026-09-22 22:00:00' === $atDue->format('Y-m-d H:i:s'),
-        'starting exactly at 22:00 UTC does not re-fire immediately; the next run is the following day'
-    );
+    $atDue = pollScheduler(makeGenerator($provider), utc('2026-09-24 22:00:00'));
+    check([] === $atDue, 'starting exactly at 22:00 UTC does not fire immediately');
 
-    $justAfter = $trigger->getNextRunDate(utc('2026-09-21 22:00:01'));
-    check(
-        '2026-09-22 22:00:00' === $justAfter->format('Y-m-d H:i:s'),
-        'starting just after 22:00 UTC waits for the next day, it does not fire immediately'
-    );
+    $justAfter = pollScheduler(makeGenerator($provider), utc('2026-09-24 22:00:01'));
+    check([] === $justAfter, 'starting just after 22:00 UTC does not fire immediately');
 }
 
 function test_real_scheduler_generated_message_reaches_telegram(ContainerInterface $container): void
@@ -353,8 +351,8 @@ $mainContainer = bootKernel('main', [
 ensureSchema($mainContainer);
 
 test_wiring_registers_exactly_one_cron_task($mainContainer);
-test_next_run_is_always_22_00_utc_across_dst_changes();
-test_no_immediate_execution_on_startup();
+test_next_run_is_always_22_00_utc_across_dst_changes($mainContainer);
+test_no_immediate_execution_on_startup($mainContainer);
 test_real_scheduler_generated_message_reaches_telegram($mainContainer);
 test_delivery_failure_is_not_swallowed($mainContainer);
 test_disabled_telegram_never_sends();
