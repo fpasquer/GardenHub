@@ -1,0 +1,40 @@
+name: gardenhub-scheduler-cron-tests
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_DATABASE: scheduler_cron
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=TCP", "--silent"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+
+  tests:
+    image: gardenhub-api
+    entrypoint: ["sh", "-c", "php /tests/scheduler-cron.php"]
+    environment:
+      # The test script boots App\Kernel with the 'dev' environment (not
+      # 'test'): doctrine.yaml appends a "_test" dbname suffix in the test
+      # environment, which would silently point at a database this
+      # disposable MySQL container never creates.
+      APP_ENV: dev
+      APP_DEBUG: '1'
+      APP_SECRET: scheduler-cron-tests-only
+      DATABASE_URL: 'mysql://root@mysql:3306/scheduler_cron?serverVersion=8.4&charset=utf8mb4'
+      GARDENHUB_LIFECYCLE_TESTS: '1'
+      TELEGRAM_ENABLED: 'true'
+      TELEGRAM_BOT_TOKEN: 'test-token'
+      TELEGRAM_CHAT_ID: 'test-chat'
+      TELEGRAM_MIN_LEVEL: 'warning'
+    volumes:
+      - ../../api/src:/app/src:ro
+      - ../../api/config:/app/config:ro
+      - ./:/tests:ro
+    depends_on:
+      mysql:
+        condition: service_healthy

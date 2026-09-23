@@ -11,6 +11,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
+use Symfony\Component\Scheduler\Attribute\AsCronTask;
 
 /**
  * Sends a compact rolling min/max measurement summary to Telegram.
@@ -18,6 +19,11 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 #[AsCommand(
     name: 'gardenhub:telegram:daily-summary',
     description: 'Send a compact measurement summary to Telegram for the last N hours',
+)]
+#[AsCronTask(
+    expression: '0 22 * * *',
+    timezone: 'UTC',
+    arguments: '--hours=24',
 )]
 class TelegramDailySummaryCommand extends Command
 {

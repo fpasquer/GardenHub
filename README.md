@@ -927,16 +927,63 @@ Temperature 22.9 → 23.4 °C
 
 An empty window reports just `🌱 24h · 0 events`, with no table.
 
-This command has **no automatic scheduling**: it must be run manually or
-wired into external scheduling (e.g. host cron, a future
-`gardenhub-scheduler` service) — timing and timezone have not been decided
-yet, so none is configured here.
+This command runs automatically every day at **22:00 UTC**, dispatched by
+[Symfony Scheduler](https://symfony.com/doc/current/scheduler.html) via a
+single `#[AsCronTask]` attribute on `TelegramDailySummaryCommand` — no other
+application class or `Kernel.php` change is involved; FrameworkBundle wires
+Scheduler support natively once `symfony/scheduler` is installed. See
+[`gardenhub-scheduler`](#gardenhub-scheduler) below for the worker that runs
+it and how to opt in.
 
-Run the isolated test suite (own disposable MySQL container, never the dev database):
+Run the isolated test suites (own disposable MySQL container, never the dev database):
 
 ```bash
 docker compose -f tests/telegram-summary/compose.yaml run --rm tests
 docker compose -f tests/telegram-summary/compose.yaml down -v
+
+docker compose -f tests/scheduler-cron/compose.yaml run --rm tests
+docker compose -f tests/scheduler-cron/compose.yaml down -v
+```
+
+## `gardenhub-scheduler`
+
+Long-running Symfony command:
+
+```bash
+php bin/console messenger:consume scheduler_default --no-interaction -v
+```
+
+Responsibilities:
+
+- polls the Symfony Scheduler `default` schedule and dispatches each due message
+- currently runs the single `gardenhub:telegram:daily-summary --hours=24` task, scheduled at 22:00 UTC via the `#[AsCronTask]` attribute on `TelegramDailySummaryCommand` (added by `composer require symfony/scheduler dragonmantank/cron-expression`)
+
+Not started by a plain `docker compose up` (including `make dev`): the
+service is gated behind the `scheduler` Compose profile, so it must be
+opted into explicitly. Unlike the other long-running services (which run as
+root), it runs as `www-data`.
+
+No missed-run catch-up: if the worker is down when 22:00 UTC passes, that
+day's summary is simply skipped — it does not fire retroactively on the next
+start. Only one `gardenhub-scheduler` instance should run at a time; nothing
+here provides distributed locking or exactly-once delivery, so running more
+than one instance would send duplicate summaries.
+
+Start it (dev or prod) and follow its logs:
+
+```bash
+docker compose --profile scheduler up -d gardenhub-scheduler
+docker compose logs -f gardenhub-scheduler
+```
+
+Production deployment (`make deploy` already includes `gardenhub-scheduler`
+in `DEPLOY_SERVICES`, so this is normally automatic; documented here for
+reference/manual use):
+
+```bash
+docker compose build gardenhub-api
+docker compose --profile scheduler up -d gardenhub-scheduler
+docker compose logs -f gardenhub-scheduler
 ```
 
 ## Failure isolation
