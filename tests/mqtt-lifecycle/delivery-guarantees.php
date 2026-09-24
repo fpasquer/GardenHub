@@ -102,7 +102,7 @@ final class DeliveryKernel extends Kernel
         $container->addCompilerPass(new class implements CompilerPassInterface {
             public function process(ContainerBuilder $container): void
             {
-                $container->register(FakeTelegramTransport::class)->setPublic(true);
+                $container->register(FakeTelegramTransport::class, FakeTelegramTransport::class)->setPublic(true);
                 $container->setAlias(InterfaceTelegramTransport::class, FakeTelegramTransport::class)->setPublic(false);
                 $container->setAlias('test.telegram_transport', FakeTelegramTransport::class)->setPublic(true);
             }

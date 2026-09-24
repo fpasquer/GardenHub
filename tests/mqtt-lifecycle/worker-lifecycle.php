@@ -275,28 +275,38 @@ function workerScenario(LifecycleKernel $kernel, string $scenario): int
 }
 
 /**
- * Builds the 13-failure script (mixing create()-throws, loop()-throws, and
- * loop() returning normally with no exception for the 12th/13th failure -
- * the previously-unhandled "clean return" path) followed by a 14th
- * successful reconnect that ends the run via a sentinel exception.
+ * Builds the outage script:
+ *  - 12 consecutive create() failures reach the alert threshold exactly once;
+ *  - a 13th create() failure proves there is no duplicate alert;
+ *  - a 14th entry succeeds (reconnect) but its loop() returns with no
+ *    exception at all - the previously-unhandled "clean return" path -
+ *    which must both trigger the recovery alert (on the successful connect)
+ *    and still be counted as a fresh single failure afterward;
+ *  - a 15th entry succeeds but its loop() throws mid-connection (a dropped
+ *    loop, as opposed to a failed connect), proving that path also still
+ *    increments the shared counter without re-firing any alert;
+ *  - a 16th entry succeeds and ends the run via a sentinel exception.
+ *
+ * Note: a successful create() always resets the counter (see
+ * MqttConsumeCommand::handleSuccessfulConnection()), so only a run of
+ * consecutive create() failures - not intermittent drops after a successful
+ * reconnect - can accumulate to the threshold. Entries 14-15 exist to prove
+ * both failure-recording paths still function correctly after a recovery,
+ * not to extend the accumulating streak.
  *
  * @return list<\Throwable|\Closure>
  */
 function buildOutageScript(LogicException $stop): array
 {
     $script = [];
-    for ($i = 0; $i < 11; ++$i) {
-        $script[] = 0 === $i % 2
-            ? new DataTransferException(0, 'Simulated connect failure.')
-            : function (): void {
-                throw new DataTransferException(0, 'Simulated mid-loop drop.');
-            };
+    for ($i = 0; $i < 13; ++$i) {
+        $script[] = new DataTransferException(0, 'Simulated connect failure.');
     }
     $script[] = function (): void {
         // Loop returns without throwing: the previously-unhandled path.
     };
     $script[] = function (): void {
-        // Loop returns without throwing: the previously-unhandled path.
+        throw new DataTransferException(0, 'Simulated mid-loop drop.');
     };
     $script[] = function () use ($stop): void {
         throw $stop;
@@ -306,9 +316,11 @@ function buildOutageScript(LogicException $stop): array
 }
 
 /**
- * Runs 13 consecutive connection failures then a successful reconnect,
- * asserting: exactly one outage alert at the 12th failure, no duplicate at
- * the 13th, and exactly one recovery alert on the 14th (successful) attempt.
+ * Runs 13 consecutive connect failures (reaching the 12-failure threshold
+ * once, with no duplicate at 13), then a successful reconnect, asserting
+ * exactly one outage alert and exactly one recovery alert, and that both
+ * the mid-loop-drop and clean-loop-return failure paths remain correctly
+ * wired to the same counter/logger after the recovery.
  */
 function runOutageAlertCheck(MessageBusInterface $bus, ServicesResetterInterface $resetter): void
 {
@@ -317,7 +329,9 @@ function runOutageAlertCheck(MessageBusInterface $bus, ServicesResetterInterface
         $telegramLogs[] = [$level, $message];
     });
     $logger = new CallbackLogger(function (string $level, string $message): void {
-        check('error' === $level && str_contains($message, 'MQTT connection failed'), 'Connection failures must use MQTT recovery logs.');
+        $isConnectionFailure = 'error' === $level && str_contains($message, 'MQTT connection failed');
+        $isSuccessfulConnect = 'info' === $level && str_contains($message, 'Connected to MQTT broker');
+        check($isConnectionFailure || $isSuccessfulConnect, 'Unexpected log during the outage test: ['.$level.'] '.$message);
     });
 
     $stop = new LogicException('End MQTT outage test.');

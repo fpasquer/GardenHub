@@ -51,6 +51,11 @@ services:
             $clientId: '%env(MQTT_CLIENT_ID)%'
             $topic: '%env(MQTT_TOPIC)%'
             $servicesResetter: '@services_resetter'
+            # WorkerMqttClientFactory is not autowired here: its own $host/
+            # $port/$username/$password aren't bound, and MqttConsumeCommand
+            # falls back to constructing it directly when null (unchanged
+            # production behavior). Only tests inject a scripted factory.
+            $clientFactory: ~
             $telegramLogger: '@monolog.logger.telegram'
 
     App\Monolog\Telegram\InterfaceTelegramTransport: '@App\Monolog\Telegram\StreamTelegramTransport'
