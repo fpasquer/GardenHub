@@ -239,12 +239,15 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE}
       MYSQL_USER: ${GRAFANA_MYSQL_USER}
       MYSQL_PASSWORD: ${GRAFANA_MYSQL_PASSWORD}
+      # Use the same bot and destination as Symfony's Telegram notifications.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - gardenhub-grafana-data:/var/lib/grafana
-      # Datasources and dashboard provider are provisioned at startup;
-      # dashboard JSON lives in ./grafana/dashboards (see README).
+      # Datasources, dashboards, and alerting resources are provisioned at startup.
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       gardenhub-mysql:
