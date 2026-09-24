@@ -3,6 +3,7 @@
 namespace App\Command;
 
 use App\Mqtt\ChirpStackUplink;
+use App\Mqtt\InterfaceMqttClientFactory;
 use App\Mqtt\WorkerMqttClientFactory;
 use PhpMqtt\Client\Exceptions\MqttClientException;
 use Psr\Log\LoggerInterface;
@@ -27,6 +28,11 @@ use Symfony\Component\Uid\Uuid;
 )]
 class MqttConsumeCommand extends Command
 {
+    private const OUTAGE_ALERT_THRESHOLD = 12;
+
+    private int $consecutiveConnectionFailures = 0;
+    private bool $outageAlerted = false;
+
     public function __construct(
         private readonly MessageBusInterface $messageBus,
         private readonly LoggerInterface $logger,
@@ -37,13 +43,17 @@ class MqttConsumeCommand extends Command
         private readonly string $clientId,
         private readonly string $topic,
         private readonly ServicesResetterInterface $servicesResetter,
+        private readonly ?InterfaceMqttClientFactory $clientFactory = null,
+        private readonly ?LoggerInterface $telegramLogger = null,
+        private readonly int $reconnectDelaySeconds = 5,
     ) {
         parent::__construct();
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $clientFactory = new WorkerMqttClientFactory($this->host, $this->port, $this->username, $this->password);
+        $clientFactory = $this->clientFactory
+            ?? new WorkerMqttClientFactory($this->host, $this->port, $this->username, $this->password);
 
         while (true) {
             $processingFailure = null;
@@ -71,13 +81,20 @@ class MqttConsumeCommand extends Command
                     }
                 });
                 $this->logger->info('Connected to MQTT broker.', ['host' => $this->host, 'topic' => $this->topic]);
+                $this->handleSuccessfulConnection();
 
                 // loop() returns when the connection drops; the outer
                 // while loop then reconnects after a short delay.
                 $client->loop(true);
+
+                // A clean return (no exception) is still a dropped connection
+                // unless it was our own processing-failure interrupt() below.
+                if (null === $processingFailure) {
+                    $this->recordConnectionFailure();
+                }
             } catch (MqttClientException $e) {
                 if (null === $processingFailure) {
-                    $this->logger->error('MQTT connection failed, retrying in 5s.', ['message' => $e->getMessage()]);
+                    $this->recordConnectionFailure();
                 }
             }
 
@@ -87,7 +104,40 @@ class MqttConsumeCommand extends Command
                 return Command::FAILURE;
             }
 
-            sleep(5);
+            sleep($this->reconnectDelaySeconds);
+        }
+    }
+
+    /**
+     * Resets the outage counter and, if an outage alert had fired, sends
+     * exactly one recovery notification.
+     */
+    private function handleSuccessfulConnection(): void
+    {
+        $this->consecutiveConnectionFailures = 0;
+
+        if ($this->outageAlerted) {
+            $this->outageAlerted = false;
+            $this->telegramLogger?->critical('MQTT worker recovered: connection to the broker was re-established.');
+        }
+    }
+
+    /**
+     * Counts a failed connect attempt or a dropped connection loop; fires
+     * one outage alert the moment the threshold is reached.
+     */
+    private function recordConnectionFailure(): void
+    {
+        ++$this->consecutiveConnectionFailures;
+        $this->logger->error(sprintf('MQTT connection failed, retrying in %ds.', $this->reconnectDelaySeconds));
+
+        if (self::OUTAGE_ALERT_THRESHOLD === $this->consecutiveConnectionFailures) {
+            $this->outageAlerted = true;
+            $this->telegramLogger?->critical(sprintf(
+                'MQTT worker: %d consecutive connection failures; retries continue every %ds.',
+                self::OUTAGE_ALERT_THRESHOLD,
+                $this->reconnectDelaySeconds
+            ));
         }
     }
 

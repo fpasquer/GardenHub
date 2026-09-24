@@ -23,12 +23,14 @@ declare(strict_types=1);
 
 use App\Command\MqttConsumeCommand;
 use App\Kernel;
+use App\Monolog\Telegram\InterfaceTelegramTransport;
 use App\Mqtt\ChirpStackUplink;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Tools\SchemaTool;
 use Psr\Log\AbstractLogger;
 use Symfony\Component\Config\Loader\LoaderInterface;
 use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\Messenger\Envelope;
@@ -36,6 +38,7 @@ use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Uid\Uuid;
 use Tests\MqttLifecycle\CollisionConfig;
 use Tests\MqttLifecycle\CollisionMiddleware;
+use Tests\MqttLifecycle\FakeTelegramTransport;
 use Tests\MqttLifecycle\ScenarioRecorder;
 use Tests\MqttLifecycle\ScenarioSubscriber;
 
@@ -92,6 +95,18 @@ final class DeliveryKernel extends Kernel
             ->setArguments([new Reference('messenger.default_bus'), new Reference('doctrine.orm.entity_manager')])
             ->addTag('kernel.event_subscriber')
             ->setPublic(true);
+
+        // services.yaml already aliases InterfaceTelegramTransport; a compiler
+        // pass is required to override it (plain build() mutation would be
+        // clobbered when services.yaml loads after this method runs).
+        $container->addCompilerPass(new class implements CompilerPassInterface {
+            public function process(ContainerBuilder $container): void
+            {
+                $container->register(FakeTelegramTransport::class, FakeTelegramTransport::class)->setPublic(true);
+                $container->setAlias(InterfaceTelegramTransport::class, FakeTelegramTransport::class)->setPublic(false);
+                $container->setAlias('test.telegram_transport', FakeTelegramTransport::class)->setPublic(true);
+            }
+        });
     }
 }
 
@@ -289,10 +304,15 @@ try {
 
     ingest($kernel, uplink(['BatV' => 8888], devEui: 'failed-device', deduplicationId: $exhaustionId, deviceName: 'Failed sensor'));
 
+    /** @var FakeTelegramTransport $telegramTransport */
+    $telegramTransport = $container->get('test.telegram_transport');
+    $telegramCallsAfterAttempt = [];
+
     // Force every retry to be immediately available, then burn through them.
     for ($attempt = 0; $attempt < 4; ++$attempt) {
         $connection->executeStatement("UPDATE messenger_messages SET available_at = NOW() WHERE queue_name = 'async' AND delivered_at IS NULL");
         $consume();
+        $telegramCallsAfterAttempt[] = count($telegramTransport->calls);
     }
 
     $scenarioSubscriber->disarmFailureCapture();
@@ -305,13 +325,29 @@ try {
         check(str_contains($failureMessage, 'delivery_flush_failure'), 'Every failed attempt must be caused by the delivery_flush_failure CHECK constraint (a generic DB error or a duplicate-device-name violation is not sufficient). Got: '.$failureMessage);
     }
 
+    // The Telegram alert must fire only on the terminal (4th) attempt, never
+    // on any of the 3 retried attempts.
+    check([0, 0, 0, 1] === $telegramCallsAfterAttempt, 'The failed-message Telegram alert must fire exactly once, only after the final (non-retried) attempt.');
+
     $failedCount = (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'failed' AND body LIKE ?", ['%'.$exhaustionId.'%']);
     check(1 === $failedCount, 'Exactly one failed-queue message must correspond to this event.');
+    // Paired assertion: FailedMessageAlertSubscriber runs at priority -200,
+    // strictly after SendFailedMessageToFailureTransportListener's synchronous
+    // -100 send, so the Telegram call firing is proof the row above is
+    // already durably present in the failed transport.
+    check(1 === count($telegramTransport->calls), 'Exactly one Telegram alert must be recorded for this terminally-failed event.');
     $failed = $connection->fetchAssociative("SELECT * FROM messenger_messages WHERE queue_name = 'failed' AND body LIKE ?", ['%'.$exhaustionId.'%']);
     check(str_contains($failed['body'], 'failed-device'), 'The failed queue must contain the rejected uplink.');
     check(0 === (int) $connection->fetchOne("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'async' AND body LIKE ?", ['%'.$exhaustionId.'%']), 'No async-queue message may remain for this event.');
     check(0 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE deduplication_id = ?', [$exhaustionId]), 'No measurement for this event may be persisted.');
+
+    $telegramAlert = $telegramTransport->calls[0]['text'];
+    check(str_contains($telegramAlert, ChirpStackUplink::class), 'The Telegram alert must contain the failed message class.');
+    check(str_contains($telegramAlert, 'Retry count: 3'), 'The Telegram alert must contain the retry count.');
+    check(str_contains($telegramAlert, $exhaustionId), 'The Telegram alert must contain the uplink UUID.');
+    check(!str_contains($telegramAlert, 'delivery_flush_failure'), 'The Telegram alert must never contain raw exception text.');
     echo "PASS failure: exhausted retries moved the message to the failed queue via the intended CHECK constraint\n";
+    echo "PASS telegram-alert: exactly one terminal-failure alert fired, with no exception text leaked\n";
 
     // -----------------------------------------------------------------
     // 6. Failed messages are inspectable with messenger:failed:show.

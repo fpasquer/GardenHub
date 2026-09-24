@@ -848,7 +848,7 @@ This uses the same Messenger ingestion path as a real MQTT message.
 
 # Telegram Logging
 
-A dedicated Monolog `telegram` channel can forward log records to a Telegram chat. This is logging infrastructure only — it is distinct from the still-unimplemented "Telegram notifications" / alerting feature on the roadmap (no rules, thresholds, or scheduling here).
+A dedicated Monolog `telegram` channel can forward log records to a Telegram chat. This is logging infrastructure only. Two narrow, hardcoded backend alerts (see [Backend alerts](#backend-alerts)) send `critical` records through this same channel; a general rules/thresholds/scheduling "Telegram notifications" alerting framework is still on the roadmap.
 
 ## Configuration
 
@@ -989,6 +989,15 @@ docker compose logs -f gardenhub-scheduler
 ## Failure isolation
 
 Telegram delivery is best-effort: any failure (missing configuration, network error, API error) is logged to the normal application logs instead and never propagates, so Telegram outages can never break requests, MQTT ingestion, or Messenger processing. The connection has a 5-second **read** timeout (bounds the connection and each read), not a guaranteed total delivery deadline.
+
+## Backend alerts
+
+Two hardcoded, backend-triggered `critical` alerts ride the `telegram` channel above (they clear the production `TELEGRAM_MIN_LEVEL=critical` threshold). Neither has its own entity, migration, or configuration — both are plain `LoggerInterface::critical()` calls, so [Failure isolation](#failure-isolation) applies to them as well.
+
+- **Messenger terminal failure** (`App\Messenger\EventListener\FailedMessageAlertSubscriber`): fires once per message that exhausts all retries on the `async` transport and lands in the `failed` transport. The alert contains the message class, retry count, and error type — never the exception text, payload, or credentials. It never fires on intermediate retries, and never re-fires while reprocessing the `failed` transport.
+- **MQTT sustained disconnection** (`App\Command\MqttConsumeCommand`): fires once after 12 consecutive failed connection attempts or dropped connection loops (the worker keeps retrying every 5s regardless), and exactly one recovery alert on the next successful reconnect. It does not fire for brief interruptions below the threshold, the worker's initial connection, or uplink-processing failures (a separate, pre-existing failure path).
+  - **Every successful (re)connect resets the counter to zero**, even if the connection drops again immediately afterward. In practice this means the 12-count streak is driven by *repeated total inability to connect* (broker/network unreachable); a connection that keeps connecting then immediately dropping resets on each successful connect and will not, by itself, accumulate to 12 the way 12 consecutive connect failures would.
+  - **The counter and "already alerted" flag are in-memory and per-process.** They reset to zero whenever the MQTT worker process restarts (deploy, crash, manual restart). A crash-loop can therefore re-alert before reaching 12 failures again, and a restart immediately after breaching the threshold silently re-arms without notice.
 
 ---
 
