@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Mqtt;
 
+use PhpMqtt\Client\Contracts\MqttClient as MqttClientContract;
 use PhpMqtt\Client\ConnectionSettings;
 use PhpMqtt\Client\MqttClient;
 use PhpMqtt\Client\Repositories\MemoryRepository;
@@ -29,7 +30,7 @@ use PhpMqtt\Client\Subscription;
  *    the same topic filter, so the pre-registered subscription is replaced —
  *    never duplicated. Each PUBLISH invokes the callback exactly once.
  */
-final class WorkerMqttClientFactory
+final class WorkerMqttClientFactory implements InterfaceMqttClientFactory
 {
     public function __construct(
         private readonly string $host,
@@ -42,7 +43,7 @@ final class WorkerMqttClientFactory
     /**
      * Creates a connected client, subscribed with QoS 1 and a persistent session.
      */
-    public function create(string $clientId, string $topic, callable $callback): MqttClient
+    public function create(string $clientId, string $topic, callable $callback): MqttClientContract
     {
         $settings = (new ConnectionSettings())
             ->setUsername('' !== $this->username ? $this->username : null)

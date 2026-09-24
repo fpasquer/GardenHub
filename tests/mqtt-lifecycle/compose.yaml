@@ -33,6 +33,10 @@ services:
       APP_SECRET: lifecycle-tests-only
       DATABASE_URL: 'mysql://root@mysql:3306/worker_lifecycle?serverVersion=8.4&charset=utf8mb4'
       GARDENHUB_LIFECYCLE_TESTS: '1'
+      TELEGRAM_ENABLED: 'true'
+      TELEGRAM_BOT_TOKEN: 'test-token'
+      TELEGRAM_CHAT_ID: 'test-chat'
+      TELEGRAM_MIN_LEVEL: 'critical'
     volumes:
       - ../../api/src:/app/src:ro
       - ../../api/config:/app/config:ro

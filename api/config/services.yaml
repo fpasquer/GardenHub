@@ -51,6 +51,7 @@ services:
             $clientId: '%env(MQTT_CLIENT_ID)%'
             $topic: '%env(MQTT_TOPIC)%'
             $servicesResetter: '@services_resetter'
+            $telegramLogger: '@monolog.logger.telegram'
 
     App\Monolog\Telegram\InterfaceTelegramTransport: '@App\Monolog\Telegram\StreamTelegramTransport'
 

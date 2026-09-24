@@ -7,6 +7,7 @@ use App\Entity\Measurement;
 use App\Kernel;
 use Doctrine\ORM\Tools\SchemaTool;
 use PhpMqtt\Client\ConnectionSettings;
+use PhpMqtt\Client\Exceptions\DataTransferException;
 use PhpMqtt\Client\MqttClient;
 use Psr\Log\AbstractLogger;
 use Symfony\Component\Config\Loader\LoaderInterface;
@@ -19,8 +20,17 @@ use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\TraceableMessageBus;
 use Symfony\Component\Uid\Uuid;
+use Tests\MqttLifecycle\ScriptedMqttClientFactory;
 
 require '/app/vendor/autoload.php';
+
+// Test-only classes under /tests/src are not in the Composer autoloader.
+spl_autoload_register(static function (string $class): void {
+    $prefix = 'Tests\\MqttLifecycle\\';
+    if (str_starts_with($class, $prefix)) {
+        require '/tests/src/'.substr($class, strlen($prefix)).'.php';
+    }
+});
 
 final class LifecycleKernel extends Kernel
 {
@@ -143,6 +153,14 @@ function workerScenario(LifecycleKernel $kernel, string $scenario): int
         return Command::FAILURE;
     }
 
+    if ('mqtt-outage' === $scenario) {
+        runOutageAlertCheck($bus, $resetter);
+        runOutageFreshInstanceCheck($bus, $resetter);
+        echo "PASS mqtt-outage: outage alert fires once at the threshold, no duplicate, one recovery alert, and a fresh instance never carries over state\n";
+
+        return Command::FAILURE;
+    }
+
     $messages = [];
     if ('initial' === $scenario) {
         $messages = ['{', '{"object":{"BatV":3}}', '{"deviceInfo":{"devEui":"ignored"}}'];
@@ -256,6 +274,99 @@ function workerScenario(LifecycleKernel $kernel, string $scenario): int
     return $status;
 }
 
+/**
+ * Builds the 13-failure script (mixing create()-throws, loop()-throws, and
+ * loop() returning normally with no exception for the 12th/13th failure -
+ * the previously-unhandled "clean return" path) followed by a 14th
+ * successful reconnect that ends the run via a sentinel exception.
+ *
+ * @return list<\Throwable|\Closure>
+ */
+function buildOutageScript(LogicException $stop): array
+{
+    $script = [];
+    for ($i = 0; $i < 11; ++$i) {
+        $script[] = 0 === $i % 2
+            ? new DataTransferException(0, 'Simulated connect failure.')
+            : function (): void {
+                throw new DataTransferException(0, 'Simulated mid-loop drop.');
+            };
+    }
+    $script[] = function (): void {
+        // Loop returns without throwing: the previously-unhandled path.
+    };
+    $script[] = function (): void {
+        // Loop returns without throwing: the previously-unhandled path.
+    };
+    $script[] = function () use ($stop): void {
+        throw $stop;
+    };
+
+    return $script;
+}
+
+/**
+ * Runs 13 consecutive connection failures then a successful reconnect,
+ * asserting: exactly one outage alert at the 12th failure, no duplicate at
+ * the 13th, and exactly one recovery alert on the 14th (successful) attempt.
+ */
+function runOutageAlertCheck(MessageBusInterface $bus, ServicesResetterInterface $resetter): void
+{
+    $telegramLogs = [];
+    $telegramLogger = new CallbackLogger(function (string $level, string $message) use (&$telegramLogs): void {
+        $telegramLogs[] = [$level, $message];
+    });
+    $logger = new CallbackLogger(function (string $level, string $message): void {
+        check('error' === $level && str_contains($message, 'MQTT connection failed'), 'Connection failures must use MQTT recovery logs.');
+    });
+
+    $stop = new LogicException('End MQTT outage test.');
+    $clientFactory = new ScriptedMqttClientFactory(buildOutageScript($stop));
+    $command = new MqttConsumeCommand($bus, $logger, 'mqtt', 1, '', '', 'outage-test', 'tests/outage', $resetter, $clientFactory, $telegramLogger, 0);
+
+    try {
+        $command->run(new ArrayInput([]), new NullOutput());
+        throw new RuntimeException('The sentinel exception must propagate out of the outage test.');
+    } catch (LogicException $exception) {
+        check($stop === $exception, 'Expected the sentinel exception to end the outage test.');
+    }
+
+    $criticalLogs = array_values(array_filter($telegramLogs, static fn (array $r): bool => 'critical' === $r[0]));
+    check(2 === count($criticalLogs), 'Expected exactly one outage alert and one recovery alert, got '.count($criticalLogs).'.');
+    check(str_contains($criticalLogs[0][1], '12') && !str_contains($criticalLogs[0][1], 'Simulated'), 'The outage alert must mention the threshold and contain no exception text.');
+    check(str_contains($criticalLogs[1][1], 'recovered'), 'The second alert must be the recovery notification.');
+}
+
+/**
+ * Proves the "resets on worker restart" documentation claim: a brand-new
+ * command instance whose very first connection attempt succeeds must never
+ * alert, since its own in-memory counters start at zero.
+ */
+function runOutageFreshInstanceCheck(MessageBusInterface $bus, ServicesResetterInterface $resetter): void
+{
+    $telegramLogs = [];
+    $telegramLogger = new CallbackLogger(function (string $level, string $message) use (&$telegramLogs): void {
+        $telegramLogs[] = [$level, $message];
+    });
+    $logger = new CallbackLogger(function (string $level, string $message): void {
+    });
+
+    $stop = new LogicException('End fresh MQTT instance test.');
+    $clientFactory = new ScriptedMqttClientFactory([function () use ($stop): void {
+        throw $stop;
+    }]);
+    $command = new MqttConsumeCommand($bus, $logger, 'mqtt', 1, '', '', 'outage-fresh', 'tests/outage', $resetter, $clientFactory, $telegramLogger, 0);
+
+    try {
+        $command->run(new ArrayInput([]), new NullOutput());
+        throw new RuntimeException('The sentinel exception must propagate out of the fresh-instance test.');
+    } catch (LogicException $exception) {
+        check($stop === $exception, 'Expected the sentinel exception to end the fresh-instance test.');
+    }
+
+    check([] === $telegramLogs, 'A brand-new command instance must never alert on its first successful connection.');
+}
+
 try {
     check('1' === getenv('GARDENHUB_LIFECYCLE_TESTS'), 'Run only with the isolated test Compose file.');
     $kernel = new LifecycleKernel('dev', true);
@@ -292,6 +403,7 @@ try {
     runChild('reset-failure');
     check(43 === (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement'), 'Reset failure must stop after the current uplink.');
     runChild('mqtt-retry');
+    runChild('mqtt-outage');
     echo "PASS persistence, validation, provisioning, debug cleanup, and fresh-process recovery\n";
     $kernel->shutdown();
 } catch (Throwable $exception) {
