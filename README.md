@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 10668)
-Total output lines: 1542
-
 # GardenHub 🌱
 
 GardenHub is a local, self-hosted IoT backend for monitoring and eventually automating a connected garden.
@@ -575,7 +572,120 @@ Payload fields are mapped through:
 api/config/services.yaml
 ```
 
-Current SE01 mapping:…668 tokens truncated…na alerts.
+Current SE01 mapping:
+
+| Payload field | Sensor type | Unit |
+|---|---|---|
+| `BatV` | `battery` | V |
+| `water_SOIL` | `soil_moisture` | % |
+| `temp_SOIL` | `soil_temperature` | °C |
+| `temp_DS18B20` | `air_temperature` | °C |
+| `conduct_SOIL` | `soil_conductivity` | µS/cm |
+
+Unknown payload fields are ignored.
+
+Non-numeric values are skipped.
+
+Devices and sensors are automatically provisioned on first sight.
+
+---
+
+# Database Model
+
+Current MySQL tables include:
+
+```text
+api_client
+device
+doctrine_migration_versions
+measurement
+sensor
+```
+
+Doctrine migrations are applied with:
+
+```bash
+docker compose exec gardenhub-api php bin/console doctrine:migrations:migrate --no-interaction
+```
+
+Measurements are persisted in MySQL and survive:
+
+- container recreation
+- Docker restart
+- server reboot
+
+because MySQL uses the persistent volume:
+
+```text
+gardenhub-mysql-data
+```
+
+---
+
+# Getting Started
+
+## Prerequisites
+
+- Docker
+- Docker Compose v2+
+- Git
+
+No host installation of PHP, Composer, Symfony CLI, nginx or MySQL is required.
+
+## Clone
+
+```bash
+git clone <repository-url> GardenHub
+cd GardenHub
+```
+
+## Environment
+
+Never commit production secrets.
+
+The deployment uses a root `.env` file for Compose variables (`/opt/gardenhub/.env` in this repository's layout). Plain `docker compose` commands only read this single file automatically; they do **not** merge an untracked `.env.local` on their own. Only this repository's `Makefile` does that, via explicit `--env-file` flags:
+
+```make
+COMPOSE := docker compose --env-file .env
+ifneq ($(wildcard .env.local),)
+COMPOSE += --env-file .env.local
+endif
+```
+
+Use `make start` (base stack) or `make dev` (base stack + `compose-dev.yaml`) to get this behavior. To reproduce it with plain Compose, pass both files explicitly:
+
+```bash
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml up -d --build
+```
+
+Whichever mechanism is used, the resulting values are injected as real container environment variables, which always take precedence over `api/.env` — Symfony's own tracked, safe-placeholder fallback file used only when running the app outside Docker.
+
+Example development values:
+
+```dotenv
+APP_ENV=dev
+
+APP_PORT=8080
+GRAFANA_PORT=3000
+
+MYSQL_DATABASE=gardenhub
+MYSQL_USER=gardenhub
+MYSQL_PASSWORD=<password>
+MYSQL_ROOT_PASSWORD=<root-password>
+
+MQTT_HOST=mosquitto
+MQTT_PORT=1883
+MQTT_USERNAME=<username>
+MQTT_PASSWORD=<password>
+
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN=<bot-token>
+TELEGRAM_CHAT_ID=<chat-id>
+TELEGRAM_MIN_LEVEL=warning
+```
+
+Grafana uses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` directly for alerting;
+the Symfony-only `TELEGRAM_ENABLED` switch does not disable Grafana alerts.
 
 Production on `gardenhub-server` currently uses:
 
