@@ -223,6 +223,7 @@ services:
   gardenhub-grafana:
     image: grafana/grafana:12.1
     container_name: gardenhub-grafana
+    entrypoint: ["/bin/sh", "/etc/grafana/render-alerting.sh"]
     restart: unless-stopped
     ports:
       - "${BIND_ADDRESS:?BIND_ADDRESS must be set}:${GRAFANA_PORT:-3000}:3000"
@@ -247,8 +248,11 @@ services:
       # Datasources, dashboards, and alerting resources are provisioned at startup.
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./grafana/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
+      - ./grafana/provisioning/alerting:/etc/grafana/alerting-templates:ro
+      - ./grafana/render-alerting.sh:/etc/grafana/render-alerting.sh:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    tmpfs:
+      - /etc/grafana/provisioning/alerting:uid=472,gid=0,mode=0700
     depends_on:
       gardenhub-mysql:
         condition: service_healthy

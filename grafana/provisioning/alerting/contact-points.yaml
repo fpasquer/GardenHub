@@ -8,9 +8,7 @@ contactPoints:
         type: telegram
         disableResolveMessage: false
         settings:
-          # A block scalar keeps numeric/negative Telegram chat IDs as strings
-          # when Grafana expands the environment variable during provisioning.
-          chatid: |-
-            $TELEGRAM_CHAT_ID
-        secure_settings:
+          # Rendered by grafana/render-alerting.sh before Grafana reads this file.
+          # Grafana coerces numeric values substituted from $TELEGRAM_CHAT_ID.
+          chatid: "__GARDENHUB_CHAT_ID__"
           bottoken: $TELEGRAM_BOT_TOKEN

@@ -1,0 +1,48 @@
+name: gardenhub-grafana-db-tests
+
+services:
+  gardenhub-mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_DATABASE: gardenhub_test
+    tmpfs:
+      - /var/lib/mysql
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  gardenhub-grafana:
+    image: grafana/grafana:12.1
+    entrypoint: ["/bin/sh", "/etc/grafana/render-alerting.sh"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: test-only
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      MYSQL_DATABASE: gardenhub_test
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ''
+      # Invalid test credentials: no real Telegram notification can be sent.
+      TELEGRAM_BOT_TOKEN: '123456:invalid-test-token'
+      TELEGRAM_CHAT_ID: '9876543210'
+    volumes:
+      - ../../grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ../../grafana/provisioning/alerting:/etc/grafana/alerting-templates:ro
+      - ../../grafana/render-alerting.sh:/etc/grafana/render-alerting.sh:ro
+    tmpfs:
+      - /var/lib/grafana:uid=472,gid=0,mode=0700
+      - /etc/grafana/provisioning/alerting:uid=472,gid=0,mode=0700
+    ports:
+      - '127.0.0.1:13000:3000'
+    depends_on:
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30

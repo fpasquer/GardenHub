@@ -20,23 +20,24 @@ groups:
                 type: mysql
                 uid: gardenhub-mysql
               editorMode: code
-              format: time_series
+              format: table
               rawQuery: true
               rawSql: |-
                 SELECT
-                  UTC_TIMESTAMP() AS time,
                   TIMESTAMPDIFF(
                     SECOND,
                     MAX(m.created_at),
                     UTC_TIMESTAMP()
                   ) AS value,
-                  CONCAT(d.name, ' / ', s.type) AS metric
+                  CAST(s.id AS CHAR) AS sensor_id,
+                  d.name AS device,
+                  s.type AS sensor_type
                 FROM sensor s
                 INNER JOIN device d ON d.id = s.device_id
                 LEFT JOIN measurement m ON m.sensor_id = s.id
                 GROUP BY s.id, d.name, s.type
                 HAVING MAX(m.created_at) IS NOT NULL
-                ORDER BY time
+                ORDER BY s.id
               refId: A
               intervalMs: 60000
               maxDataPoints: 1440
@@ -70,7 +71,7 @@ groups:
         for: 1m
         annotations:
           summary: >-
-            No GardenHub reading stored for {{ $labels.metric }} in over 60 minutes.
+            No GardenHub reading stored for {{ $labels.device }} / {{ $labels.sensor_type }} in over 60 minutes.
           description: >-
             Check the device, LoRaWAN uplinks, MQTT connection, and GardenHub
             ingestion worker. The rule evaluates once per minute and fires after
@@ -81,7 +82,7 @@ groups:
           source: grafana
         notification_settings:
           receiver: GardenHub Telegram
-          group_by: [grafana_folder, alertname, metric]
+          group_by: [grafana_folder, alertname, sensor_id]
           group_wait: 30s
           group_interval: 5m
           repeat_interval: 4h
@@ -101,11 +102,10 @@ groups:
                 type: mysql
                 uid: gardenhub-mysql
               editorMode: code
-              format: time_series
+              format: table
               rawQuery: true
               rawSql: |-
                 SELECT
-                  UTC_TIMESTAMP() AS time,
                   COUNT(DISTINCT m.deduplication_id) AS value
                 FROM measurement m
                 WHERE m.created_at >= UTC_TIMESTAMP() - INTERVAL 60 MINUTE
