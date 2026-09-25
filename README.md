@@ -449,28 +449,69 @@ Grafana Alerting is provisioned from `grafana/provisioning/alerting` and sends
 notifications through the same Telegram bot and chat configured for Symfony
 (`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the root Compose environment).
 `TELEGRAM_ENABLED` only controls Symfony's Monolog channel; Grafana evaluates
-and sends its own alerts independently. The provisioned contact point keeps
-the bot token in Grafana's secure settings.
+and sends its own alerts independently.
+
+Both `bottoken` and `chatid` are plain (non-secure) contact point settings, as
+required by Grafana's current file-provisioning schema. Because Grafana
+unconditionally coerces any `$VAR`-substituted setting that looks numeric into
+a JSON number — crashing `chatid`, which must stay a string, regardless of
+YAML quoting — the container's entrypoint is overridden to
+`grafana/docker/render-provisioning.sh`, which resolves `$TELEGRAM_CHAT_ID`/
+`$TELEGRAM_BOT_TOKEN` itself and writes an already-resolved, quoted
+`contact-points.yaml` before Grafana's own provisioning loader ever parses it.
 
 The initial rules are:
 
-- **GardenHub device silent** — fires for each sensor that has previously
-  reported but has no measurement stored in the previous 60 minutes, after one
-  additional minute of confirmation. It checks `created_at` (when GardenHub
-  stored the reading), not the device's measurement timestamp. Sensors that
-  have never reported are covered by the platform-wide alert below.
+- **GardenHub device silent** — fires per sensor that has previously reported
+  but has no measurement stored in the previous 60 minutes, after one
+  additional minute of confirmation. Each firing instance is uniquely
+  identified by `device`/`sensor_type` labels (one row per sensor from a
+  `format: table` query — required so Grafana can tell sensors apart; a
+  `time_series` query with a synthetic "metric" column collapses every sensor
+  into the same empty label set and fails evaluation). It checks `created_at`
+  (when GardenHub stored the reading), not the device's measurement
+  timestamp. Sensors that have never reported are covered by the
+  platform-wide alert below.
 - **GardenHub no measurements received** — fires when no uplink event was
   stored for any device during the previous 60 minutes, after five minutes of
-  confirmation.
+  confirmation. The underlying query also uses `format: table` (a single
+  reduced row); Grafana rejects a raw `time_series` result here with
+  "looks like time series data, only reduced data can be alerted on".
 
 Both rules are evaluated every minute and notify the `GardenHub Telegram`
-contact point, including a notification when the condition resolves. To apply
-changes to provisioned resources, restart Grafana after deploying the files:
+contact point, including a notification when the condition resolves.
+
+Compose only re-injects environment variables when a container is
+**recreated**, not on a plain restart — so after changing `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_CHAT_ID`, or any other env var, or after editing files under
+`grafana/provisioning/`, redeploy with:
 
 ```bash
-docker compose restart gardenhub-grafana
+docker compose up -d gardenhub-grafana
 docker compose logs --tail=100 gardenhub-grafana
 ```
+
+`docker compose restart gardenhub-grafana` reuses the existing container and
+its already-injected environment, so it will not pick up the change.
+
+### Testing Grafana alerts
+
+`tests/grafana-db/` runs the pinned Grafana image against this repo's actual,
+unmodified provisioning files and a disposable MySQL database, seeding
+representative devices/sensors/measurements (an active sensor, a silent one on
+the same device, and a global-silence scenario), then asserts each rule's
+resulting labels, health, and state through Grafana's rules API, plus that the
+Telegram contact point's `chatid` decodes as a string:
+
+```bash
+docker compose -f tests/grafana-db/compose.yaml up --abort-on-container-exit --exit-code-from tests
+docker compose -f tests/grafana-db/compose.yaml down -v
+```
+
+This does not send a real Telegram message — Grafana's Telegram integration
+has no configurable API endpoint to intercept, so real delivery still
+requires manual verification with real credentials (see
+[Telegram Logging](#telegram-logging)).
 
 The active root `.env` (production) or `.env.local` (development, loaded by
 the Makefile) must provide the intended bot token and chat ID. Keep separate

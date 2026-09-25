@@ -242,13 +242,17 @@ services:
       # Use the same bot and destination as Symfony's Telegram notifications.
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    entrypoint: ["/bin/sh", "/docker-entrypoint-scripts/render-provisioning.sh"]
     volumes:
       - gardenhub-grafana-data:/var/lib/grafana
-      # Datasources, dashboards, and alerting resources are provisioned at startup.
+      # Datasources and dashboards are provisioned as-is; alerting is
+      # rendered from templates first (see render-provisioning.sh) so
+      # Telegram's chatid never passes through Grafana's own $VAR expansion.
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./grafana/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
+      - ./grafana/provisioning/alerting:/etc/grafana/provisioning-templates/alerting:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./grafana/docker/render-provisioning.sh:/docker-entrypoint-scripts/render-provisioning.sh:ro
     depends_on:
       gardenhub-mysql:
         condition: service_healthy

@@ -20,23 +20,22 @@ groups:
                 type: mysql
                 uid: gardenhub-mysql
               editorMode: code
-              format: time_series
+              format: table
               rawQuery: true
               rawSql: |-
                 SELECT
-                  UTC_TIMESTAMP() AS time,
+                  d.name AS device,
+                  s.type AS sensor_type,
                   TIMESTAMPDIFF(
                     SECOND,
                     MAX(m.created_at),
                     UTC_TIMESTAMP()
-                  ) AS value,
-                  CONCAT(d.name, ' / ', s.type) AS metric
+                  ) AS seconds_since_last_reading
                 FROM sensor s
                 INNER JOIN device d ON d.id = s.device_id
                 LEFT JOIN measurement m ON m.sensor_id = s.id
                 GROUP BY s.id, d.name, s.type
                 HAVING MAX(m.created_at) IS NOT NULL
-                ORDER BY time
               refId: A
               intervalMs: 60000
               maxDataPoints: 1440
@@ -50,13 +49,6 @@ groups:
                 - evaluator:
                     params: [3600]
                     type: gt
-                  operator:
-                    type: and
-                  query:
-                    params: [A]
-                  reducer:
-                    type: last
-                  type: query
               datasource:
                 type: __expr__
                 uid: __expr__
@@ -70,7 +62,7 @@ groups:
         for: 1m
         annotations:
           summary: >-
-            No GardenHub reading stored for {{ $labels.metric }} in over 60 minutes.
+            No GardenHub reading stored for {{ $labels.device }} / {{ $labels.sensor_type }} in over 60 minutes.
           description: >-
             Check the device, LoRaWAN uplinks, MQTT connection, and GardenHub
             ingestion worker. The rule evaluates once per minute and fires after
@@ -81,7 +73,7 @@ groups:
           source: grafana
         notification_settings:
           receiver: GardenHub Telegram
-          group_by: [grafana_folder, alertname, metric]
+          group_by: [grafana_folder, alertname, device, sensor_type]
           group_wait: 30s
           group_interval: 5m
           repeat_interval: 4h
@@ -101,12 +93,11 @@ groups:
                 type: mysql
                 uid: gardenhub-mysql
               editorMode: code
-              format: time_series
+              format: table
               rawQuery: true
               rawSql: |-
                 SELECT
-                  UTC_TIMESTAMP() AS time,
-                  COUNT(DISTINCT m.deduplication_id) AS value
+                  COUNT(DISTINCT m.deduplication_id) AS measurements_last_60m
                 FROM measurement m
                 WHERE m.created_at >= UTC_TIMESTAMP() - INTERVAL 60 MINUTE
               refId: A
@@ -122,13 +113,6 @@ groups:
                 - evaluator:
                     params: [1]
                     type: lt
-                  operator:
-                    type: and
-                  query:
-                    params: [A]
-                  reducer:
-                    type: last
-                  type: query
               datasource:
                 type: __expr__
                 uid: __expr__

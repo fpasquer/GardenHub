@@ -1,0 +1,70 @@
+name: gardenhub-grafana-db-tests
+
+services:
+  # Named gardenhub-mysql to match the hostname hardcoded in the real,
+  # unmodified grafana/provisioning/datasources/mysql.yaml.
+  gardenhub-mysql:
+    image: mysql:8.4
+    command: ["--mysql-native-password=ON", "--authentication-policy=mysql_native_password"]
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_DATABASE: gardenhub
+    tmpfs:
+      - /var/lib/mysql
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/1-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=TCP", "--silent"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+
+  # Real, pinned Grafana image loading this repo's actual provisioning files
+  # unmodified (same bind-mount shape as compose.yaml's gardenhub-grafana),
+  # so a passing test here reflects the real dev/prod deployment.
+  grafana:
+    image: grafana/grafana:12.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      MYSQL_DATABASE: gardenhub
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ''
+      # Synthetic, non-secret, but same shape as real Telegram credentials
+      # (numeric chat id, colon-delimited bot token) to exercise provisioning.
+      TELEGRAM_BOT_TOKEN: '123456789:TEST-not-a-real-token-AAAAAAAAAAAAAAAAAAAA'
+      TELEGRAM_CHAT_ID: '987654321'
+    entrypoint: ["/bin/sh", "/docker-entrypoint-scripts/render-provisioning.sh"]
+    volumes:
+      - ../../grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ../../grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../../grafana/provisioning/alerting:/etc/grafana/provisioning-templates/alerting:ro
+      - ../../grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ../../grafana/docker/render-provisioning.sh:/docker-entrypoint-scripts/render-provisioning.sh:ro
+    depends_on:
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  tests:
+    image: alpine:3.20
+    entrypoint: ["sh", "/tests/run.sh"]
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_USER: admin
+      GRAFANA_PASSWORD: admin
+      MYSQL_HOST: gardenhub-mysql
+    volumes:
+      - ./:/tests:ro
+    depends_on:
+      grafana:
+        condition: service_healthy
