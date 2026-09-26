@@ -17,19 +17,23 @@ NO_MEASUREMENTS="GardenHub no measurements received"
 POLL_INTERVAL=5
 DEVICE_SILENT_TIMEOUT=180
 NO_MEASUREMENTS_TIMEOUT=480
+# Bounds each individual request so one stalled call can't silently outlast
+# the outer polling timeouts above.
+CURL_MAX_TIME=10
 
 run_sql() {
     mysql -h "$MYSQL_HOST" -u root gardenhub < "$1"
 }
 
 fetch_rule() {
-    curl -sf -u "$GRAFANA_AUTH" "$RULES_URL" \
+    curl -sf --max-time "$CURL_MAX_TIME" -u "$GRAFANA_AUTH" "$RULES_URL" \
         | jq --arg name "$1" '[.data.groups[].rules[] | select(.name == $name)][0]'
 }
 
 # Polls a rule until its Prometheus-style top-level `state` (lowercase
-# firing/pending/inactive) equals $2, printing the last-seen rule JSON
-# either way. Fails with diagnostics if $3 seconds pass without reaching it.
+# firing/pending/inactive) equals $2, echoing the matching rule JSON on
+# success. Returns 1 with diagnostics on stderr if $3 seconds pass without
+# reaching it.
 wait_for_rule_state() {
     name="$1"
     want="$2"
@@ -53,8 +57,10 @@ wait_for_rule_state() {
         echo "  lastError:   $(echo "$rule" | jq -r '.lastError // ""')"
         echo "  instances:   $(echo "$rule" | jq -c '[.alerts[]? | {labels, state}]')"
     } >&2
-    FAIL=1
-    echo "$rule"
+    # Runs inside a `rule=$(...)` command substitution in every caller, so
+    # setting FAIL here would be lost in that subshell - return 1 instead so
+    # `set -e` aborts the script at the failing assignment.
+    return 1
 }
 
 find_instance() {
@@ -66,8 +72,8 @@ find_instance() {
 }
 
 # Polls a single alert instance (by device/sensor_type labels) until its own
-# per-instance `state` matches $4, printing the last-seen rule JSON either
-# way. Each instance has its own independent "for" pending timer, so the
+# per-instance `state` matches $4, echoing the matching rule JSON on success.
+# Each instance has its own independent "for" pending timer, so the
 # rule-level state (which fires as soon as ANY instance is Alerting - see
 # ComputeRuleState's Alerting > Pending priority) is not sufficient evidence
 # that a specific instance has also finished transitioning.
@@ -98,8 +104,8 @@ wait_for_instance_state() {
         echo "FAIL: instance device=$device sensor_type=$sensor_type on rule '$name' did not reach state '$want' within ${timeout}s"
         echo "  instances: $(echo "$rule" | jq -c '[.alerts[]? | {labels, state}]')"
     } >&2
-    FAIL=1
-    echo "$rule"
+    # Same subshell caveat as wait_for_rule_state - return 1, don't set FAIL.
+    return 1
 }
 
 # Checks one alert instance's own per-instance `state` (e.g. "Normal" vs
@@ -140,8 +146,50 @@ assert_rule_state() {
     fi
 }
 
+# Rule-level `health` is "ok" only if every underlying eval was Normal/Pending/
+# Alerting/Recovering - it flips to "error"/"nodata" on any eval.Error/NoData,
+# independently of `state` (which can still read "firing" in both cases since
+# this rule's noDataState/executionErrorState are both "Alerting"). This is
+# the only reliable way to reject an error/No-Data-driven firing.
+assert_rule_health() {
+    rule_json="$1"
+    expected="$2"
+    ctx="$3"
+    health=$(echo "$rule_json" | jq -r '.health // "missing"')
+    if [ "$health" != "$expected" ]; then
+        {
+            echo "FAIL: $ctx - expected health '$expected', got '$health'"
+            echo "  state:     $(echo "$rule_json" | jq -r '.state // "missing"')"
+            echo "  lastError: $(echo "$rule_json" | jq -r '.lastError // ""')"
+            echo "  instances: $(echo "$rule_json" | jq -c '[.alerts[]? | {labels, state}]')"
+        } >&2
+        FAIL=1
+    fi
+}
+
+# For rules whose query has no string identity column (e.g. a single-row
+# aggregate), Grafana produces exactly one unlabeled alert instance - unlike
+# find_instance()/assert_instance_state(), which match on device/sensor_type
+# labels that don't exist here.
+assert_single_instance_state() {
+    rule_json="$1"
+    expected="$2"
+    ctx="$3"
+    count=$(echo "$rule_json" | jq '[.alerts[]?] | length')
+    if [ "$count" != "1" ]; then
+        echo "FAIL: $ctx - expected exactly 1 alert instance, found $count"
+        FAIL=1
+        return
+    fi
+    state=$(echo "$rule_json" | jq -r '.alerts[0].state')
+    if [ "$state" != "$expected" ]; then
+        echo "FAIL: $ctx - expected instance state '$expected', got '$state'"
+        FAIL=1
+    fi
+}
+
 check_contact_point() {
-    response=$(curl -sf -u "$GRAFANA_AUTH" "$CONTACT_POINTS_URL")
+    response=$(curl -sf --max-time "$CURL_MAX_TIME" -u "$GRAFANA_AUTH" "$CONTACT_POINTS_URL")
     chatid_type=$(echo "$response" | jq -r '[.[] | select(.name == "GardenHub Telegram")][0].settings.chatid | type')
 
     echo "Telegram contact point chatid JSON type: $chatid_type"
@@ -169,7 +217,9 @@ assert_instance_state "$rule" "SE01-Test" "soil_temperature" "Alerting" "device-
 rule=$(wait_for_instance_state "$DEVICE_SILENT" "SE01-Test" "soil_moisture" "Alerting" "$DEVICE_SILENT_TIMEOUT")
 assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Alerting" "device-silent scenario 2"
 
-wait_for_rule_state "$NO_MEASUREMENTS" firing "$NO_MEASUREMENTS_TIMEOUT" >/dev/null
+rule=$(wait_for_rule_state "$NO_MEASUREMENTS" firing "$NO_MEASUREMENTS_TIMEOUT")
+assert_rule_health "$rule" ok "no-measurements scenario 2 (must be a genuine breach, not eval error/No Data)"
+assert_single_instance_state "$rule" Alerting "no-measurements scenario 2"
 
 echo "=== Telegram contact point provisioning ==="
 check_contact_point
