@@ -28,10 +28,10 @@ HEALTHZ_PORT ?= 8081
 DEPLOY_HEALTH_TIMEOUT ?= 120
 DEPLOY_HEALTH_INTERVAL ?= 5
 
-.PHONY: deploy deploy-check deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-logs deploy-info
+.PHONY: deploy deploy-check deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana deploy-logs deploy-info
 
 # bash is required here: dash (Ubuntu's /bin/sh) has no pipefail/ERR trap
-deploy deploy-check deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health: SHELL := /bin/bash
+deploy deploy-check deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana: SHELL := /bin/bash
 
 deploy-check: ## Verify git/compose state is safe to deploy, then fast-forward to $(DEPLOY_REMOTE)/$(DEPLOY_BRANCH)
 	@set -Eeuo pipefail; \
@@ -140,6 +140,51 @@ deploy-health: ## Wait for required containers to become healthy, then verify th
 	}; \
 	echo "==> [deploy-health] /healthz OK: $$body"
 
+# Compose only recreates a container when its config changes; bind-mounted
+# provisioning files never do, so a plain `up -d` would leave stale content
+# running -- force recreation here on every deploy instead. Run after
+# deploy-health so app-tier readiness is confirmed before touching Grafana.
+deploy-grafana: ## Force-recreate gardenhub-grafana (no rebuild, no MySQL restart), then wait for it to become healthy
+	@set -Eeuo pipefail; \
+	dump_health_log() { docker inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' "$$1" 2>/dev/null; }; \
+	echo "==> [deploy-grafana] Recreating: gardenhub-grafana"; \
+	$(COMPOSE) $(COMPOSE_FILES) up -d --force-recreate --no-build --no-deps gardenhub-grafana; \
+	echo "==> [deploy-grafana] Waiting up to $(DEPLOY_HEALTH_TIMEOUT)s for gardenhub-grafana to become healthy"; \
+	elapsed=0; \
+	while :; do \
+	  cid=$$($(COMPOSE) $(COMPOSE_FILES) ps -a -q gardenhub-grafana); \
+	  if [ -z "$$cid" ]; then \
+	    echo "!! [deploy-grafana] gardenhub-grafana: no container found"; \
+	    exit 1; \
+	  fi; \
+	  state=$$(docker inspect -f '{{.State.Status}}' $$cid); \
+	  if [ "$$state" = "exited" ] || [ "$$state" = "dead" ]; then \
+	    echo "!! [deploy-grafana] gardenhub-grafana exited (state: $$state)"; \
+	    echo "==> [deploy-grafana] Health-check log (no secrets):"; \
+	    dump_health_log "$$cid"; \
+	    exit 1; \
+	  fi; \
+	  health=$$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $$cid); \
+	  if [ "$$health" = "unhealthy" ]; then \
+	    echo "!! [deploy-grafana] gardenhub-grafana is unhealthy"; \
+	    echo "==> [deploy-grafana] Health-check log (no secrets):"; \
+	    dump_health_log "$$cid"; \
+	    exit 1; \
+	  fi; \
+	  if [ "$$health" = "healthy" ]; then \
+	    echo "==> [deploy-grafana] gardenhub-grafana healthy"; \
+	    break; \
+	  fi; \
+	  if [ "$$elapsed" -ge "$(DEPLOY_HEALTH_TIMEOUT)" ]; then \
+	    echo "!! [deploy-grafana] Timed out after $(DEPLOY_HEALTH_TIMEOUT)s waiting for gardenhub-grafana to become healthy (last status: $$health)"; \
+	    echo "==> [deploy-grafana] Health-check log (no secrets):"; \
+	    dump_health_log "$$cid"; \
+	    exit 1; \
+	  fi; \
+	  sleep $(DEPLOY_HEALTH_INTERVAL); \
+	  elapsed=$$((elapsed + $(DEPLOY_HEALTH_INTERVAL))); \
+	done
+
 deploy-logs: ## Best-effort diagnostics: container status and recent logs (last 2 minutes)
 	-@echo "==> [deploy-logs] docker compose ps"; $(COMPOSE) $(COMPOSE_FILES) ps
 	-@echo "==> [deploy-logs] gardenhub-api (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-api
@@ -147,6 +192,7 @@ deploy-logs: ## Best-effort diagnostics: container status and recent logs (last 
 	-@echo "==> [deploy-logs] gardenhub-consumer (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-consumer
 	-@echo "==> [deploy-logs] gardenhub-scheduler (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-scheduler
 	-@echo "==> [deploy-logs] gardenhub-nginx (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-nginx
+	-@echo "==> [deploy-logs] gardenhub-grafana (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-grafana
 
 deploy-info: ## Show current git/image/container state (read-only, safe anytime)
 	@echo "==> Git"; \
@@ -175,6 +221,7 @@ deploy-info: ## Show current git/image/container state (read-only, safe anytime)
 #   make deploy-up
 #   make deploy-cache
 #   make deploy-health
+#   make deploy-grafana
 #
 # Deliberately skip `make deploy-migrate`: Doctrine migrations are not
 # auto-reversible. Assess DB/schema compatibility with the old code by hand
@@ -192,5 +239,6 @@ deploy: ## Safe, end-to-end production deployment (the only target that orchestr
 	$(MAKE) --no-print-directory deploy-up; \
 	$(MAKE) --no-print-directory deploy-cache; \
 	$(MAKE) --no-print-directory deploy-health; \
+	$(MAKE) --no-print-directory deploy-grafana; \
 	sha=$$(git rev-parse HEAD); \
 	echo "==> Deployment successful: $$sha"

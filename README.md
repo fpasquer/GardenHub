@@ -445,6 +445,102 @@ Grafana reads MySQL directly through the internal GardenHub Docker network.
 
 Anonymous access and user self-registration are disabled.
 
+Grafana Alerting is provisioned from `grafana/provisioning/alerting` and sends
+notifications through the same Telegram bot and chat configured for Symfony
+(`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the root Compose environment).
+`TELEGRAM_ENABLED` only controls Symfony's Monolog channel; Grafana evaluates
+and sends its own alerts independently.
+
+Both `bottoken` and `chatid` are plain (non-secure) contact point settings —
+Grafana 12.1's file-provisioning schema has no secure-setting mechanism for
+any contact point type, so the bot token unavoidably lands on disk in
+plaintext. Because Grafana also unconditionally coerces any `$VAR`-substituted
+setting that looks numeric into a JSON number — crashing `chatid`, which must
+stay a string, regardless of YAML quoting — the container's entrypoint is
+overridden to `grafana/docker/render-provisioning.sh`, which resolves
+`$TELEGRAM_CHAT_ID`/`$TELEGRAM_BOT_TOKEN` itself and writes an
+already-resolved, quoted `contact-points.yaml` before Grafana's own
+provisioning loader ever parses it. That script fails fast if either variable
+is unset and restricts the rendered directory (`700`) and files (`600`) to
+the container's own user, since file permissions are the only protection
+available for the token.
+
+The initial rules are:
+
+- **GardenHub device silent** — fires per sensor that has previously reported
+  but has no measurement stored in the previous 60 minutes, after one
+  additional minute of confirmation. Each firing instance is uniquely
+  identified by `device`/`sensor_type` labels (one row per sensor from a
+  `format: table` query — required so Grafana can tell sensors apart; a
+  `time_series` query with a synthetic "metric" column collapses every sensor
+  into the same empty label set and fails evaluation). It checks `created_at`
+  (when GardenHub stored the reading), not the device's measurement
+  timestamp. Sensors that have never reported are covered by the
+  platform-wide alert below.
+- **GardenHub no measurements received** — fires when no uplink event was
+  stored for any device during the previous 60 minutes, after five minutes of
+  confirmation. The underlying query also uses `format: table` (a single
+  reduced row); Grafana rejects a raw `time_series` result here with
+  "looks like time series data, only reduced data can be alerted on".
+
+Both rules are evaluated every minute and notify the `GardenHub Telegram`
+contact point, including a notification when the condition resolves.
+
+Compose only re-injects environment variables when a container is
+**recreated**, not on a plain restart, and bind-mounted files (everything
+under `grafana/provisioning/`) have no effect on Compose's own config-diff
+detection at all — so a plain `docker compose up -d gardenhub-grafana` only
+reliably recreates the container for an env var change, never for a
+provisioning-file-only edit.
+
+Production `make deploy` handles both cases automatically: its
+`deploy-grafana` step always force-recreates `gardenhub-grafana` (without
+rebuilding the image or touching `gardenhub-mysql`) and waits for it to
+report healthy, so every deploy applies the latest `grafana/provisioning/`
+content and any changed Telegram env vars, whether or not Compose would have
+detected a config diff on its own.
+
+For a manual/dev redeploy, force recreation explicitly rather than relying on
+a plain `up -d`:
+
+```bash
+docker compose up -d --force-recreate gardenhub-grafana
+docker compose logs --tail=100 gardenhub-grafana
+```
+
+`docker compose restart gardenhub-grafana` reuses the existing container and
+its already-injected environment, so it will not pick up either kind of
+change.
+
+### Testing Grafana alerts
+
+`tests/grafana-db/` runs the pinned Grafana image against this repo's actual,
+unmodified provisioning files and a disposable MySQL database, seeding
+representative devices/sensors/measurements (an active sensor, a silent one on
+the same device, and a global-silence scenario). It bounded-polls each rule's
+Prometheus-style state through Grafana's rules API and, once a rule reaches
+the expected state, asserts every individual alert instance's own state by
+`device`/`sensor_type` labels — confirming, for example, that the silent
+sensor's instance fires while its still-active sibling's instance stays
+Normal, rather than assuming a non-firing sensor is simply absent from the
+response (Grafana lists every tracked instance regardless of state). It also
+asserts that the Telegram contact point's `chatid` decodes as a string:
+
+```bash
+docker compose -f tests/grafana-db/compose.yaml up --abort-on-container-exit --exit-code-from tests
+docker compose -f tests/grafana-db/compose.yaml down -v
+```
+
+This does not send a real Telegram message — Grafana's Telegram integration
+has no configurable API endpoint to intercept, so real delivery still
+requires manual verification with real credentials (see
+[Telegram Logging](#telegram-logging)).
+
+The active root `.env` (production) or `.env.local` (development, loaded by
+the Makefile) must provide the intended bot token and chat ID. Keep separate
+credentials or chats for development and production if you do not want test
+alerts sent to the production conversation.
+
 ---
 
 # LoRaStack Integration
@@ -652,6 +748,9 @@ TELEGRAM_CHAT_ID=<chat-id>
 TELEGRAM_MIN_LEVEL=warning
 ```
 
+Grafana uses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` directly for alerting;
+the Symfony-only `TELEGRAM_ENABLED` switch does not disable Grafana alerts.
+
 Production on `gardenhub-server` currently uses:
 
 ```text
@@ -848,7 +947,7 @@ This uses the same Messenger ingestion path as a real MQTT message.
 
 # Telegram Logging
 
-A dedicated Monolog `telegram` channel can forward log records to a Telegram chat. This is logging infrastructure only. Two narrow, hardcoded backend alerts (see [Backend alerts](#backend-alerts)) send `critical` records through this same channel; a general rules/thresholds/scheduling "Telegram notifications" alerting framework is still on the roadmap.
+A dedicated Monolog `telegram` channel can forward log records to a Telegram chat. Two narrow, hardcoded backend alerts (see [Backend alerts](#backend-alerts)) send `critical` records through this channel. Grafana independently sends the provisioned sensor-silence and no-measurement alerts described under [`gardenhub-grafana`](#gardenhub-grafana).
 
 ## Configuration
 

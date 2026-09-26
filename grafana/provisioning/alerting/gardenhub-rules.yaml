@@ -1,0 +1,144 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: gardenhub-ingestion-health
+    folder: GardenHub
+    interval: 1m
+    rules:
+      - uid: gardenhub-device-silent
+        title: GardenHub device silent
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: gardenhub-mysql
+            model:
+              datasource:
+                type: mysql
+                uid: gardenhub-mysql
+              editorMode: code
+              format: table
+              rawQuery: true
+              rawSql: |-
+                SELECT
+                  d.name AS device,
+                  s.type AS sensor_type,
+                  TIMESTAMPDIFF(
+                    SECOND,
+                    MAX(m.created_at),
+                    UTC_TIMESTAMP()
+                  ) AS seconds_since_last_reading
+                FROM sensor s
+                INNER JOIN device d ON d.id = s.device_id
+                LEFT JOIN measurement m ON m.sensor_id = s.id
+                GROUP BY s.id, d.name, s.type
+                HAVING MAX(m.created_at) IS NOT NULL
+              refId: A
+              intervalMs: 60000
+              maxDataPoints: 1440
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params: [3600]
+                    type: gt
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 60000
+              maxDataPoints: 1440
+              refId: B
+              type: threshold
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 1m
+        annotations:
+          summary: >-
+            No GardenHub reading stored for {{ $labels.device }} / {{ $labels.sensor_type }} in over 60 minutes.
+          description: >-
+            Check the device, LoRaWAN uplinks, MQTT connection, and GardenHub
+            ingestion worker. The rule evaluates once per minute and fires after
+            the stale condition remains true for one minute.
+        labels:
+          component: ingestion
+          severity: warning
+          source: grafana
+        notification_settings:
+          receiver: GardenHub Telegram
+          group_by: [grafana_folder, alertname, device, sensor_type]
+          group_wait: 30s
+          group_interval: 5m
+          repeat_interval: 4h
+        isPaused: false
+
+      - uid: gardenhub-no-measurements
+        title: GardenHub no measurements received
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: gardenhub-mysql
+            model:
+              datasource:
+                type: mysql
+                uid: gardenhub-mysql
+              editorMode: code
+              format: table
+              rawQuery: true
+              rawSql: |-
+                SELECT
+                  COUNT(DISTINCT m.deduplication_id) AS measurements_last_60m
+                FROM measurement m
+                WHERE m.created_at >= UTC_TIMESTAMP() - INTERVAL 60 MINUTE
+              refId: A
+              intervalMs: 60000
+              maxDataPoints: 1440
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: lt
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 60000
+              maxDataPoints: 1440
+              refId: B
+              type: threshold
+        noDataState: Alerting
+        executionErrorState: Alerting
+        for: 5m
+        annotations:
+          summary: No GardenHub measurements received from any device for 60 minutes.
+          description: >-
+            This indicates a platform-wide ingestion outage or a database query
+            failure. Check ChirpStack, MQTT, gardenhub-worker, and
+            gardenhub-mysql. The rule fires after the condition remains true for
+            five minutes.
+        labels:
+          component: ingestion
+          severity: critical
+          source: grafana
+        notification_settings:
+          receiver: GardenHub Telegram
+          group_by: [grafana_folder, alertname]
+          group_wait: 30s
+          group_interval: 5m
+          repeat_interval: 4h
+        isPaused: false
