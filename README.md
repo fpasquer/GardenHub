@@ -451,14 +451,19 @@ notifications through the same Telegram bot and chat configured for Symfony
 `TELEGRAM_ENABLED` only controls Symfony's Monolog channel; Grafana evaluates
 and sends its own alerts independently.
 
-Both `bottoken` and `chatid` are plain (non-secure) contact point settings, as
-required by Grafana's current file-provisioning schema. Because Grafana
-unconditionally coerces any `$VAR`-substituted setting that looks numeric into
-a JSON number — crashing `chatid`, which must stay a string, regardless of
-YAML quoting — the container's entrypoint is overridden to
-`grafana/docker/render-provisioning.sh`, which resolves `$TELEGRAM_CHAT_ID`/
-`$TELEGRAM_BOT_TOKEN` itself and writes an already-resolved, quoted
-`contact-points.yaml` before Grafana's own provisioning loader ever parses it.
+Both `bottoken` and `chatid` are plain (non-secure) contact point settings —
+Grafana 12.1's file-provisioning schema has no secure-setting mechanism for
+any contact point type, so the bot token unavoidably lands on disk in
+plaintext. Because Grafana also unconditionally coerces any `$VAR`-substituted
+setting that looks numeric into a JSON number — crashing `chatid`, which must
+stay a string, regardless of YAML quoting — the container's entrypoint is
+overridden to `grafana/docker/render-provisioning.sh`, which resolves
+`$TELEGRAM_CHAT_ID`/`$TELEGRAM_BOT_TOKEN` itself and writes an
+already-resolved, quoted `contact-points.yaml` before Grafana's own
+provisioning loader ever parses it. That script fails fast if either variable
+is unset and restricts the rendered directory (`700`) and files (`600`) to
+the container's own user, since file permissions are the only protection
+available for the token.
 
 The initial rules are:
 
@@ -499,9 +504,14 @@ its already-injected environment, so it will not pick up the change.
 `tests/grafana-db/` runs the pinned Grafana image against this repo's actual,
 unmodified provisioning files and a disposable MySQL database, seeding
 representative devices/sensors/measurements (an active sensor, a silent one on
-the same device, and a global-silence scenario), then asserts each rule's
-resulting labels, health, and state through Grafana's rules API, plus that the
-Telegram contact point's `chatid` decodes as a string:
+the same device, and a global-silence scenario). It bounded-polls each rule's
+Prometheus-style state through Grafana's rules API and, once a rule reaches
+the expected state, asserts every individual alert instance's own state by
+`device`/`sensor_type` labels — confirming, for example, that the silent
+sensor's instance fires while its still-active sibling's instance stays
+Normal, rather than assuming a non-firing sensor is simply absent from the
+response (Grafana lists every tracked instance regardless of state). It also
+asserts that the Telegram contact point's `chatid` decodes as a string:
 
 ```bash
 docker compose -f tests/grafana-db/compose.yaml up --abort-on-container-exit --exit-code-from tests

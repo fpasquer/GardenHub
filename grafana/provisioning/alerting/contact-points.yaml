@@ -12,5 +12,9 @@ contactPoints:
           # own provisioning loader parses this file: Grafana coerces any
           # $VAR-substituted value that looks numeric into a JSON number
           # (crashing chatid, which must stay a string), regardless of quoting.
+          # This schema has no secure_settings mechanism for any contact-point
+          # type (verified against Grafana 12.1 source), so bottoken lands
+          # here in plaintext - it is protected only by the file/directory
+          # permissions render-provisioning.sh applies to the rendered file.
           chatid: "$TELEGRAM_CHAT_ID"
           bottoken: "$TELEGRAM_BOT_TOKEN"
