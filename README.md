@@ -487,17 +487,30 @@ Both rules are evaluated every minute and notify the `GardenHub Telegram`
 contact point, including a notification when the condition resolves.
 
 Compose only re-injects environment variables when a container is
-**recreated**, not on a plain restart — so after changing `TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_CHAT_ID`, or any other env var, or after editing files under
-`grafana/provisioning/`, redeploy with:
+**recreated**, not on a plain restart, and bind-mounted files (everything
+under `grafana/provisioning/`) have no effect on Compose's own config-diff
+detection at all — so a plain `docker compose up -d gardenhub-grafana` only
+reliably recreates the container for an env var change, never for a
+provisioning-file-only edit.
+
+Production `make deploy` handles both cases automatically: its
+`deploy-grafana` step always force-recreates `gardenhub-grafana` (without
+rebuilding the image or touching `gardenhub-mysql`) and waits for it to
+report healthy, so every deploy applies the latest `grafana/provisioning/`
+content and any changed Telegram env vars, whether or not Compose would have
+detected a config diff on its own.
+
+For a manual/dev redeploy, force recreation explicitly rather than relying on
+a plain `up -d`:
 
 ```bash
-docker compose up -d gardenhub-grafana
+docker compose up -d --force-recreate gardenhub-grafana
 docker compose logs --tail=100 gardenhub-grafana
 ```
 
 `docker compose restart gardenhub-grafana` reuses the existing container and
-its already-injected environment, so it will not pick up the change.
+its already-injected environment, so it will not pick up either kind of
+change.
 
 ### Testing Grafana alerts
 
