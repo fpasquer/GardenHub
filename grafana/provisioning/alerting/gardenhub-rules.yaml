@@ -142,3 +142,107 @@ groups:
           group_interval: 5m
           repeat_interval: 4h
         isPaused: false
+
+  - orgId: 1
+    name: gardenhub-soil-moisture
+    folder: GardenHub
+    interval: 1m
+    rules:
+      - uid: gardenhub-soil-moisture-low
+        title: GardenHub soil moisture low
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: gardenhub-mysql
+            model:
+              datasource:
+                type: mysql
+                uid: gardenhub-mysql
+              editorMode: code
+              format: table
+              rawQuery: true
+              rawSql: |-
+                WITH ranked AS (
+                  SELECT
+                    s.id AS sensor_id,
+                    d.name AS device,
+                    s.type AS sensor_type,
+                    m.value,
+                    m.measured_at,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY s.id
+                      ORDER BY m.measured_at DESC, m.id DESC
+                    ) AS rn
+                  FROM measurement m
+                  INNER JOIN sensor s ON s.id = m.sensor_id
+                  INNER JOIN device d ON d.id = s.device_id
+                  WHERE s.type = 'soil_moisture'
+                )
+                SELECT
+                  device,
+                  sensor_type,
+                  -- <=16 iff the latest 3 readings are all low, >=18 iff all high,
+                  -- otherwise 17 (dead zone) so Grafana's hysteresis keeps the prior state.
+                  CASE
+                    WHEN MAX(value) <= 16 THEN MAX(value)
+                    WHEN MIN(value) >= 18 THEN MIN(value)
+                    ELSE 17
+                  END AS moisture_gate
+                FROM ranked
+                WHERE rn <= 3
+                GROUP BY sensor_id, device, sensor_type
+                HAVING
+                  COUNT(*) = 3
+                  AND MAX(measured_at) >= UTC_TIMESTAMP() - INTERVAL 75 MINUTE
+              refId: A
+              intervalMs: 60000
+              maxDataPoints: 1440
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params: [16]
+                    type: lte
+                  unloadEvaluator:
+                    params: [18]
+                    type: gte
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              intervalMs: 60000
+              maxDataPoints: 1440
+              refId: B
+              type: threshold
+        noDataState: OK
+        executionErrorState: Alerting
+        for: 0s
+        # A sensor that goes stale while Alerting must resolve on the very next
+        # missed evaluation, not linger on last-known-low data (default is 2).
+        missing_series_evals_to_resolve: 1
+        annotations:
+          summary: >-
+            Soil moisture low for {{ $labels.device }} / {{ $labels.sensor_type }}
+            for the last 3 consecutive readings.
+          description: >-
+            The last 3 consecutive readings from this sensor are at or below 16%.
+            Recovery requires 3 consecutive readings at or above 18%. Check
+            irrigation for this device.
+        labels:
+          component: irrigation
+          severity: warning
+          source: grafana
+        notification_settings:
+          receiver: GardenHub Telegram
+          group_by: [grafana_folder, alertname, device, sensor_type]
+          group_wait: 30s
+          group_interval: 5m
+          repeat_interval: 4h
+        isPaused: false
