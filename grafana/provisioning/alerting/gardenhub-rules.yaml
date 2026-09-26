@@ -196,7 +196,8 @@ groups:
                 GROUP BY sensor_id, device, sensor_type
                 HAVING
                   COUNT(*) = 3
-                  AND MAX(measured_at) >= UTC_TIMESTAMP() - INTERVAL 75 MINUTE
+                  -- MIN, not MAX: all 3 latest readings must be fresh, not just the newest one.
+                  AND MIN(measured_at) >= UTC_TIMESTAMP() - INTERVAL 75 MINUTE
               refId: A
               intervalMs: 60000
               maxDataPoints: 1440

@@ -302,49 +302,60 @@ assert_instance_absent "$rule" "SE01-Test" "soil_moisture" "soil-moisture scenar
 assert_instance_state "$rule" "SE02-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.1 (Sensor B baseline)"
 
 echo "--- 3.2: give Sensor A a clean fresh baseline before the isolation test ---"
-# Without this, Sensor A's own "latest 3" for the next step would still pull
-# in one of the stale-but-low rows from 3.1, spuriously satisfying "all 3 low".
+# 3 fresh readings, not 1 - under MIN(measured_at) freshness, a group still
+# containing 2 stale rows would fail freshness entirely (absent), not "Normal".
+insert_measurement "SE01-Test" "soil_moisture" 20.0 30
 insert_measurement "SE01-Test" "soil_moisture" 20.0 20
+insert_measurement "SE01-Test" "soil_moisture" 20.0 10
 sleep "$SOIL_MOISTURE_SETTLE"
 rule=$(fetch_rule "$SOIL_MOISTURE_LOW")
-assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.2 (fresh reset reading must not itself trigger)"
+assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.2 (3 fresh normal readings must not trigger)"
 
 echo "--- 3.3: interleaved readings must not combine into a false 3-reading sequence ---"
-insert_measurement "SE01-Test" "soil_moisture" 15.2 14
-insert_measurement "SE02-Test" "soil_moisture" 15.4 13
-insert_measurement "SE01-Test" "soil_moisture" 15.8 12
+insert_measurement "SE01-Test" "soil_moisture" 15.2 9
+insert_measurement "SE02-Test" "soil_moisture" 15.4 8
+insert_measurement "SE01-Test" "soil_moisture" 15.8 7
 sleep "$SOIL_MOISTURE_SETTLE"
 rule=$(fetch_rule "$SOIL_MOISTURE_LOW")
 assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.3 (Sensor A has only 2 of its own last 3 readings low)"
 assert_instance_state "$rule" "SE02-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.3 (Sensor B has only 1 of its own last 3 readings low)"
 
 echo "--- 3.4: isolated trigger (only Sensor A completes its own 3 low readings) ---"
-insert_measurement "SE01-Test" "soil_moisture" 15.6 10
+insert_measurement "SE01-Test" "soil_moisture" 15.6 6
 rule=$(wait_for_instance_state "$SOIL_MOISTURE_LOW" "SE01-Test" "soil_moisture" "Alerting" "$SOIL_MOISTURE_TIMEOUT")
 assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Alerting" "soil-moisture scenario 3.4"
 assert_instance_state "$rule" "SE02-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.4 (Sensor B must stay unaffected by Sensor A's alert)"
 
 echo "--- 3.5: independent double-alerting (Sensor B completes its own 3 low readings) ---"
-insert_measurement "SE02-Test" "soil_moisture" 15.0 6
-insert_measurement "SE02-Test" "soil_moisture" 14.8 4
+insert_measurement "SE02-Test" "soil_moisture" 15.0 4
+insert_measurement "SE02-Test" "soil_moisture" 14.8 3
 rule=$(wait_for_instance_state "$SOIL_MOISTURE_LOW" "SE02-Test" "soil_moisture" "Alerting" "$SOIL_MOISTURE_TIMEOUT")
 assert_instance_state "$rule" "SE02-Test" "soil_moisture" "Alerting" "soil-moisture scenario 3.5"
 assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Alerting" "soil-moisture scenario 3.5 (Sensor A must remain independently alerting)"
 
-echo "--- 3.6: recovery is isolated (Sensor A recovers, Sensor B is untouched and stays alerting) ---"
-insert_measurement "SE01-Test" "soil_moisture" 19.0 3
-insert_measurement "SE01-Test" "soil_moisture" 18.5 2
-insert_measurement "SE01-Test" "soil_moisture" 18.0 1
-rule=$(wait_for_instance_state "$SOIL_MOISTURE_LOW" "SE01-Test" "soil_moisture" "Normal" "$SOIL_MOISTURE_TIMEOUT")
-assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.6 (Sensor A recovered via 3 consecutive >=18 readings)"
+echo "--- 3.6: the 16-18% dead band must hold an already-alerting instance, not unload it ---"
+insert_measurement "SE01-Test" "soil_moisture" 17.0 5
+insert_measurement "SE01-Test" "soil_moisture" 17.2 4
+insert_measurement "SE01-Test" "soil_moisture" 16.8 3
+sleep "$SOIL_MOISTURE_SETTLE"
+rule=$(fetch_rule "$SOIL_MOISTURE_LOW")
+assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Alerting" "soil-moisture scenario 3.6 (dead-band readings must not unload an alerting instance)"
 assert_instance_state "$rule" "SE02-Test" "soil_moisture" "Alerting" "soil-moisture scenario 3.6 (Sensor B untouched, must remain alerting)"
 
-echo "--- 3.7: final combined state/label assertion for both sensors ---"
-rule=$(fetch_rule "$SOIL_MOISTURE_LOW")
-assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.7 final"
-assert_instance_state "$rule" "SE02-Test" "soil_moisture" "Alerting" "soil-moisture scenario 3.7 final"
+echo "--- 3.7: recovery is isolated (Sensor A recovers, Sensor B is untouched and stays alerting) ---"
+insert_measurement "SE01-Test" "soil_moisture" 19.0 2
+insert_measurement "SE01-Test" "soil_moisture" 18.5 1
+insert_measurement "SE01-Test" "soil_moisture" 18.0 0
+rule=$(wait_for_instance_state "$SOIL_MOISTURE_LOW" "SE01-Test" "soil_moisture" "Normal" "$SOIL_MOISTURE_TIMEOUT")
+assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.7 (Sensor A recovered via 3 consecutive >=18 readings)"
+assert_instance_state "$rule" "SE02-Test" "soil_moisture" "Alerting" "soil-moisture scenario 3.7 (Sensor B untouched, must remain alerting)"
 
-echo "--- 3.8: an already-alerting instance whose series goes stale must resolve and be evicted, not stay Alerting forever ---"
+echo "--- 3.8: final combined state/label assertion for both sensors ---"
+rule=$(fetch_rule "$SOIL_MOISTURE_LOW")
+assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.8 final"
+assert_instance_state "$rule" "SE02-Test" "soil_moisture" "Alerting" "soil-moisture scenario 3.8 final"
+
+echo "--- 3.9: an already-alerting instance whose series goes stale must resolve and be evicted, not stay Alerting forever ---"
 mysql -h "$MYSQL_HOST" -u root gardenhub -e "
     UPDATE measurement m
     INNER JOIN sensor s ON s.id = m.sensor_id
@@ -360,8 +371,8 @@ mysql -h "$MYSQL_HOST" -u root gardenhub -e "
 # intermediate state transition that Grafana doesn't actually expose here.
 wait_for_instance_absent "$SOIL_MOISTURE_LOW" "SE02-Test" "soil_moisture" "$SOIL_MOISTURE_TIMEOUT"
 rule=$(fetch_rule "$SOIL_MOISTURE_LOW")
-assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.8 (Sensor A must stay unaffected by Sensor B going stale)"
-echo "soil-moisture scenario 3.8: Sensor B instance evicted after going stale (missing_series_evals_to_resolve)"
+assert_instance_state "$rule" "SE01-Test" "soil_moisture" "Normal" "soil-moisture scenario 3.9 (Sensor A must stay unaffected by Sensor B going stale)"
+echo "soil-moisture scenario 3.9: Sensor B instance evicted after going stale (missing_series_evals_to_resolve)"
 
 echo "=== Telegram contact point provisioning ==="
 check_contact_point
