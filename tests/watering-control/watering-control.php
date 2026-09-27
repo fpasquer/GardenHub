@@ -97,7 +97,8 @@ check($watering->latest()['status'] === 'uncertain', 'Water shortage did not blo
 $db->executeStatement('DELETE FROM watering_run');
 $db->executeStatement('UPDATE watering_control SET active_run_id = NULL, last_request_at = NULL WHERE id = 1');
 $watering->request(3);
-check($watering->observe('{"state":"ON","battery_low":true}'), 'Low battery did not request OFF');
+check($watering->observe('{"state":"OFF","battery_low":true}'), 'Low battery on an OFF report did not request OFF');
+check($watering->latest()['status'] === 'uncertain', 'Low battery did not block the cycle');
 
 $db->executeStatement('DELETE FROM watering_run');
 $db->executeStatement('UPDATE watering_control SET active_run_id = NULL, last_request_at = NULL WHERE id = 1');

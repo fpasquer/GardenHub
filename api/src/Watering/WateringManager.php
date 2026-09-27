@@ -101,11 +101,15 @@ final class WateringManager
             $now = gmdate('Y-m-d H:i:s');
             $db->update('watering_run', ['last_state' => $state['state'], 'last_state_at' => $now], ['id' => $id]);
 
+            if ($unsafe && in_array($run['status'], ['pending', 'running'], true)) {
+                $db->update('watering_run', ['status' => 'uncertain', 'error' => 'Water shortage or low battery reported'], ['id' => $id]);
+                $stop = true;
+                return;
+            }
+
             if ($on) {
-                $stop = $unsafe || in_array($run['status'], ['timed_out', 'uncertain'], true);
-                if ($unsafe && in_array($run['status'], ['pending', 'running'], true)) {
-                    $db->update('watering_run', ['status' => 'uncertain', 'error' => 'Water shortage or low battery reported while ON'], ['id' => $id]);
-                } elseif ($run['status'] === 'pending') {
+                $stop = in_array($run['status'], ['timed_out', 'uncertain'], true);
+                if ($run['status'] === 'pending') {
                     $db->update('watering_run', ['status' => 'running', 'started_at' => $now], ['id' => $id]);
                 }
             } elseif ($run['status'] === 'running' && $run['started_at'] !== null) {
