@@ -73,6 +73,34 @@ services:
             $enabled: '%env(bool:WATERING_ENABLED)%'
             $environment: '%kernel.environment%'
 
+    App\Watering\ProposalPolicy:
+        arguments:
+            $threshold: '%env(float:WATERING_PROPOSAL_THRESHOLD)%'
+            $freshnessMinutes: '%env(int:WATERING_PROPOSAL_FRESHNESS_MINUTES)%'
+            $maxGapMinutes: '%env(int:WATERING_PROPOSAL_MAX_GAP_MINUTES)%'
+            $validityMinutes: '%env(int:WATERING_PROPOSAL_VALIDITY_MINUTES)%'
+            $durationSeconds: '%env(int:WATERING_PROPOSAL_DURATION_SECONDS)%'
+
+    App\Watering\TelegramGateway: '@App\Watering\StreamTelegramGateway'
+
+    App\Watering\StreamTelegramGateway:
+        arguments:
+            $botToken: '%env(TELEGRAM_BOT_TOKEN)%'
+            $chatId: '%env(WATERING_TELEGRAM_CHAT_ID)%'
+
+    App\Watering\ProposalBot:
+        arguments:
+            $expectedUserId: '%env(WATERING_TELEGRAM_USER_ID)%'
+            $expectedChatId: '%env(WATERING_TELEGRAM_CHAT_ID)%'
+
+    App\Command\WateringProposalPollCommand:
+        arguments:
+            $enabled: '%env(bool:WATERING_ENABLED)%'
+            $environment: '%kernel.environment%'
+            $botToken: '%env(TELEGRAM_BOT_TOKEN)%'
+            $userId: '%env(WATERING_TELEGRAM_USER_ID)%'
+            $chatId: '%env(WATERING_TELEGRAM_CHAT_ID)%'
+
     App\Watering\WateringMonitorRunner:
         arguments:
             $host: '%env(WATERING_MQTT_HOST)%'

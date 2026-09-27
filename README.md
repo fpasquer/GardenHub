@@ -154,7 +154,8 @@ This is intentionally **development only**. The application command targets
 the fixed `gardenhub/dev/watering/avocado/set` topic, requires
 `WATERING_ENABLED=true` and `APP_ENV=dev`, and uses the separate `watering_dev`
 account. The production Compose file does not provide watering credentials or
-start the monitor. Automatic watering is not implemented or enabled.
+start the monitor. The optional proposal poller below is also development only;
+it never starts a cycle without an authorized Telegram approval.
 
 After updating the Pi checkout, run the new migration, then start the opt-in
 monitor alongside the simulator (from `/opt/GardenHub`):
@@ -204,6 +205,57 @@ docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
 This manual override is dev-only and preserves the cooldown and daily budget.
 Never use it as evidence that a physical pump has stopped. This branch never
 publishes to `zigbee2mqtt/#`.
+
+### Soil moisture proposals (development simulator only)
+
+The optional `gardenhub-watering-proposals` service runs one outbound-only
+Telegram long poller. It has no published port or webhook. Start it only with
+the simulator and monitor, after applying the migration. It requires
+`APP_ENV=dev`, `WATERING_ENABLED=true`, the dev bot token, and both
+`WATERING_TELEGRAM_USER_ID` and `WATERING_TELEGRAM_CHAT_ID` set to the exact
+numeric IDs of the intended user and private chat. Set these in the untracked
+root `.env.local`; keep one `getUpdates` poller for this bot, including outside
+GardenHub. The dev bot may also send Monolog alerts, but its callback logic is
+separate. Do not run a webhook or a second long poller on that bot.
+
+For a local test without Telegram credentials, use the isolated suite below;
+it supplies fake Telegram responses and a fake actuator publisher. To opt in
+to the interactive service later, add the two IDs to an untracked root
+`.env.local` and pass both environment files to Compose:
+
+```bash
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
+  --profile watering-sim --profile watering-proposals up -d \
+  gardenhub-watering-sim gardenhub-watering-monitor gardenhub-watering-proposals
+```
+
+The poller checks the `SE01-Avocado` soil moisture sensor every polling pass.
+It creates a durable proposal after the latest three distinct, consecutive
+readings are each below 15%, the newest is at most 35 minutes old, adjacent
+readings are no more than 35 minutes apart, and no watering run was requested
+in the preceding 24 hours. These limits allow the sensor's normal 20 minute
+reporting interval. A run in `uncertain` or `timed_out` state still counts as an
+attempt. No previous run satisfies the 24 hour check. The proposal expires
+after 30 minutes and offers a three second simulator cycle. Configure the
+threshold, freshness, gap, validity, and duration with
+`WATERING_PROPOSAL_THRESHOLD`,
+`WATERING_PROPOSAL_FRESHNESS_MINUTES`, `WATERING_PROPOSAL_MAX_GAP_MINUTES`,
+`WATERING_PROPOSAL_VALIDITY_MINUTES`, and `WATERING_PROPOSAL_DURATION_SECONDS`.
+The default values are in [api/.env](api/.env).
+
+One initial prompt and at most one reminder 24 hours later are allowed during
+the same dry episode, including after rejection or expiry. A wet reading resets
+the episode and invalidates any pending proposal. A newer watering attempt
+also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
+proposal expiry, and the 24 hour rule under the watering reservation lock;
+`WateringManager` retains its enabled, monitor heartbeat, cooldown, active
+cycle, duration, and daily budget checks. Rejected, unauthorized, replayed,
+expired, and unapproved proposals never run the simulator. If an approval is
+interrupted or command delivery is uncertain, it stays blocked for manual
+review; pressing the button again never retries the cycle. Check the proposal
+and watering run tables before any manual simulator recovery. A failed Telegram
+send may have succeeded remotely, so that episode is not sent again; a failed
+message edit is retried on the next polling pass.
 
 Run its isolated integration suite with:
 

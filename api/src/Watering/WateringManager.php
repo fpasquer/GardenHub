@@ -22,7 +22,8 @@ final class WateringManager
     ) {
     }
 
-    public function request(int $seconds): string
+    /** Optional guard runs under the same control lock as the run reservation. */
+    public function request(int $seconds, ?callable $guard = null): string
     {
         $this->assertEnabled();
         if ($seconds < 1 || $seconds > self::MAX_SECONDS) {
@@ -30,9 +31,9 @@ final class WateringManager
         }
 
         $id = (string) Uuid::v4();
-        $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
-        $this->db->transactional(function (Connection $db) use ($id, $seconds, $now): void {
+        $this->db->transactional(function (Connection $db) use ($id, $seconds, $guard): void {
             $control = $db->fetchAssociative('SELECT * FROM watering_control WHERE id = 1 FOR UPDATE');
+            $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
             if (!$control || $control['active_run_id'] !== null) {
                 throw new \DomainException('A watering cycle is active or requires review.');
             }
@@ -45,6 +46,9 @@ final class WateringManager
             $used = (int) $db->fetchOne('SELECT COALESCE(SUM(requested_seconds), 0) FROM watering_run WHERE requested_at >= ?', [$now->modify('-24 hours')->format('Y-m-d H:i:s')]);
             if ($used + $seconds > self::DAILY_SECONDS) {
                 throw new \DomainException('Rolling 24-hour watering limit exceeded.');
+            }
+            if ($guard !== null) {
+                $guard($db, $now);
             }
 
             $db->insert('watering_run', [
