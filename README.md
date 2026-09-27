@@ -183,7 +183,10 @@ docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
 
 The monitor should observe ON followed by OFF and record `completed`. A second
 request during the cycle is rejected; completed runs have a 60-second cooldown.
-Requests also fail when the monitor is absent or its heartbeat is stale.
+Requests also fail when the monitor is absent or its heartbeat is stale; the
+heartbeat only starts once the monitor's state subscription is confirmed by
+the broker (SUBACK), not merely once its MQTT loop is running, and it is
+cleared again on disconnect until a fresh subscription is confirmed.
 Limits in this dev stage are 30 seconds per request and 120 requested seconds
 per rolling 24 hours. A lost acknowledgement, missing OFF, reported water
 shortage or low battery blocks further requests and causes repeated OFF

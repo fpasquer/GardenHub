@@ -6,6 +6,7 @@ namespace App\Watering;
 
 use PhpMqtt\Client\ConnectionSettings;
 use PhpMqtt\Client\MqttClient;
+use PhpMqtt\Client\Repositories\MemoryRepository;
 
 final class MqttWateringPublisher implements WateringPublisher
 {
@@ -26,15 +27,24 @@ final class MqttWateringPublisher implements WateringPublisher
             throw new \LogicException('Development watering MQTT credentials are unavailable.');
         }
 
-        $client = new MqttClient($this->host, $this->port, 'gardenhub-watering-publish-'.bin2hex(random_bytes(5)));
+        // Injected so we can verify the PUBACK actually arrived, not just that loop() returned.
+        $repository = new MemoryRepository();
+        $client = new MqttClient($this->host, $this->port, 'gardenhub-watering-publish-'.bin2hex(random_bytes(5)), repository: $repository);
         try {
             $client->connect((new ConnectionSettings())->setUsername($this->username)->setPassword($this->password), true);
             // Never retain actuator commands. Wait for PUBACK before returning.
             $client->publish(self::TOPIC.'/set', json_encode($command, JSON_THROW_ON_ERROR), MqttClient::QOS_AT_LEAST_ONCE, false);
             $client->loop(true, true, 5);
+            if ($repository->countPendingOutgoingMessages() > 0) {
+                throw new \RuntimeException('Publish acknowledgement (PUBACK) not received within timeout.');
+            }
         } finally {
-            if ($client->isConnected()) {
-                $client->disconnect();
+            try {
+                if ($client->isConnected()) {
+                    $client->disconnect();
+                }
+            } catch (\Throwable) {
+                // A cleanup failure must never mask the publish outcome above.
             }
         }
     }

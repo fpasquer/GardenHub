@@ -101,6 +101,13 @@ final class WateringManager
             $now = gmdate('Y-m-d H:i:s');
             $db->update('watering_run', ['last_state' => $state['state'], 'last_state_at' => $now], ['id' => $id]);
 
+            // A missed deadline wins over any incoming report, even a plain OFF.
+            if ($this->isOverdue($run, $now)) {
+                $this->markTimedOut($db, $id, 'OFF not confirmed before deadline');
+                $stop = true;
+                return;
+            }
+
             if ($unsafe && in_array($run['status'], ['pending', 'running'], true)) {
                 $db->update('watering_run', ['status' => 'uncertain', 'error' => 'Water shortage or low battery reported'], ['id' => $id]);
                 $stop = true;
@@ -123,7 +130,7 @@ final class WateringManager
         return $stop;
     }
 
-    /** Marks overdue runs as uncertain; they remain blocked until reviewed. */
+    /** Marks overdue runs as timed out; they remain blocked until reviewed. */
     public function expire(): bool
     {
         $this->assertEnabled();
@@ -133,12 +140,23 @@ final class WateringManager
                 return false;
             }
             $run = $db->fetchAssociative('SELECT status, deadline_at FROM watering_run WHERE id = ?', [$control['active_run_id']]);
-            if (!$run || !in_array($run['status'], ['pending', 'running'], true) || $run['deadline_at'] > gmdate('Y-m-d H:i:s')) {
+            if (!$run || !$this->isOverdue($run, gmdate('Y-m-d H:i:s'))) {
                 return false;
             }
-            $db->update('watering_run', ['status' => 'timed_out', 'error' => 'OFF not confirmed before deadline'], ['id' => $control['active_run_id']]);
+            $this->markTimedOut($db, $control['active_run_id'], 'OFF not confirmed before deadline');
             return true;
         });
+    }
+
+    /** Same timeout rule used by expire() and observe(): only a still-open cycle can be overdue. */
+    private function isOverdue(array $run, string $now): bool
+    {
+        return in_array($run['status'], ['pending', 'running'], true) && $run['deadline_at'] <= $now;
+    }
+
+    private function markTimedOut(Connection $db, string $runId, string $reason): void
+    {
+        $db->update('watering_run', ['status' => 'timed_out', 'error' => $reason], ['id' => $runId]);
     }
 
     public function latest(): ?array
@@ -147,20 +165,26 @@ final class WateringManager
         return $row ?: null;
     }
 
+    /** Inspects the run actually referenced by active_run_id, never inferred by recency. */
     public function requiresStop(): bool
     {
-        $run = $this->latest();
-        if (!$run || !in_array($run['status'], ['timed_out', 'uncertain'], true)) {
-            return false;
-        }
-        $active = $this->db->fetchOne('SELECT active_run_id FROM watering_control WHERE id = 1');
-        return $active === $run['id'];
+        $status = $this->db->fetchOne(
+            'SELECT r.status FROM watering_control c JOIN watering_run r ON r.id = c.active_run_id WHERE c.id = 1'
+        );
+        return in_array($status, ['timed_out', 'uncertain'], true);
     }
 
     public function heartbeat(): void
     {
         $this->assertEnabled();
         $this->db->update('watering_control', ['monitor_seen_at' => gmdate('Y-m-d H:i:s')], ['id' => 1]);
+    }
+
+    /** Clears the persisted heartbeat so a stale value can't authorize a request after a real failure. */
+    public function invalidateHeartbeat(): void
+    {
+        $this->assertEnabled();
+        $this->db->update('watering_control', ['monitor_seen_at' => null], ['id' => 1]);
     }
 
     /** Manual recovery only after verifying the simulator is OFF. */

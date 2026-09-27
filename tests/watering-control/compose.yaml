@@ -14,14 +14,28 @@ services:
       timeout: 5s
       retries: 60
 
+  mqtt:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "health", "-m", "ready"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
   tests:
     image: gardenhub-api
-    entrypoint: ["sh", "-c", "php bin/console doctrine:migrations:migrate --no-interaction && php /tests/watering-control.php"]
+    entrypoint: ["sh", "-c", "php bin/console doctrine:migrations:migrate --no-interaction && php /tests/watering-control.php && php /tests/watering-mqtt-acknowledgements.php"]
     environment:
       APP_ENV: dev
       APP_SECRET: watering-tests-only
       DATABASE_URL: 'mysql://root@mysql:3306/watering_control_test?serverVersion=8.4&charset=utf8mb4'
       WATERING_ENABLED: 'true'
+      WATERING_MQTT_HOST: mqtt
+      WATERING_MQTT_PORT: '1883'
+      WATERING_DEV_USERNAME: test
+      WATERING_DEV_PASSWORD: test
     volumes:
       - ../../api/src:/app/src:ro
       - ../../api/config:/app/config:ro
@@ -29,4 +43,6 @@ services:
       - ./:/tests:ro
     depends_on:
       mysql:
+        condition: service_healthy
+      mqtt:
         condition: service_healthy

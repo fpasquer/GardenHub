@@ -73,12 +73,15 @@ services:
             $enabled: '%env(bool:WATERING_ENABLED)%'
             $environment: '%kernel.environment%'
 
-    App\Command\WateringMonitorCommand:
+    App\Watering\WateringMonitorRunner:
         arguments:
             $host: '%env(WATERING_MQTT_HOST)%'
             $port: '%env(int:WATERING_MQTT_PORT)%'
             $username: '%env(WATERING_DEV_USERNAME)%'
             $password: '%env(WATERING_DEV_PASSWORD)%'
+
+    App\Command\WateringMonitorCommand:
+        arguments:
             $enabled: '%env(bool:WATERING_ENABLED)%'
             $environment: '%kernel.environment%'
 
