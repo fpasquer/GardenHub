@@ -51,10 +51,14 @@ function pollUntil(callable $condition, float $seconds, string $message): void
 final class FakePublisher implements WateringPublisher
 {
     public array $commands = [];
+    public bool $fail = false;
 
     public function publish(array $command): void
     {
         $this->commands[] = $command;
+        if ($this->fail) {
+            throw new RuntimeException('Test OFF publish failed');
+        }
     }
 }
 
@@ -199,6 +203,29 @@ function stubRejectedSuback(int $port): int
     writeAll($conn, "\x90\x03".pack('n', $messageId)."\x80", $deadline);
     stubDrainUntil($conn, $deadline);
 
+    return 0;
+}
+
+function stubCallbackFailureDuringSuback(int $port): int
+{
+    $deadline = microtime(true) + 20;
+    $conn = acceptOne($port, $deadline);
+    stubExpectConnect($conn, $deadline);
+    [$type, $body] = readPacket($conn, $deadline);
+    check(0x08 === ($type >> 4), 'stub: expected SUBSCRIBE');
+    $messageId = unpack('n', substr($body, 0, 2))[1];
+    $topic = MqttWateringPublisher::TOPIC;
+    $payload = '{"state":"ON"}';
+    $publish = static function (int $id) use ($topic, $payload): string {
+        $body = pack('n', strlen($topic)).$topic.pack('n', $id).$payload;
+        check(strlen($body) < 128, 'stub: publish packet too large');
+        return "\x32".chr(strlen($body)).$body;
+    };
+
+    // A single read can dispatch SUBACK and both callbacks before the gate
+    // regains control. The second callback must be ignored after the first fails.
+    writeAll($conn, "\x90\x03".pack('n', $messageId)."\x01".$publish(1).$publish(2), $deadline);
+    stubDrainUntil($conn, $deadline);
     return 0;
 }
 
@@ -412,6 +439,79 @@ function scenario_reconnect_resumes_heartbeat(Doctrine\DBAL\Connection $db): voi
     echo "PASS reconnect-resumes-heartbeat: a failed attempt never leaves a stale heartbeat, and a later successful attempt re-establishes it\n";
 }
 
+function scenario_callback_failure_during_suback(Doctrine\DBAL\Connection $db): void
+{
+    resetControl($db);
+    $db->executeStatement('UPDATE watering_control SET active_run_id = ?, monitor_seen_at = NOW() WHERE id = 1', ['missing-run']);
+    $publisher = new FakePublisher();
+    $publisher->fail = true;
+    $handle = spawnBrokerStub('callback-failure-during-suback', 11905);
+    try {
+        $runner = newRunner($db, $publisher, STUB_HOST, 11905, 5.0);
+        $threw = false;
+        try {
+            $runner->runConnectionAttempt(static fn (): bool => false);
+        } catch (RuntimeException $e) {
+            $threw = true;
+            check('Active watering run is missing.' === $e->getMessage(), 'Emergency OFF failure masked the processing error: '.$e->getMessage());
+        }
+        check($threw, 'Callback failure during SUBACK was swallowed.');
+        check([['state' => 'OFF']] === $publisher->commands, 'A later callback ran after the first failed.');
+        check(null === heartbeatAt($db), 'Heartbeat survived a callback failure during subscription setup.');
+    } finally {
+        stopBrokerStub($handle);
+    }
+    echo "PASS callback-failure-during-suback: first processing error survives failed OFF and clears heartbeat\n";
+}
+
+function scenario_callback_failure_after_heartbeat(Doctrine\DBAL\Connection $db): void
+{
+    resetControl($db);
+    $publisher = new FakePublisher();
+    $publisher->fail = true;
+    $runner = newRunner($db, $publisher, MOSQUITTO_HOST, MOSQUITTO_PORT, 5.0);
+    $sender = new MqttClient(MOSQUITTO_HOST, MOSQUITTO_PORT, 'callback-failure-sender');
+    $sender->connect(new ConnectionSettings(), true);
+    $calls = 0;
+    $heartbeatBeforeFailure = null;
+    try {
+        $threw = false;
+        try {
+            $runner->runConnectionAttempt(function () use (&$calls, &$heartbeatBeforeFailure, $db, $sender): bool {
+                if (1 === $calls++) {
+                    $heartbeatBeforeFailure = heartbeatAt($db);
+                    $sender->publish(MqttWateringPublisher::TOPIC, '{"state":"ON"}', MqttClient::QOS_AT_MOST_ONCE);
+                    $sender->publish(MqttWateringPublisher::TOPIC, '{"state":"ON"}', MqttClient::QOS_AT_MOST_ONCE);
+                }
+                return false;
+            });
+        } catch (RuntimeException $e) {
+            $threw = true;
+            check('Test OFF publish failed' === $e->getMessage(), 'Wrong callback OFF error: '.$e->getMessage());
+        }
+        check($threw, 'Callback OFF failure was swallowed after the heartbeat started.');
+        check(null !== $heartbeatBeforeFailure, 'Heartbeat did not start after SUBACK.');
+        check([['state' => 'OFF'], ['state' => 'OFF']] === $publisher->commands, 'A later callback ran after OFF failed.');
+        check(null === heartbeatAt($db), 'Heartbeat survived a callback failure in the main loop.');
+
+        $publisher->fail = false;
+        $calls = 0;
+        $recoveredHeartbeat = null;
+        $runner->runConnectionAttempt(function () use (&$calls, &$recoveredHeartbeat, $db): bool {
+            if (0 === $calls++) {
+                return false;
+            }
+            $recoveredHeartbeat = heartbeatAt($db);
+            return true;
+        });
+        check(null !== $recoveredHeartbeat, 'Later connection attempt did not restore the heartbeat.');
+        check(null === heartbeatAt($db), 'Successful attempt did not invalidate heartbeat on disconnect.');
+    } finally {
+        $sender->disconnect();
+    }
+    echo "PASS callback-failure-after-heartbeat: OFF error reconnects, invalidates heartbeat, and later attempt recovers\n";
+}
+
 // -------------------------------------------------------------------------
 // Entry point
 // -------------------------------------------------------------------------
@@ -424,6 +524,7 @@ try {
             'withhold-puback' => stubWithholdPuback($port),
             'missing-suback' => stubMissingSuback($port),
             'rejected-suback' => stubRejectedSuback($port),
+            'callback-failure-during-suback' => stubCallbackFailureDuringSuback($port),
             default => throw new RuntimeException('Unknown broker stub mode: '.$mode),
         });
     }
@@ -439,6 +540,8 @@ try {
     scenario_rejected_suback($db);
     scenario_suback_starts_and_invalidates_heartbeat($db);
     scenario_reconnect_resumes_heartbeat($db);
+    scenario_callback_failure_during_suback($db);
+    scenario_callback_failure_after_heartbeat($db);
 
     echo "PASS watering MQTT acknowledgements: PUBACK detection and SUBACK-gated heartbeat lifecycle\n";
     $kernel->shutdown();

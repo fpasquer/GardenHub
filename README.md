@@ -159,6 +159,9 @@ start the monitor. Automatic watering is not implemented or enabled.
 After updating the Pi checkout, run the new migration, then start the opt-in
 monitor alongside the simulator (from `/opt/GardenHub`):
 
+The monitor's Compose command uses `--no-debug` while keeping `APP_ENV=dev`,
+so its continuous database queries do not accumulate Doctrine profiling data.
+
 ```bash
 docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
   exec gardenhub-api php bin/console doctrine:migrations:migrate --no-interaction

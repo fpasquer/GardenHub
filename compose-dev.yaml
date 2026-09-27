@@ -67,7 +67,7 @@ services:
     container_name: gardenhub-watering-monitor
     profiles: ["watering-sim"]
     restart: unless-stopped
-    command: php bin/console gardenhub:watering:monitor
+    command: php bin/console gardenhub:watering:monitor --no-debug
     environment:
       APP_ENV: dev
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"

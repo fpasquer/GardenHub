@@ -37,14 +37,29 @@ final class WateringMonitorRunner
 
         $repository = new MemoryRepository();
         $client = new MqttClient($this->host, $this->port, 'gardenhub-watering-monitor', repository: $repository);
+        $callbackFailure = null;
+        $throwCallbackFailure = static function () use (&$callbackFailure): void {
+            if ($callbackFailure !== null) {
+                throw $callbackFailure;
+            }
+        };
         try {
             $client->connect((new ConnectionSettings())->setUsername($this->username)->setPassword($this->password)->setKeepAliveInterval(30), true);
-            $client->subscribe(MqttWateringPublisher::TOPIC, function (string $topic, string $message): void {
-                $this->handleMessage($message);
+            $client->subscribe(MqttWateringPublisher::TOPIC, function (string $topic, string $message) use (&$callbackFailure): void {
+                if ($callbackFailure !== null) {
+                    return;
+                }
+                try {
+                    $this->handleMessage($message);
+                } catch (\Throwable $e) {
+                    // php-mqtt/client catches callback exceptions, so carry the
+                    // first one out of loopOnce() explicitly.
+                    $callbackFailure = $e;
+                }
             }, MqttClient::QOS_AT_LEAST_ONCE);
-            SubscriptionReadyGate::await($client, $repository, $this->subackTimeoutSeconds);
+            SubscriptionReadyGate::await($client, $repository, $this->subackTimeoutSeconds, $throwCallbackFailure);
             $this->logger->info('Monitoring '.MqttWateringPublisher::TOPIC);
-            $this->runHeartbeatLoop($client, $stopRequested);
+            $this->runHeartbeatLoop($client, $stopRequested, $throwCallbackFailure);
         } finally {
             try {
                 $this->watering->invalidateHeartbeat();
@@ -70,18 +85,23 @@ final class WateringMonitorRunner
         } catch (\Throwable $e) {
             $this->logger->error('Watering state processing failed; trying OFF.', ['error' => $e->getMessage()]);
             // Never silently discard an ON when persistence fails.
-            $this->publisher->publish(['state' => 'OFF']);
+            try {
+                $this->publisher->publish(['state' => 'OFF']);
+            } catch (\Throwable) {
+                // Keep the processing failure as the reason to reconnect.
+            }
             throw $e;
         }
     }
 
-    private function runHeartbeatLoop(MqttClient $client, \Closure $stopRequested): void
+    private function runHeartbeatLoop(MqttClient $client, \Closure $stopRequested, \Closure $throwCallbackFailure): void
     {
         $started = microtime(true);
         $lastStopAttempt = 0.0;
         $lastHeartbeat = 0.0;
         while (!$stopRequested()) {
             $client->loopOnce($started, true);
+            $throwCallbackFailure();
             if (microtime(true) - $lastHeartbeat >= 1) {
                 $this->watering->heartbeat();
                 $lastHeartbeat = microtime(true);
