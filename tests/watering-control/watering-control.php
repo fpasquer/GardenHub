@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 use App\Watering\WateringManager;
 use App\Watering\WateringPublisher;
-use Doctrine\DBAL\DriverManager;
+use App\Kernel;
 
 require '/app/vendor/autoload.php';
 
@@ -39,7 +39,9 @@ function rejects(callable $callback, string $message): void
     throw new RuntimeException($message);
 }
 
-$db = DriverManager::getConnection(['url' => getenv('DATABASE_URL')]);
+$kernel = new Kernel('dev', true);
+$kernel->boot();
+$db = $kernel->getContainer()->get('doctrine')->getManager()->getConnection();
 check($db->getDatabase() === 'watering_control_test', 'Refusing to use a non-test database.');
 $publisher = new FakePublisher();
 $watering = new WateringManager($db, $publisher, true, 'dev');
@@ -106,3 +108,4 @@ $db->executeStatement("INSERT INTO watering_run (id, requested_seconds, status, 
 rejects(fn () => $watering->request(2), 'Rolling 24-hour budget exceeded');
 
 echo "PASS dev watering: duration, duplicate, restart, cooldown, MQTT failure, timeout, water shortage, low battery and daily budget\n";
+$kernel->shutdown();
