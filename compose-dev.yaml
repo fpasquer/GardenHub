@@ -27,6 +27,14 @@ services:
       - gardenhub
 
   gardenhub-api:
+    environment:
+      WATERING_ENABLED: ${WATERING_ENABLED:-false}
+      WATERING_MQTT_HOST: ${MQTT_HOST:-}
+      WATERING_MQTT_PORT: ${MQTT_PORT:-1883}
+      WATERING_DEV_USERNAME: ${WATERING_DEV_USERNAME:-}
+      WATERING_DEV_PASSWORD: ${WATERING_DEV_PASSWORD:-}
+    extra_hosts:
+      - "host.docker.internal:172.22.0.1"
     volumes:
       - ./api/tests:/app/tests
   gardenhub-consumer:
@@ -51,6 +59,33 @@ services:
       - "host.docker.internal:172.22.0.1"
     volumes:
       - ./tests/watering-sim:/tests/watering-sim:ro
+    networks:
+      - gardenhub
+
+  gardenhub-watering-monitor:
+    image: gardenhub-api
+    container_name: gardenhub-watering-monitor
+    profiles: ["watering-sim"]
+    restart: unless-stopped
+    command: php bin/console gardenhub:watering:monitor
+    environment:
+      APP_ENV: dev
+      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+      WATERING_ENABLED: ${WATERING_ENABLED:-false}
+      WATERING_MQTT_HOST: ${MQTT_HOST:-}
+      WATERING_MQTT_PORT: ${MQTT_PORT:-1883}
+      WATERING_DEV_USERNAME: ${WATERING_DEV_USERNAME:-}
+      WATERING_DEV_PASSWORD: ${WATERING_DEV_PASSWORD:-}
+    extra_hosts:
+      - "host.docker.internal:172.22.0.1"
+    volumes:
+      - ./api/bin:/app/bin
+      - ./api/config:/app/config
+      - ./api/src:/app/src
+      - ./api/.env:/app/.env
+    depends_on:
+      gardenhub-mysql:
+        condition: service_healthy
     networks:
       - gardenhub
 

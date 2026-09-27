@@ -107,6 +107,9 @@ Set these values in GardenHub's untracked root `.env` on the Pi:
 ```dotenv
 WATERING_SIM_USERNAME=watering_sim
 WATERING_SIM_PASSWORD=<simulator-password-from-broker>
+WATERING_ENABLED=true
+WATERING_DEV_USERNAME=watering_dev
+WATERING_DEV_PASSWORD=<separate-watering_dev-password-from-broker>
 ```
 
 `MQTT_HOST` and `MQTT_PORT` are shared with the existing dev worker. Start only
@@ -144,6 +147,64 @@ The simulator publishes ON, then OFF after three seconds. `{"state":"OFF"}`
 stops early. Test-only commands `{"simulate_alarm_1":true}` and
 `{"simulate_battery":5}` publish water shortage and low battery; clear them
 with `false` and `100`. No real Zigbee2MQTT process is required on the Pi.
+
+### Manual watering through GardenHub
+
+This is intentionally **development only**. The application command targets
+the fixed `gardenhub/dev/watering/avocado/set` topic, requires
+`WATERING_ENABLED=true` and `APP_ENV=dev`, and uses the separate `watering_dev`
+account. The production Compose file does not provide watering credentials or
+start the monitor. Automatic watering is not implemented or enabled.
+
+After updating the Pi checkout, run the new migration, then start the opt-in
+monitor alongside the simulator (from `/opt/GardenHub`):
+
+```bash
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  exec gardenhub-api php bin/console doctrine:migrations:migrate --no-interaction
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  --profile watering-sim up -d gardenhub-watering-sim gardenhub-watering-monitor
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  logs -f gardenhub-watering-monitor
+```
+
+In another terminal, request a three-second cycle and inspect its durable
+state. The API container must be recreated after changing root `.env` so it
+receives `WATERING_ENABLED` and the dedicated MQTT credentials:
+
+```bash
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  up -d --no-deps --force-recreate gardenhub-api
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  exec gardenhub-api php bin/console gardenhub:watering:request 3
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  exec gardenhub-api php bin/console gardenhub:watering:status
+```
+
+The monitor should observe ON followed by OFF and record `completed`. A second
+request during the cycle is rejected; completed runs have a 60-second cooldown.
+Requests also fail when the monitor is absent or its heartbeat is stale.
+Limits in this dev stage are 30 seconds per request and 120 requested seconds
+per rolling 24 hours. A lost acknowledgement, missing OFF, reported water
+shortage or low battery blocks further requests and causes repeated OFF
+commands. The blocked state remains in MySQL across restarts. After verifying
+the simulator is OFF, mark the run reviewed to resume tests:
+
+```bash
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  exec gardenhub-api php bin/console gardenhub:watering:acknowledge-stop --confirm-simulator-off
+```
+
+This manual override is dev-only and preserves the cooldown and daily budget.
+Never use it as evidence that a physical pump has stopped. This branch never
+publishes to `zigbee2mqtt/#`.
+
+Run its isolated integration suite with:
+
+```bash
+docker compose -f tests/watering-control/compose.yaml run --rm tests
+docker compose -f tests/watering-control/compose.yaml down -v
+```
 
 ## Current Status
 

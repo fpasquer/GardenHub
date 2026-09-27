@@ -58,6 +58,30 @@ services:
             $clientFactory: ~
             $telegramLogger: '@monolog.logger.telegram'
 
+    App\Watering\WateringPublisher: '@App\Watering\MqttWateringPublisher'
+
+    App\Watering\MqttWateringPublisher:
+        arguments:
+            $host: '%env(WATERING_MQTT_HOST)%'
+            $port: '%env(int:WATERING_MQTT_PORT)%'
+            $username: '%env(WATERING_DEV_USERNAME)%'
+            $password: '%env(WATERING_DEV_PASSWORD)%'
+            $environment: '%kernel.environment%'
+
+    App\Watering\WateringManager:
+        arguments:
+            $enabled: '%env(bool:WATERING_ENABLED)%'
+            $environment: '%kernel.environment%'
+
+    App\Command\WateringMonitorCommand:
+        arguments:
+            $host: '%env(WATERING_MQTT_HOST)%'
+            $port: '%env(int:WATERING_MQTT_PORT)%'
+            $username: '%env(WATERING_DEV_USERNAME)%'
+            $password: '%env(WATERING_DEV_PASSWORD)%'
+            $enabled: '%env(bool:WATERING_ENABLED)%'
+            $environment: '%kernel.environment%'
+
     App\Monolog\Telegram\InterfaceTelegramTransport: '@App\Monolog\Telegram\StreamTelegramTransport'
 
     App\Monolog\Handler\TelegramHandler:
