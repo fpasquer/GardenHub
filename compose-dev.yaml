@@ -33,6 +33,27 @@ services:
     networks: !override
       - gardenhub
 
+  # Opt-in fake Zigbee2MQTT device for developing the watering workflow on
+  # the Pi without a coordinator. Uses a dedicated, dev-only MQTT identity.
+  gardenhub-watering-sim:
+    image: gardenhub-api
+    container_name: gardenhub-watering-sim
+    profiles: ["watering-sim"]
+    restart: unless-stopped
+    command: php /tests/watering-sim/simulator.php
+    environment:
+      APP_ENV: dev
+      WATERING_SIM_MQTT_HOST: ${MQTT_HOST:-}
+      WATERING_SIM_MQTT_PORT: ${MQTT_PORT:-1883}
+      WATERING_SIM_USERNAME: ${WATERING_SIM_USERNAME:-}
+      WATERING_SIM_PASSWORD: ${WATERING_SIM_PASSWORD:-}
+    extra_hosts:
+      - "host.docker.internal:172.22.0.1"
+    volumes:
+      - ./tests/watering-sim:/tests/watering-sim:ro
+    networks:
+      - gardenhub
+
 # Reference to the shared network defined in compose.yaml so the adminer
 # container can reach gardenhub-mysql over the internal Docker network.
 networks:
