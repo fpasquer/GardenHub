@@ -19,16 +19,18 @@ final class ProposalBot
 
     public function evaluateAndNotify(): void
     {
-        $proposal = $this->policy->evaluate();
-        if (!$proposal || !$this->policy->claimNotification($proposal['id'])) {
-            return;
-        }
-        try {
-            $id = $this->telegram->send($this->text($proposal), $proposal['id']);
-            $this->policy->recordMessage($proposal['id'], $id);
-        } catch (\Throwable) {
-            // Send may have succeeded before a timeout/crash. Never resend this episode.
-            $this->policy->notificationUncertain($proposal['id']);
+        $this->policy->evaluate();
+        foreach ($this->policy->newNotifications() as $proposal) {
+            if (!$this->policy->claimNotification($proposal['id'])) {
+                continue;
+            }
+            try {
+                $id = $this->telegram->send($this->text($proposal), $proposal['id']);
+                $this->policy->recordMessage($proposal['id'], $id);
+            } catch (\Throwable) {
+                // Send may have succeeded before a timeout/crash. Never resend this episode.
+                $this->policy->notificationUncertain($proposal['id']);
+            }
         }
     }
 

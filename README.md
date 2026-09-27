@@ -254,7 +254,8 @@ expired, and unapproved proposals never run the simulator. If an approval is
 interrupted or command delivery is uncertain, it stays blocked for manual
 review; pressing the button again never retries the cycle. Check the proposal
 and watering run tables before any manual simulator recovery. A failed Telegram
-send may have succeeded remotely, so that episode is not sent again; a failed
+send may have succeeded remotely, so that episode is not sent again. A proposal
+committed before the notification claim is sent on the next poll; a failed
 message edit is retried on the next polling pass.
 
 Run its isolated integration suite with:

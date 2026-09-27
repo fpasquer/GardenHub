@@ -77,7 +77,13 @@ final class ProposalPolicy
 
     public function claimNotification(string $id): bool
     {
-        return 1 === $this->db->executeStatement("UPDATE watering_proposal SET notification_status = 'sending' WHERE id = ? AND status = 'pending' AND notification_status = 'new'", [$id]);
+        return 1 === $this->db->executeStatement("UPDATE watering_proposal SET notification_status = 'sending' WHERE id = ? AND status = 'pending' AND notification_status = 'new' AND expires_at > UTC_TIMESTAMP()", [$id]);
+    }
+
+    /** Only unclaimed, still actionable proposals may be sent after a restart. */
+    public function newNotifications(): array
+    {
+        return $this->db->fetchAllAssociative("SELECT p.*, d.name AS device_name FROM watering_proposal p JOIN device d ON d.id = p.device_id WHERE p.status = 'pending' AND p.notification_status = 'new' AND p.expires_at > UTC_TIMESTAMP() ORDER BY p.created_at, p.id");
     }
 
     public function recordMessage(string $id, int $messageId): void

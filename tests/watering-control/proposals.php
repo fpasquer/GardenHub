@@ -73,11 +73,17 @@ ok($policy->evaluate() === null, 'Two readings triggered');
 $insert(14, 0);
 $p = $policy->evaluate();
 ok(is_array($p), 'Three fresh consecutive readings did not trigger');
-$bot->evaluateAndNotify();
+ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'new', 'Proposal was not persisted before notification');
+// Simulate a restart after evaluate() committed but before the Telegram claim.
+$restartedPolicy = new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev'), 15, 35, 35, 30, 3);
+$restartedBot = new ProposalBot($db, $restartedPolicy, $telegram, '123', '456');
+$restartedBot->evaluateAndNotify();
+ok(count($telegram->sent) === 1 && $telegram->sent[0][1] === $p['id'], 'Restart did not send the persisted proposal exactly once');
+ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'sent', 'Recovered notification was not recorded');
+$restartedBot->evaluateAndNotify();
+ok(count($telegram->sent) === 1, 'Replay resent a recorded notification');
 ok($policy->evaluate() === null, 'Duplicate proposal created');
-$policy->claimNotification($p['id']);
-$telegram->send('fixture', $p['id']);
-$policy->recordMessage($p['id'], 1);
+ok(!$policy->claimNotification($p['id']), 'Recorded notification was claimed again');
 ok(count(json_decode($p['readings_json'], true)) === 3, 'Snapshot must contain three values');
 
 $bot->process(callback(1, $p['id'], 999));
@@ -95,6 +101,15 @@ $db->executeStatement('UPDATE watering_proposal_state SET last_prompt_at = DATE_
 $reminder = $policy->evaluate();
 ok(is_array($reminder), 'Bounded reminder missing');
 ok($policy->evaluate() === null, 'Duplicate reminder created');
+ok($policy->claimNotification($reminder['id']), 'Reminder notification claim failed');
+$telegram->send('fixture', $reminder['id']); // Telegram may receive it before the process records the message ID.
+$sentBeforeRestart = count($telegram->sent);
+(new ProposalBot($db, $restartedPolicy, $telegram, '123', '456'))->evaluateAndNotify();
+ok(count($telegram->sent) === $sentBeforeRestart, 'Restart resent a possibly successful notification');
+ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$reminder['id']]) === 'sending', 'Restart changed an in-flight notification');
+$policy->notificationUncertain($reminder['id']);
+(new ProposalBot($db, $restartedPolicy, $telegram, '123', '456'))->evaluateAndNotify();
+ok(count($telegram->sent) === $sentBeforeRestart, 'Restart resent an uncertain notification');
 $db->executeStatement("UPDATE watering_proposal SET expires_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 SECOND) WHERE id = ?", [$reminder['id']]);
 ok($policy->decide($reminder['id'], 'approve') === 'expired', 'Expired proposal approved');
 ok($policy->evaluate() === null, 'More than one reminder prompted');
