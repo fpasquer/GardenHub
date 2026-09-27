@@ -86,6 +86,65 @@ The LoRaStack and GardenHub repositories remain logically independent, but in pr
 
 ---
 
+## Watering simulator on the Pi (development only)
+
+The opt-in `gardenhub-watering-sim` service in `compose-dev.yaml` emulates the
+THIRDREALITY kit over MQTT without Zigbee hardware. It does not water plants
+and cannot connect to a real pump. Its topic is
+`gardenhub/dev/watering/avocado` (commands go to `/set`; full state is
+published on the base topic). The production Zigbee2MQTT topic is separate.
+
+Before starting it, apply the matching `feature/watering-dev-simulator`
+branch of **lorastack-pi** and create the `watering_sim` and `watering_dev`
+broker accounts described there. The broker ACL is the security boundary:
+`watering_dev` can write only the dev `/set` topic and read its state;
+`watering_sim` can read only that command topic and write only its state.
+Neither has access to `zigbee2mqtt/#`. Do not reuse the current `symfony`
+account, which is read-only for ChirpStack uplinks.
+
+Set these values in GardenHub's untracked root `.env` on the Pi:
+
+```dotenv
+WATERING_SIM_USERNAME=watering_sim
+WATERING_SIM_PASSWORD=<simulator-password-from-broker>
+```
+
+`MQTT_HOST` and `MQTT_PORT` are shared with the existing dev worker. Start only
+the simulator (the API image must already have been built by the normal dev
+stack):
+
+```bash
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  --profile watering-sim up -d gardenhub-watering-sim
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
+  logs -f gardenhub-watering-sim
+```
+
+Using the broker container on the Pi, first watch the state as `watering_dev`
+and then send a command from another terminal. Enter the `watering_dev`
+password at the shell prompt (it is not saved in shell history):
+
+```bash
+cd /opt/iot
+read -rsp 'watering_dev password: ' MQTT_DEV_SECRET; echo
+docker compose exec mosquitto mosquitto_sub -h localhost -u watering_dev \
+  -P "$MQTT_DEV_SECRET" -t gardenhub/dev/watering/avocado -v
+```
+
+```bash
+cd /opt/iot
+read -rsp 'watering_dev password: ' MQTT_DEV_SECRET; echo
+docker compose exec mosquitto mosquitto_pub -h localhost -u watering_dev \
+  -P "$MQTT_DEV_SECRET" -t gardenhub/dev/watering/avocado/set \
+  -m '{"watering_times":3,"state":"ON"}'
+unset MQTT_DEV_SECRET
+```
+
+The simulator publishes ON, then OFF after three seconds. `{"state":"OFF"}`
+stops early. Test-only commands `{"simulate_alarm_1":true}` and
+`{"simulate_battery":5}` publish water shortage and low battery; clear them
+with `false` and `100`. No real Zigbee2MQTT process is required on the Pi.
+
 ## Current Status
 
 ### Implemented
