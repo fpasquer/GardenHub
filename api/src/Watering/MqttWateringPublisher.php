@@ -10,7 +10,7 @@ use PhpMqtt\Client\Repositories\MemoryRepository;
 
 final class MqttWateringPublisher implements WateringPublisher
 {
-    public const TOPIC = 'gardenhub/dev/watering/avocado';
+    public const DEFAULT_TOPIC = 'gardenhub/dev/watering/avocado';
 
     public function __construct(
         private readonly string $host,
@@ -18,7 +18,16 @@ final class MqttWateringPublisher implements WateringPublisher
         private readonly string $username,
         private readonly string $password,
         private readonly string $environment,
+        private readonly string $topic = self::DEFAULT_TOPIC,
     ) {
+        if ('' === trim($this->topic) || str_contains($this->topic, '#') || str_contains($this->topic, '+') || str_ends_with($this->topic, '/set')) {
+            throw new \LogicException('Watering MQTT topic must be a concrete base topic.');
+        }
+    }
+
+    public function topic(): string
+    {
+        return $this->topic;
     }
 
     public function publish(array $command): void
@@ -33,7 +42,7 @@ final class MqttWateringPublisher implements WateringPublisher
         try {
             $client->connect((new ConnectionSettings())->setUsername($this->username)->setPassword($this->password), true);
             // Never retain actuator commands. Wait for PUBACK before returning.
-            $client->publish(self::TOPIC.'/set', json_encode($command, JSON_THROW_ON_ERROR), MqttClient::QOS_AT_LEAST_ONCE, false);
+            $client->publish($this->topic.'/set', json_encode($command, JSON_THROW_ON_ERROR), MqttClient::QOS_AT_LEAST_ONCE, false);
             $client->loop(true, true, 5);
             if ($repository->countPendingOutgoingMessages() > 0) {
                 throw new \RuntimeException('Publish acknowledgement (PUBACK) not received within timeout.');
