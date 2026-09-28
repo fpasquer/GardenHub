@@ -63,6 +63,14 @@ $insert = static function (float $value, int $ageMinutes) use ($db, $sensorId): 
 };
 $publisher = new ProposalFakePublisher();
 $watering = new WateringManager($db, $publisher, true, 'dev');
+$invalidDurationRejected = false;
+try {
+    new ProposalPolicy($db, $watering, 15, 35, 35, 30, 67);
+} catch (LogicException) {
+    $invalidDurationRejected = true;
+}
+ok($invalidDurationRejected, 'Proposal duration may exceed the configured per-run safety limit');
+new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev', 67, 134, 1800), 15, 35, 35, 30, 67);
 $policy = new ProposalPolicy($db, $watering, 15, 35, 35, 30, 3);
 $telegram = new ProposalFakeTelegram();
 $bot = new ProposalBot($db, $policy, $telegram, '123', '456');
@@ -76,9 +84,10 @@ ok(is_array($p), 'Three fresh consecutive readings did not trigger');
 ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'new', 'Proposal was not persisted before notification');
 // Simulate a restart after evaluate() committed but before the Telegram claim.
 $restartedPolicy = new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev'), 15, 35, 35, 30, 3);
-$restartedBot = new ProposalBot($db, $restartedPolicy, $telegram, '123', '456');
+$restartedBot = new ProposalBot($db, $restartedPolicy, $telegram, '123', '456', 'zigbee2mqtt/avocado-watering');
 $restartedBot->evaluateAndNotify();
 ok(count($telegram->sent) === 1 && $telegram->sent[0][1] === $p['id'], 'Restart did not send the persisted proposal exactly once');
+ok(str_contains($telegram->sent[0][0], 'Actuator: physical pump (zigbee2mqtt/avocado-watering)') && !str_contains($telegram->sent[0][0], 'simulator'), 'Hardware approval text misidentifies the actuator');
 ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'sent', 'Recovered notification was not recorded');
 $restartedBot->evaluateAndNotify();
 ok(count($telegram->sent) === 1, 'Replay resent a recorded notification');

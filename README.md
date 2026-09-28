@@ -94,9 +94,9 @@ and cannot connect to a real pump. Its topic is
 `gardenhub/dev/watering/avocado` (commands go to `/set`; full state is
 published on the base topic). The production Zigbee2MQTT topic is separate.
 
-Before starting it, apply the matching `feature/watering-dev-simulator`
-branch of **lorastack-pi** and create the `watering_sim` and `watering_dev`
-broker accounts described there. The broker ACL is the security boundary:
+Before starting it, use the corresponding ACL in **lorastack-pi** and create
+the `watering_sim` and `watering_dev` broker accounts described there. The
+broker ACL is the security boundary:
 `watering_dev` can write only the dev `/set` topic and read its state;
 `watering_sim` can read only that command topic and write only its state.
 Neither has access to `zigbee2mqtt/#`. Do not reuse the current `symfony`
@@ -128,14 +128,14 @@ and then send a command from another terminal. Enter the `watering_dev`
 password at the shell prompt (it is not saved in shell history):
 
 ```bash
-cd /opt/iot
+cd /opt/lorastack
 read -rsp 'watering_dev password: ' MQTT_DEV_SECRET; echo
 docker compose exec mosquitto mosquitto_sub -h localhost -u watering_dev \
   -P "$MQTT_DEV_SECRET" -t gardenhub/dev/watering/avocado -v
 ```
 
 ```bash
-cd /opt/iot
+cd /opt/lorastack
 read -rsp 'watering_dev password: ' MQTT_DEV_SECRET; echo
 docker compose exec mosquitto mosquitto_pub -h localhost -u watering_dev \
   -P "$MQTT_DEV_SECRET" -t gardenhub/dev/watering/avocado/set \
@@ -150,12 +150,13 @@ with `false` and `100`. No real Zigbee2MQTT process is required on the Pi.
 
 ### Manual watering through GardenHub
 
-This is intentionally **development only**. The application command targets
-the fixed `gardenhub/dev/watering/avocado/set` topic, requires
-`WATERING_ENABLED=true` and `APP_ENV=dev`, and uses the separate `watering_dev`
-account. The production Compose file does not provide watering credentials or
-start the monitor. The optional proposal poller below is also development only;
-it never starts a cycle without an authorized Telegram approval.
+This is intentionally **development only**. The application command publishes
+to `WATERING_MQTT_TOPIC/set`, requires `WATERING_ENABLED=true` and
+`APP_ENV=dev`, and uses the MQTT identity configured in
+`WATERING_DEV_USERNAME`/`WATERING_DEV_PASSWORD`. The simulator defaults to the
+dev topic and the `watering_dev` account. The production Compose file does
+not provide watering credentials or start the monitor. The optional proposal
+poller below never starts a cycle without an authorized Telegram approval.
 
 After updating the Pi checkout, run the new migration, then start the opt-in
 monitor alongside the simulator (from `/opt/GardenHub`):
@@ -199,18 +200,18 @@ the simulator is OFF, mark the run reviewed to resume tests:
 
 ```bash
 docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
-  exec gardenhub-api php bin/console gardenhub:watering:acknowledge-stop --confirm-simulator-off
+  exec gardenhub-api php bin/console gardenhub:watering:acknowledge-stop --confirm-actuator-off
 ```
 
 This manual override is dev-only and preserves the cooldown and daily budget.
-Never use it as evidence that a physical pump has stopped. This branch never
-publishes to `zigbee2mqtt/#`.
+It requires an independent check that the actuator is OFF; the command itself
+does not stop or verify the pump.
 
-### Soil moisture proposals (development simulator only)
+### Soil moisture proposals (development)
 
 The optional `gardenhub-watering-proposals` service runs one outbound-only
 Telegram long poller. It has no published port or webhook. Start it only with
-the simulator and monitor, after applying the migration. It requires
+the selected actuator and monitor, after applying the migration. It requires
 `APP_ENV=dev`, `WATERING_ENABLED=true`, the dev bot token, and both
 `WATERING_TELEGRAM_USER_ID` and `WATERING_TELEGRAM_CHAT_ID` set to the exact
 numeric IDs of the intended user and private chat. Set these in the untracked
@@ -236,7 +237,10 @@ readings are no more than 35 minutes apart, and no watering run was requested
 in the preceding 24 hours. These limits allow the sensor's normal 20 minute
 reporting interval. A run in `uncertain` or `timed_out` state still counts as an
 attempt. No previous run satisfies the 24 hour check. The proposal expires
-after 30 minutes and offers a three second simulator cycle. Configure the
+after 30 minutes and offers a three second cycle by default for the simulator.
+For hardware, set the duration to the measured calibration and keep it within
+`WATERING_MAX_SECONDS`; an invalid combination now prevents the poller from
+starting. Configure the
 threshold, freshness, gap, validity, and duration with
 `WATERING_PROPOSAL_THRESHOLD`,
 `WATERING_PROPOSAL_FRESHNESS_MINUTES`, `WATERING_PROPOSAL_MAX_GAP_MINUTES`,
@@ -250,13 +254,77 @@ also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
 proposal expiry, and the 24 hour rule under the watering reservation lock;
 `WateringManager` retains its enabled, monitor heartbeat, cooldown, active
 cycle, duration, and daily budget checks. Rejected, unauthorized, replayed,
-expired, and unapproved proposals never run the simulator. If an approval is
+expired, and unapproved proposals never run the configured actuator. If an approval is
 interrupted or command delivery is uncertain, it stays blocked for manual
 review; pressing the button again never retries the cycle. Check the proposal
-and watering run tables before any manual simulator recovery. A failed Telegram
+and watering run tables before any manual recovery. A failed Telegram
 send may have succeeded remotely, so that episode is not sent again. A proposal
 committed before the notification claim is sent on the next poll; a failed
 message edit is retried on the next polling pass.
+
+### Real Zigbee2MQTT pump on the Pi (opt-in development test)
+
+The real THIRDREALITY pump is exposed as `zigbee2mqtt/avocado-watering`.
+Install the companion **lorastack-pi** ACL change first, create its separate
+`watering_hw_dev` broker account, and reload Mosquitto as described in its
+operations guide. That account can read only the pump's state topic and write
+only its `/set` topic. Do not give `watering_dev` access to `zigbee2mqtt/#` or
+reuse the simulator account for hardware.
+
+In GardenHub's untracked root `.env` on the Pi, select the hardware topic and
+the dedicated account. The calibration below is based on a measured 500 ml in
+67 seconds; verify it again with the installed tubing and a measured vessel
+before using the plant. The default limits in `api/.env` and `compose-dev.yaml`
+remain simulator-safe and must be explicitly overridden for this test:
+
+```dotenv
+WATERING_ENABLED=true
+WATERING_MQTT_TOPIC=zigbee2mqtt/avocado-watering
+WATERING_DEV_USERNAME=watering_hw_dev
+WATERING_DEV_PASSWORD=<separate-hardware-account-password>
+WATERING_MAX_SECONDS=67
+WATERING_DAILY_SECONDS=134
+WATERING_COOLDOWN_SECONDS=1800
+WATERING_PROPOSAL_DURATION_SECONDS=67
+```
+
+Stop the simulator if it is running. Recreate the API, monitor, and proposal
+containers so all three receive the new topic, credentials, and limits. Start
+only the hardware and proposal profiles; `make dev` enables the simulator
+profile and should not be used for this hardware run. The commands include the
+untracked `.env.local` that holds the Telegram user and chat IDs described
+above.
+
+```bash
+cd /opt/GardenHub
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
+  stop gardenhub-watering-sim gardenhub-watering-monitor gardenhub-watering-proposals
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
+  up -d --no-deps --force-recreate gardenhub-api
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
+  --profile watering-hardware --profile watering-proposals up -d --no-deps --force-recreate \
+  gardenhub-watering-monitor gardenhub-watering-proposals
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
+  logs -f gardenhub-watering-monitor
+```
+
+Start with a manual request and confirm ON, OFF, and the collected volume.
+Run it only with the outlet in a measured vessel:
+
+```bash
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
+  exec gardenhub-api php bin/console gardenhub:watering:request 67
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
+  exec gardenhub-api php bin/console gardenhub:watering:status
+```
+
+The proposal policy will then block a Telegram approval for 24 hours after
+that request; wait for a new dry episode to test the interactive flow. The
+manager reserves the requested seconds against its rolling 24 hour budget
+even if a run is interrupted.
+If the cycle becomes `uncertain` or `timed_out`, independently verify the
+physical pump is OFF before `gardenhub:watering:acknowledge-stop
+--confirm-actuator-off`. Acknowledging the stop does not restore the budget.
 
 Run its isolated integration suite with:
 

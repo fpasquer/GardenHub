@@ -96,6 +96,7 @@ services:
         arguments:
             $expectedUserId: '%env(WATERING_TELEGRAM_USER_ID)%'
             $expectedChatId: '%env(WATERING_TELEGRAM_CHAT_ID)%'
+            $actuatorTopic: '%env(WATERING_MQTT_TOPIC)%'
 
     App\Command\WateringProposalPollCommand:
         arguments:
