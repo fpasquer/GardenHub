@@ -20,13 +20,14 @@ final class WateringMonitorRunner
         private readonly int $port,
         private readonly string $username,
         private readonly string $password,
+        private readonly string $topic = MqttWateringPublisher::DEFAULT_TOPIC,
         private readonly float $subackTimeoutSeconds = 10.0,
     ) {
     }
 
     public function isConfigured(): bool
     {
-        return '' !== $this->host && '' !== $this->username && '' !== $this->password;
+        return '' !== $this->host && '' !== $this->username && '' !== $this->password && '' !== trim($this->topic);
     }
 
     /** $stopRequested is polled each heartbeat iteration; production passes a closure that never stops. */
@@ -45,7 +46,7 @@ final class WateringMonitorRunner
         };
         try {
             $client->connect((new ConnectionSettings())->setUsername($this->username)->setPassword($this->password)->setKeepAliveInterval(30), true);
-            $client->subscribe(MqttWateringPublisher::TOPIC, function (string $topic, string $message) use (&$callbackFailure): void {
+            $client->subscribe($this->topic, function (string $topic, string $message) use (&$callbackFailure): void {
                 if ($callbackFailure !== null) {
                     return;
                 }
@@ -58,7 +59,7 @@ final class WateringMonitorRunner
                 }
             }, MqttClient::QOS_AT_LEAST_ONCE);
             SubscriptionReadyGate::await($client, $repository, $this->subackTimeoutSeconds, $throwCallbackFailure);
-            $this->logger->info('Monitoring '.MqttWateringPublisher::TOPIC);
+            $this->logger->info('Monitoring '.$this->topic);
             $this->runHeartbeatLoop($client, $stopRequested, $throwCallbackFailure);
         } finally {
             try {
