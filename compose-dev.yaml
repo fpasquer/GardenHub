@@ -2,7 +2,8 @@
 #
 #   docker compose -f compose.yaml -f compose-dev.yaml up -d
 #
-# Production runs `compose.yaml` alone, so this container never starts there.
+# Production runs `compose.yaml` alone, so these development watering services
+# never start there.
 name: gardenhub
 
 services:
@@ -29,14 +30,19 @@ services:
   gardenhub-api:
     environment:
       WATERING_ENABLED: ${WATERING_ENABLED:-false}
-      WATERING_MQTT_HOST: ${MQTT_HOST:-}
-      WATERING_MQTT_PORT: ${MQTT_PORT:-1883}
+      WATERING_MQTT_HOST: ${WATERING_MQTT_HOST:-${MQTT_HOST:-}}
+      WATERING_MQTT_PORT: ${WATERING_MQTT_PORT:-${MQTT_PORT:-1883}}
+      WATERING_MQTT_TOPIC: ${WATERING_MQTT_TOPIC:-gardenhub/dev/watering/avocado}
       WATERING_DEV_USERNAME: ${WATERING_DEV_USERNAME:-}
       WATERING_DEV_PASSWORD: ${WATERING_DEV_PASSWORD:-}
+      WATERING_MAX_SECONDS: ${WATERING_MAX_SECONDS:-30}
+      WATERING_DAILY_SECONDS: ${WATERING_DAILY_SECONDS:-120}
+      WATERING_COOLDOWN_SECONDS: ${WATERING_COOLDOWN_SECONDS:-60}
     extra_hosts:
       - "host.docker.internal:172.22.0.1"
     volumes:
       - ./api/tests:/app/tests
+
   gardenhub-consumer:
     networks: !override
       - gardenhub
@@ -62,20 +68,26 @@ services:
     networks:
       - gardenhub
 
+  # The same monitor is used either with the simulator or, explicitly, with
+  # the real Zigbee2MQTT actuator. Hardware mode remains dev-only and opt-in.
   gardenhub-watering-monitor:
     image: gardenhub-api
     container_name: gardenhub-watering-monitor
-    profiles: ["watering-sim"]
+    profiles: ["watering-sim", "watering-hardware"]
     restart: unless-stopped
     command: php bin/console gardenhub:watering:monitor --no-debug
     environment:
       APP_ENV: dev
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
       WATERING_ENABLED: ${WATERING_ENABLED:-false}
-      WATERING_MQTT_HOST: ${MQTT_HOST:-}
-      WATERING_MQTT_PORT: ${MQTT_PORT:-1883}
+      WATERING_MQTT_HOST: ${WATERING_MQTT_HOST:-${MQTT_HOST:-}}
+      WATERING_MQTT_PORT: ${WATERING_MQTT_PORT:-${MQTT_PORT:-1883}}
+      WATERING_MQTT_TOPIC: ${WATERING_MQTT_TOPIC:-gardenhub/dev/watering/avocado}
       WATERING_DEV_USERNAME: ${WATERING_DEV_USERNAME:-}
       WATERING_DEV_PASSWORD: ${WATERING_DEV_PASSWORD:-}
+      WATERING_MAX_SECONDS: ${WATERING_MAX_SECONDS:-30}
+      WATERING_DAILY_SECONDS: ${WATERING_DAILY_SECONDS:-120}
+      WATERING_COOLDOWN_SECONDS: ${WATERING_COOLDOWN_SECONDS:-60}
     extra_hosts:
       - "host.docker.internal:172.22.0.1"
     volumes:
@@ -101,10 +113,14 @@ services:
       APP_ENV: dev
       DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
       WATERING_ENABLED: ${WATERING_ENABLED:-false}
-      WATERING_MQTT_HOST: ${MQTT_HOST:-}
-      WATERING_MQTT_PORT: ${MQTT_PORT:-1883}
+      WATERING_MQTT_HOST: ${WATERING_MQTT_HOST:-${MQTT_HOST:-}}
+      WATERING_MQTT_PORT: ${WATERING_MQTT_PORT:-${MQTT_PORT:-1883}}
+      WATERING_MQTT_TOPIC: ${WATERING_MQTT_TOPIC:-gardenhub/dev/watering/avocado}
       WATERING_DEV_USERNAME: ${WATERING_DEV_USERNAME:-}
       WATERING_DEV_PASSWORD: ${WATERING_DEV_PASSWORD:-}
+      WATERING_MAX_SECONDS: ${WATERING_MAX_SECONDS:-30}
+      WATERING_DAILY_SECONDS: ${WATERING_DAILY_SECONDS:-120}
+      WATERING_COOLDOWN_SECONDS: ${WATERING_COOLDOWN_SECONDS:-60}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       WATERING_TELEGRAM_USER_ID: ${WATERING_TELEGRAM_USER_ID:-}
       WATERING_TELEGRAM_CHAT_ID: ${WATERING_TELEGRAM_CHAT_ID:-}
