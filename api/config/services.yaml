@@ -67,11 +67,15 @@ services:
             $username: '%env(WATERING_DEV_USERNAME)%'
             $password: '%env(WATERING_DEV_PASSWORD)%'
             $environment: '%kernel.environment%'
+            $topic: '%env(WATERING_MQTT_TOPIC)%'
 
     App\Watering\WateringManager:
         arguments:
             $enabled: '%env(bool:WATERING_ENABLED)%'
             $environment: '%kernel.environment%'
+            $maxSeconds: '%env(int:WATERING_MAX_SECONDS)%'
+            $dailySeconds: '%env(int:WATERING_DAILY_SECONDS)%'
+            $cooldownSeconds: '%env(int:WATERING_COOLDOWN_SECONDS)%'
 
     App\Watering\ProposalPolicy:
         arguments:
@@ -107,6 +111,7 @@ services:
             $port: '%env(int:WATERING_MQTT_PORT)%'
             $username: '%env(WATERING_DEV_USERNAME)%'
             $password: '%env(WATERING_DEV_PASSWORD)%'
+            $topic: '%env(WATERING_MQTT_TOPIC)%'
 
     App\Command\WateringMonitorCommand:
         arguments:
