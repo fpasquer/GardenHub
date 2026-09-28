@@ -10,6 +10,8 @@ use Symfony\Component\Uid\Uuid;
 /** Durable, single-actuator safety gate for development watering. */
 final class WateringManager
 {
+    /** Absolute actuator bound; configured limits can only be stricter. */
+    public const MAX_SECONDS = 1800;
     public const DEFAULT_MAX_SECONDS = 30;
     public const DEFAULT_DAILY_SECONDS = 120;
     public const DEFAULT_COOLDOWN_SECONDS = 60;
@@ -23,8 +25,8 @@ final class WateringManager
         private readonly int $dailySeconds = self::DEFAULT_DAILY_SECONDS,
         private readonly int $cooldownSeconds = self::DEFAULT_COOLDOWN_SECONDS,
     ) {
-        if ($this->maxSeconds < 1 || $this->maxSeconds > 1800) {
-            throw new \LogicException('Watering max duration must be between 1 and 1800 seconds.');
+        if ($this->maxSeconds < 1 || $this->maxSeconds > self::MAX_SECONDS) {
+            throw new \LogicException('Watering max duration must be between 1 and '.self::MAX_SECONDS.' seconds.');
         }
         if ($this->dailySeconds < $this->maxSeconds || $this->dailySeconds > 86400) {
             throw new \LogicException('Watering daily budget must be at least max duration and no more than 86400 seconds.');
