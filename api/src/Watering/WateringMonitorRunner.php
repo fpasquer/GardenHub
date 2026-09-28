@@ -20,8 +20,8 @@ final class WateringMonitorRunner
         private readonly int $port,
         private readonly string $username,
         private readonly string $password,
-        private readonly string $topic = MqttWateringPublisher::DEFAULT_TOPIC,
         private readonly float $subackTimeoutSeconds = 10.0,
+        private readonly string $topic = MqttWateringPublisher::DEFAULT_TOPIC,
     ) {
     }
 
