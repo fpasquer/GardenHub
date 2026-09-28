@@ -10,7 +10,7 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'gardenhub:watering:status', description: 'Show the last simulated watering cycle')]
+#[AsCommand(name: 'gardenhub:watering:status', description: 'Show the last watering cycle')]
 final class WateringStatusCommand extends Command
 {
     public function __construct(private readonly WateringManager $watering)
