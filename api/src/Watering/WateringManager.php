@@ -7,27 +7,46 @@ namespace App\Watering;
 use Doctrine\DBAL\Connection;
 use Symfony\Component\Uid\Uuid;
 
-/** Durable, single-actuator safety gate for the development simulator. */
+/** Durable, single-actuator safety gate for development watering. */
 final class WateringManager
 {
-    public const MAX_SECONDS = 30;
-    public const DAILY_SECONDS = 120;
-    public const COOLDOWN_SECONDS = 60;
+    /** Absolute actuator bound; configured limits can only be stricter. */
+    public const MAX_SECONDS = 1800;
+    public const DEFAULT_MAX_SECONDS = 30;
+    public const DEFAULT_DAILY_SECONDS = 120;
+    public const DEFAULT_COOLDOWN_SECONDS = 60;
 
     public function __construct(
         private readonly Connection $db,
         private readonly WateringPublisher $publisher,
         private readonly bool $enabled,
         private readonly string $environment,
+        private readonly int $maxSeconds = self::DEFAULT_MAX_SECONDS,
+        private readonly int $dailySeconds = self::DEFAULT_DAILY_SECONDS,
+        private readonly int $cooldownSeconds = self::DEFAULT_COOLDOWN_SECONDS,
     ) {
+        if ($this->maxSeconds < 1 || $this->maxSeconds > self::MAX_SECONDS) {
+            throw new \LogicException('Watering max duration must be between 1 and '.self::MAX_SECONDS.' seconds.');
+        }
+        if ($this->dailySeconds < $this->maxSeconds || $this->dailySeconds > 86400) {
+            throw new \LogicException('Watering daily budget must be at least max duration and no more than 86400 seconds.');
+        }
+        if ($this->cooldownSeconds < 0 || $this->cooldownSeconds > 86400) {
+            throw new \LogicException('Watering cooldown must be between 0 and 86400 seconds.');
+        }
+    }
+
+    public function maxSeconds(): int
+    {
+        return $this->maxSeconds;
     }
 
     /** Optional guard runs under the same control lock as the run reservation. */
     public function request(int $seconds, ?callable $guard = null): string
     {
         $this->assertEnabled();
-        if ($seconds < 1 || $seconds > self::MAX_SECONDS) {
-            throw new \DomainException('Duration must be between 1 and '.self::MAX_SECONDS.' seconds.');
+        if ($seconds < 1 || $seconds > $this->maxSeconds) {
+            throw new \DomainException('Duration must be between 1 and '.$this->maxSeconds.' seconds.');
         }
 
         $id = (string) Uuid::v4();
@@ -40,11 +59,11 @@ final class WateringManager
             if ($control['monitor_seen_at'] === null || strtotime($control['monitor_seen_at'].' UTC') < $now->getTimestamp() - 5) {
                 throw new \DomainException('Watering monitor is not reporting; refusing to start.');
             }
-            if ($control['last_request_at'] !== null && strtotime($control['last_request_at'].' UTC') > $now->getTimestamp() - self::COOLDOWN_SECONDS) {
+            if ($control['last_request_at'] !== null && strtotime($control['last_request_at'].' UTC') > $now->getTimestamp() - $this->cooldownSeconds) {
                 throw new \DomainException('Watering cooldown has not elapsed.');
             }
             $used = (int) $db->fetchOne('SELECT COALESCE(SUM(requested_seconds), 0) FROM watering_run WHERE requested_at >= ?', [$now->modify('-24 hours')->format('Y-m-d H:i:s')]);
-            if ($used + $seconds > self::DAILY_SECONDS) {
+            if ($used + $seconds > $this->dailySeconds) {
                 throw new \DomainException('Rolling 24-hour watering limit exceeded.');
             }
             if ($guard !== null) {
@@ -191,7 +210,7 @@ final class WateringManager
         $this->db->update('watering_control', ['monitor_seen_at' => null], ['id' => 1]);
     }
 
-    /** Manual recovery only after verifying the simulator is OFF. */
+    /** Manual recovery only after independently verifying that the actuator is OFF. */
     public function acknowledgeStopped(): void
     {
         $this->assertEnabled();

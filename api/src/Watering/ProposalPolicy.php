@@ -21,7 +21,7 @@ final class ProposalPolicy
         private readonly int $validityMinutes,
         private readonly int $durationSeconds,
     ) {
-        if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || $durationSeconds < 1 || $durationSeconds > WateringManager::MAX_SECONDS) {
+        if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || $durationSeconds < 1 || $durationSeconds > $watering->maxSeconds()) {
             throw new \LogicException('Invalid dev watering proposal configuration.');
         }
     }

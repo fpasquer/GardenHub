@@ -11,7 +11,7 @@ use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'gardenhub:watering:request', description: 'Request a short manual watering cycle on the dev simulator')]
+#[AsCommand(name: 'gardenhub:watering:request', description: 'Request a manual development watering cycle')]
 final class WateringRequestCommand extends Command
 {
     public function __construct(private readonly WateringManager $watering)
@@ -21,7 +21,7 @@ final class WateringRequestCommand extends Command
 
     protected function configure(): void
     {
-        $this->addArgument('seconds', InputArgument::REQUIRED, 'Run duration, 1–30 seconds');
+        $this->addArgument('seconds', InputArgument::REQUIRED, 'Run duration in seconds; validated against the configured safety limit');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int

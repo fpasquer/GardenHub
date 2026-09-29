@@ -14,6 +14,7 @@ final class ProposalBot
         private readonly TelegramGateway $telegram,
         private readonly string $expectedUserId,
         private readonly string $expectedChatId,
+        private readonly string $actuatorTopic = MqttWateringPublisher::DEFAULT_TOPIC,
     ) {
     }
 
@@ -79,12 +80,13 @@ final class ProposalBot
 
     private function text(array $p): string
     {
-        $lines = ['GardenHub dev watering proposal', 'Device: '.$p['device_name']];
+        $actuator = str_starts_with($this->actuatorTopic, 'zigbee2mqtt/') ? 'physical pump' : 'configured MQTT actuator';
+        $lines = ['GardenHub dev watering proposal', 'Device: '.$p['device_name'], 'Actuator: '.$actuator.' ('.$this->actuatorTopic.')'];
         foreach (json_decode($p['readings_json'], true, 512, JSON_THROW_ON_ERROR) as $r) {
             $lines[] = $r['measured_at'].' UTC: '.$r['value'].'%';
         }
         $lines[] = 'Last watering attempt: '.($p['last_attempt_at'] ? $p['last_attempt_at'].' UTC' : 'none');
-        $lines[] = 'Proposed simulator duration: '.$p['duration_seconds'].' seconds';
+        $lines[] = 'Proposed watering duration: '.$p['duration_seconds'].' seconds';
         $lines[] = 'Expires: '.$p['expires_at'].' UTC';
         return implode("\n", $lines);
     }
