@@ -9,6 +9,7 @@ endif
 
 ifneq ($(filter dev,$(MAKECMDGOALS)),)
 COMPOSE_FILES += -f compose-dev.yaml
+COMPOSE += --profile watering-sim
 endif
 
 .PHONY: start dev
