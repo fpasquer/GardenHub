@@ -247,8 +247,18 @@ threshold, freshness, gap, validity, and duration with
 `WATERING_PROPOSAL_VALIDITY_MINUTES`, and `WATERING_PROPOSAL_DURATION_SECONDS`.
 The default values are in [api/.env](api/.env).
 
+Each proposal stores the `WATERING_MQTT_TOPIC` it was created for and its
+Telegram text is rendered from that stored topic. If the configured topic later
+changes (for example from the simulator to the physical pump), every pending
+proposal for another topic is invalidated before it can be sent or approved,
+nothing is published, and an already delivered message is edited to remove its
+buttons. Proposals created before the topic was recorded have no topic and can
+never be approved.
+
 One initial prompt and at most one reminder 24 hours later are allowed during
-the same dry episode, including after rejection or expiry. A wet reading resets
+the same dry episode for each actuator topic, including after rejection or
+expiry, so an invalidated simulator proposal does not consume the physical
+pump's prompts. A wet reading resets
 the episode and invalidates any pending proposal. A newer watering attempt
 also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
 proposal expiry, and the 24 hour rule under the watering reservation lock;

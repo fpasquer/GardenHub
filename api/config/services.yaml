@@ -84,6 +84,7 @@ services:
             $maxGapMinutes: '%env(int:WATERING_PROPOSAL_MAX_GAP_MINUTES)%'
             $validityMinutes: '%env(int:WATERING_PROPOSAL_VALIDITY_MINUTES)%'
             $durationSeconds: '%env(int:WATERING_PROPOSAL_DURATION_SECONDS)%'
+            $actuatorTopic: '%env(WATERING_MQTT_TOPIC)%'
 
     App\Watering\TelegramGateway: '@App\Watering\StreamTelegramGateway'
 
@@ -96,7 +97,6 @@ services:
         arguments:
             $expectedUserId: '%env(WATERING_TELEGRAM_USER_ID)%'
             $expectedChatId: '%env(WATERING_TELEGRAM_CHAT_ID)%'
-            $actuatorTopic: '%env(WATERING_MQTT_TOPIC)%'
 
     App\Command\WateringProposalPollCommand:
         arguments:

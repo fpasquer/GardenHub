@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use App\Kernel;
+use App\Watering\MqttWateringPublisher;
 use App\Watering\ProposalBot;
 use App\Watering\ProposalPolicy;
 use App\Watering\TelegramGateway;
@@ -12,6 +13,9 @@ use Doctrine\DBAL\Connection;
 use Symfony\Component\Uid\Uuid;
 
 require '/app/vendor/autoload.php';
+
+const SIM_TOPIC = MqttWateringPublisher::DEFAULT_TOPIC;
+const HW_TOPIC = 'zigbee2mqtt/avocado-watering';
 
 final class ProposalFakePublisher implements WateringPublisher
 {
@@ -65,13 +69,13 @@ $publisher = new ProposalFakePublisher();
 $watering = new WateringManager($db, $publisher, true, 'dev');
 $invalidDurationRejected = false;
 try {
-    new ProposalPolicy($db, $watering, 15, 35, 35, 30, 67);
+    new ProposalPolicy($db, $watering, 15, 35, 35, 30, 67, SIM_TOPIC);
 } catch (LogicException) {
     $invalidDurationRejected = true;
 }
 ok($invalidDurationRejected, 'Proposal duration may exceed the configured per-run safety limit');
-new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev', 67, 134, 1800), 15, 35, 35, 30, 67);
-$policy = new ProposalPolicy($db, $watering, 15, 35, 35, 30, 3);
+new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev', 67, 134, 1800), 15, 35, 35, 30, 67, SIM_TOPIC);
+$policy = new ProposalPolicy($db, $watering, 15, 35, 35, 30, 3, SIM_TOPIC);
 $telegram = new ProposalFakeTelegram();
 $bot = new ProposalBot($db, $policy, $telegram, '123', '456');
 
@@ -82,12 +86,13 @@ $insert(14, 0);
 $p = $policy->evaluate();
 ok(is_array($p), 'Three fresh consecutive readings did not trigger');
 ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'new', 'Proposal was not persisted before notification');
-// Simulate a restart after evaluate() committed but before the Telegram claim.
-$restartedPolicy = new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev'), 15, 35, 35, 30, 3);
-$restartedBot = new ProposalBot($db, $restartedPolicy, $telegram, '123', '456', 'zigbee2mqtt/avocado-watering');
+// Restart with the same actuator after evaluate() committed but before the Telegram claim.
+$restartedPolicy = new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev'), 15, 35, 35, 30, 3, SIM_TOPIC);
+$restartedBot = new ProposalBot($db, $restartedPolicy, $telegram, '123', '456');
 $restartedBot->evaluateAndNotify();
 ok(count($telegram->sent) === 1 && $telegram->sent[0][1] === $p['id'], 'Restart did not send the persisted proposal exactly once');
-ok(str_contains($telegram->sent[0][0], 'Actuator: physical pump (zigbee2mqtt/avocado-watering)') && !str_contains($telegram->sent[0][0], 'simulator'), 'Hardware approval text misidentifies the actuator');
+ok(str_contains($telegram->sent[0][0], 'Actuator: configured MQTT actuator ('.SIM_TOPIC.')') && !str_contains($telegram->sent[0][0], 'physical pump'), 'Restarted text does not use the proposal\'s stored topic');
+ok($p['actuator_topic'] === SIM_TOPIC, 'Proposal did not persist its actuator topic');
 ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'sent', 'Recovered notification was not recorded');
 $restartedBot->evaluateAndNotify();
 ok(count($telegram->sent) === 1, 'Replay resent a recorded notification');
@@ -223,5 +228,108 @@ $acks = count($telegram->acks);
 (new ProposalBot($db, $policy, $telegram, '123', '456'))->pollOnce();
 ok(count($telegram->acks) === $acks, 'Restart redelivered an acknowledged update');
 
-echo "PASS proposal trigger, duplicate/stale/gap/recovery, reminder/expiry, authorization, replay, concurrent approval, 24-hour boundary, uncertain delivery, restart and polling offset\n";
+// Actuator switching: a proposal is bound to the topic it was created for.
+$resetFixture = static function () use ($db, $sensorId, $insert, $publisher): void {
+    $db->executeStatement('DELETE FROM watering_proposal');
+    $db->executeStatement('DELETE FROM watering_proposal_state');
+    $db->executeStatement('DELETE FROM watering_run');
+    $db->executeStatement('DELETE FROM measurement WHERE sensor_id = ?', [$sensorId]);
+    $db->executeStatement('UPDATE watering_control SET active_run_id = NULL, last_request_at = NULL, monitor_seen_at = UTC_TIMESTAMP() WHERE id = 1');
+    $publisher->fail = false;
+    $publisher->calls = 0;
+    $insert(14, 40);
+    $insert(14, 20);
+    $insert(14, 0);
+};
+$stackFor = static function (string $topic, ProposalFakeTelegram $gateway) use ($db, $publisher): array {
+    $stackPolicy = new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev'), 15, 35, 35, 30, 3, $topic);
+    return [$stackPolicy, new ProposalBot($db, $stackPolicy, $gateway, '123', '456')];
+};
+$column = static fn (string $name, string $id): mixed => $db->fetchOne('SELECT '.$name.' FROM watering_proposal WHERE id = ?', [$id]);
+$runs = static fn (): int => (int) $db->fetchOne('SELECT COUNT(*) FROM watering_run');
+
+// A simulator proposal waiting to be sent must never be sent once the hardware topic is configured.
+$resetFixture();
+$waiting = new ProposalFakeTelegram();
+[$simPolicy] = $stackFor(SIM_TOPIC, $waiting);
+[$hwPolicy, $hwBot] = $stackFor(HW_TOPIC, $waiting);
+$old = $simPolicy->evaluate();
+ok(is_array($old) && $old['actuator_topic'] === SIM_TOPIC, 'Simulator proposal did not record its topic');
+$hwBot->evaluateAndNotify();
+ok($column('status', $old['id']) === 'invalidated' && $column('failure', $old['id']) === 'Actuator changed', 'Waiting simulator proposal survived the actuator switch');
+ok($column('notification_status', $old['id']) === 'new' && $column('message_id', $old['id']) === null, 'Waiting simulator proposal was notified after the switch');
+ok(count($waiting->sent) === 1 && $waiting->sent[0][1] !== $old['id'], 'Only the hardware proposal may be sent');
+$hardwareId = $waiting->sent[0][1];
+ok($column('actuator_topic', $hardwareId) === HW_TOPIC, 'Hardware proposal did not persist the physical topic');
+ok(str_contains($waiting->sent[0][0], 'Actuator: physical pump ('.HW_TOPIC.')') && !str_contains($waiting->sent[0][0], SIM_TOPIC), 'Hardware proposal text does not name the physical topic');
+ok($hwPolicy->decide($old['id'], 'approve') === 'ignored' && $publisher->calls === 0 && $runs() === 0, 'Invalidated waiting proposal was approved');
+$hwBot->process(callback(100, $hardwareId));
+ok($column('status', $hardwareId) === 'approved' && $publisher->calls === 1 && $runs() === 1, 'Hardware proposal did not follow the normal approval flow');
+
+// An already delivered simulator Approve button must publish nothing and lose its buttons.
+$resetFixture();
+$delivered = new ProposalFakeTelegram();
+[$simPolicy, $simBot] = $stackFor(SIM_TOPIC, $delivered);
+[$hwPolicy, $hwBot] = $stackFor(HW_TOPIC, $delivered);
+$simBot->evaluateAndNotify();
+$oldId = $delivered->sent[0][1];
+ok($column('notification_status', $oldId) === 'sent' && (int) $column('message_id', $oldId) === 1, 'Simulator proposal was not delivered');
+$hwBot->process(callback(101, $oldId));
+ok($column('status', $oldId) === 'invalidated' && $column('failure', $oldId) === 'Actuator changed', 'Old Approve was not invalidated');
+ok($publisher->calls === 0 && $runs() === 0 && $delivered->acks === ['cb101'], 'Old Approve published or was not acknowledged');
+$hwBot->reconcileMessages();
+ok(count($delivered->edits) === 1 && $delivered->edits[0][0] === 1, 'Delivered message was not edited to remove its buttons');
+ok(str_contains($delivered->edits[0][1], 'Actuator: configured MQTT actuator ('.SIM_TOPIC.')') && !str_contains($delivered->edits[0][1], 'physical pump') && str_contains($delivered->edits[0][1], 'Decision: invalidated'), 'Old message was relabelled for another actuator');
+ok($column('notification_status', $oldId) === 'final', 'Edited message was not marked final');
+$hwBot->evaluateAndNotify();
+ok(count($delivered->sent) === 2, 'Invalidated simulator proposal blocked a hardware proposal');
+$newId = $delivered->sent[1][1];
+ok($column('actuator_topic', $newId) === HW_TOPIC && str_contains($delivered->sent[1][0], 'Actuator: physical pump ('.HW_TOPIC.')'), 'New proposal does not name the physical topic');
+$hwBot->process(callback(102, $newId));
+ok($column('status', $newId) === 'approved' && $publisher->calls === 1 && $runs() === 1, 'Hardware approval after the switch failed');
+$counts = $db->fetchAllKeyValue('SELECT actuator_topic, prompt_count FROM watering_proposal_state WHERE device_id = ?', [$deviceId]);
+ok($counts === [SIM_TOPIC => 1, HW_TOPIC => 1], 'Prompt counters are not tracked per actuator');
+
+// Each actuator keeps its own one-reminder limit within the same dry episode.
+$resetFixture();
+[$simPolicy] = $stackFor(SIM_TOPIC, new ProposalFakeTelegram());
+[$hwPolicy] = $stackFor(HW_TOPIC, new ProposalFakeTelegram());
+ok(is_array($simPolicy->evaluate()), 'Simulator initial prompt missing');
+$hwFirst = $hwPolicy->evaluate();
+ok(is_array($hwFirst), 'Invalidated simulator proposal consumed the hardware prompt');
+ok($hwPolicy->decide($hwFirst['id'], 'reject') === 'rejected' && $hwPolicy->evaluate() === null, 'Hardware prompt repeated immediately');
+$ageHardwarePrompt = static fn () => $db->executeStatement('UPDATE watering_proposal_state SET last_prompt_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY) WHERE actuator_topic = ?', [HW_TOPIC]);
+$ageHardwarePrompt();
+$hwReminder = $hwPolicy->evaluate();
+ok(is_array($hwReminder), 'Hardware reminder missing');
+ok($hwPolicy->decide($hwReminder['id'], 'reject') === 'rejected', 'Hardware reminder was not decided');
+$ageHardwarePrompt();
+ok($hwPolicy->evaluate() === null, 'Hardware exceeded one initial prompt and one reminder');
+ok((int) $db->fetchOne('SELECT prompt_count FROM watering_proposal_state WHERE actuator_topic = ?', [SIM_TOPIC]) === 1, 'Hardware prompts changed the simulator counter');
+
+// Proposals from before the topic was recorded are never approvable and never relabelled.
+$resetFixture();
+$legacy = new ProposalFakeTelegram();
+[$hwPolicy, $hwBot] = $stackFor(HW_TOPIC, $legacy);
+$legacyRow = static function (string $notification, ?int $messageId) use ($db, $deviceId): string {
+    $id = (string) Uuid::v4();
+    $db->insert('watering_proposal', [
+        'id' => $id, 'device_id' => $deviceId, 'status' => 'pending', 'created_at' => gmdate('Y-m-d H:i:s'),
+        'expires_at' => gmdate('Y-m-d H:i:s', time() + 1800), 'duration_seconds' => 3,
+        'readings_json' => json_encode([['value' => 14.0, 'measured_at' => gmdate('Y-m-d H:i:s')]], JSON_THROW_ON_ERROR),
+        'notification_status' => $notification, 'message_id' => $messageId,
+    ]);
+    return $id;
+};
+$sentLegacy = $legacyRow('sent', 77);
+$unsentLegacy = $legacyRow('new', null);
+ok($hwPolicy->decide($sentLegacy, 'approve') === 'invalidated' && $publisher->calls === 0 && $runs() === 0, 'Legacy proposal without a topic was approved');
+$hwBot->evaluateAndNotify();
+ok($column('status', $unsentLegacy) === 'invalidated' && $column('message_id', $unsentLegacy) === null, 'Legacy notification was sent');
+ok(count($legacy->sent) === 1 && $column('actuator_topic', $legacy->sent[0][1]) === HW_TOPIC, 'Only the recorded hardware proposal may be sent');
+$hwBot->reconcileMessages();
+ok(count($legacy->edits) === 1 && $legacy->edits[0][0] === 77, 'Legacy message buttons were not removed');
+ok(str_contains($legacy->edits[0][1], 'Actuator: not recorded (legacy proposal)') && !str_contains($legacy->edits[0][1], HW_TOPIC) && !str_contains($legacy->edits[0][1], SIM_TOPIC), 'Legacy message invented an actuator topic');
+
+echo "PASS proposal trigger, duplicate/stale/gap/recovery, reminder/expiry, authorization, replay, concurrent approval, 24-hour boundary, uncertain delivery, restart, polling offset and actuator switching\n";
 $kernel->shutdown();
