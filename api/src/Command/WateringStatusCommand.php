@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Command;
 
+use App\Entity\WateringRun;
 use App\Watering\WateringManager;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -25,9 +26,31 @@ final class WateringStatusCommand extends Command
             $output->writeln('No watering cycle recorded.');
             return Command::SUCCESS;
         }
-        foreach ($run as $key => $value) {
-            $output->writeln($key.': '.($value ?? '(none)'));
+        foreach ($this->describe($run) as $key => $value) {
+            $output->writeln(sprintf('%s: %s', $key, $value ?? '(none)'));
         }
         return Command::SUCCESS;
+    }
+
+    /** @return array<string, int|string|null> */
+    private function describe(WateringRun $run): array
+    {
+        return [
+            'id' => $run->getId(),
+            'requested_seconds' => $run->getRequestedSeconds(),
+            'status' => $run->getStatus(),
+            'requested_at' => $this->format($run->getRequestedAt()),
+            'deadline_at' => $this->format($run->getDeadlineAt()),
+            'started_at' => $this->format($run->getStartedAt()),
+            'finished_at' => $this->format($run->getFinishedAt()),
+            'last_state_at' => $this->format($run->getLastStateAt()),
+            'last_state' => $run->getLastState(),
+            'error' => $run->getError(),
+        ];
+    }
+
+    private function format(?\DateTimeImmutable $moment): ?string
+    {
+        return $moment?->format('Y-m-d H:i:s');
     }
 }

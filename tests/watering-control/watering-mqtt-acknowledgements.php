@@ -19,14 +19,16 @@ declare(strict_types=1);
 
 use App\Kernel;
 use App\Watering\MqttWateringPublisher;
-use App\Watering\WateringManager;
 use App\Watering\WateringMonitorRunner;
 use App\Watering\WateringPublisher;
+use Doctrine\DBAL\Exception\ForeignKeyConstraintViolationException;
+use Doctrine\ORM\EntityManagerInterface;
 use PhpMqtt\Client\ConnectionSettings;
 use PhpMqtt\Client\MqttClient;
 use Psr\Log\NullLogger;
 
 require '/app/vendor/autoload.php';
+require __DIR__.'/support.php';
 
 const STUB_HOST = '127.0.0.1';
 const MOSQUITTO_HOST = 'mqtt';
@@ -269,9 +271,9 @@ function stopBrokerStub(array $handle): void
     check(0 === $exit, 'Broker stub failed: '.$output);
 }
 
-function newRunner(Doctrine\DBAL\Connection $db, WateringPublisher $publisher, string $host, int $port, float $subackTimeout): WateringMonitorRunner
+function newRunner(EntityManagerInterface $em, WateringPublisher $publisher, string $host, int $port, float $subackTimeout): WateringMonitorRunner
 {
-    $watering = new WateringManager($db, $publisher, true, 'dev');
+    $watering = newTestManager($em, $publisher);
 
     return new WateringMonitorRunner($watering, $publisher, new NullLogger(), $host, $port, 'test', 'test', $subackTimeout);
 }
@@ -285,8 +287,8 @@ function heartbeatAt(Doctrine\DBAL\Connection $db): ?string
 
 function resetControl(Doctrine\DBAL\Connection $db): void
 {
-    $db->executeStatement('DELETE FROM watering_run');
-    $db->executeStatement('UPDATE watering_control SET active_run_id = NULL, last_request_at = NULL, monitor_seen_at = NULL WHERE id = 1');
+    clearWateringRuns($db);
+    $db->executeStatement('UPDATE watering_control SET monitor_seen_at = NULL WHERE id = 1');
 }
 
 // -------------------------------------------------------------------------
@@ -337,12 +339,13 @@ function scenario_withheld_puback(): void
     echo "PASS withheld-puback: publish() detects a PUBACK that never arrives and throws\n";
 }
 
-function scenario_missing_suback(Doctrine\DBAL\Connection $db): void
+function scenario_missing_suback(EntityManagerInterface $em): void
 {
+    $db = $em->getConnection();
     resetControl($db);
     $handle = spawnBrokerStub('missing-suback', 11902);
     try {
-        $runner = newRunner($db, new FakePublisher(), STUB_HOST, 11902, 1.0);
+        $runner = newRunner($em, new FakePublisher(), STUB_HOST, 11902, 1.0);
         $threw = false;
         try {
             $runner->runConnectionAttempt(static fn (): bool => false);
@@ -358,12 +361,13 @@ function scenario_missing_suback(Doctrine\DBAL\Connection $db): void
     echo "PASS missing-suback: heartbeat never starts without a confirmed SUBACK\n";
 }
 
-function scenario_rejected_suback(Doctrine\DBAL\Connection $db): void
+function scenario_rejected_suback(EntityManagerInterface $em): void
 {
+    $db = $em->getConnection();
     resetControl($db);
     $handle = spawnBrokerStub('rejected-suback', 11903);
     try {
-        $runner = newRunner($db, new FakePublisher(), STUB_HOST, 11903, 1.0);
+        $runner = newRunner($em, new FakePublisher(), STUB_HOST, 11903, 1.0);
         $threw = false;
         try {
             $runner->runConnectionAttempt(static fn (): bool => false);
@@ -384,10 +388,11 @@ function scenario_rejected_suback(Doctrine\DBAL\Connection $db): void
     echo "PASS rejected-suback: heartbeat never starts on a rejected SUBACK\n";
 }
 
-function scenario_suback_starts_and_invalidates_heartbeat(Doctrine\DBAL\Connection $db): void
+function scenario_suback_starts_and_invalidates_heartbeat(EntityManagerInterface $em): void
 {
+    $db = $em->getConnection();
     resetControl($db);
-    $runner = newRunner($db, new FakePublisher(), MOSQUITTO_HOST, MOSQUITTO_PORT, 5.0);
+    $runner = newRunner($em, new FakePublisher(), MOSQUITTO_HOST, MOSQUITTO_PORT, 5.0);
     $calls = 0;
     $duringLoopHeartbeat = null;
     $runner->runConnectionAttempt(function () use (&$calls, &$duringLoopHeartbeat, $db): bool {
@@ -404,13 +409,14 @@ function scenario_suback_starts_and_invalidates_heartbeat(Doctrine\DBAL\Connecti
     echo "PASS suback-starts-heartbeat: heartbeat starts only after SUBACK and is invalidated on disconnect\n";
 }
 
-function scenario_reconnect_resumes_heartbeat(Doctrine\DBAL\Connection $db): void
+function scenario_reconnect_resumes_heartbeat(EntityManagerInterface $em): void
 {
+    $db = $em->getConnection();
     resetControl($db);
     $publisher = new FakePublisher();
     $handle = spawnBrokerStub('missing-suback', 11904);
     try {
-        $failingRunner = newRunner($db, $publisher, STUB_HOST, 11904, 1.0);
+        $failingRunner = newRunner($em, $publisher, STUB_HOST, 11904, 1.0);
         $threw = false;
         try {
             $failingRunner->runConnectionAttempt(static fn (): bool => false);
@@ -423,7 +429,7 @@ function scenario_reconnect_resumes_heartbeat(Doctrine\DBAL\Connection $db): voi
         stopBrokerStub($handle);
     }
 
-    $recoveredRunner = newRunner($db, $publisher, MOSQUITTO_HOST, MOSQUITTO_PORT, 5.0);
+    $recoveredRunner = newRunner($em, $publisher, MOSQUITTO_HOST, MOSQUITTO_PORT, 5.0);
     $calls = 0;
     $duringLoopHeartbeat = null;
     $recoveredRunner->runConnectionAttempt(function () use (&$calls, &$duringLoopHeartbeat, $db): bool {
@@ -439,37 +445,43 @@ function scenario_reconnect_resumes_heartbeat(Doctrine\DBAL\Connection $db): voi
     echo "PASS reconnect-resumes-heartbeat: a failed attempt never leaves a stale heartbeat, and a later successful attempt re-establishes it\n";
 }
 
-function scenario_callback_failure_during_suback(Doctrine\DBAL\Connection $db): void
+function scenario_callback_failure_during_suback(EntityManagerInterface $em): void
 {
+    $db = $em->getConnection();
     resetControl($db);
-    $db->executeStatement('UPDATE watering_control SET active_run_id = ?, monitor_seen_at = NOW() WHERE id = 1', ['missing-run']);
+    $db->executeStatement("INSERT INTO watering_run (id, requested_seconds, status, requested_at, deadline_at) VALUES (1, 3, 'pending', UTC_TIMESTAMP(), DATE_ADD(UTC_TIMESTAMP(), INTERVAL 1 HOUR))");
+    $db->executeStatement('UPDATE watering_control SET active_run_id = 1, monitor_seen_at = NOW() WHERE id = 1');
+    // Recording the ON report updates the run; make that write fail.
+    $db->executeStatement("CREATE TRIGGER fail_run_update BEFORE UPDATE ON watering_run FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Injected run update failure'");
     $publisher = new FakePublisher();
     $publisher->fail = true;
     $handle = spawnBrokerStub('callback-failure-during-suback', 11905);
     try {
-        $runner = newRunner($db, $publisher, STUB_HOST, 11905, 5.0);
+        $runner = newRunner($em, $publisher, STUB_HOST, 11905, 5.0);
         $threw = false;
         try {
             $runner->runConnectionAttempt(static fn (): bool => false);
-        } catch (RuntimeException $e) {
+        } catch (Throwable $e) {
             $threw = true;
-            check('Active watering run is missing.' === $e->getMessage(), 'Emergency OFF failure masked the processing error: '.$e->getMessage());
+            check(str_contains($e->getMessage(), 'Injected run update failure'), 'Emergency OFF failure masked the processing error: '.$e->getMessage());
         }
         check($threw, 'Callback failure during SUBACK was swallowed.');
         check([['state' => 'OFF']] === $publisher->commands, 'A later callback ran after the first failed.');
         check(null === heartbeatAt($db), 'Heartbeat survived a callback failure during subscription setup.');
     } finally {
+        $db->executeStatement('DROP TRIGGER IF EXISTS fail_run_update');
         stopBrokerStub($handle);
     }
     echo "PASS callback-failure-during-suback: first processing error survives failed OFF and clears heartbeat\n";
 }
 
-function scenario_callback_failure_after_heartbeat(Doctrine\DBAL\Connection $db): void
+function scenario_callback_failure_after_heartbeat(EntityManagerInterface $em): void
 {
+    $db = $em->getConnection();
     resetControl($db);
     $publisher = new FakePublisher();
     $publisher->fail = true;
-    $runner = newRunner($db, $publisher, MOSQUITTO_HOST, MOSQUITTO_PORT, 5.0);
+    $runner = newRunner($em, $publisher, MOSQUITTO_HOST, MOSQUITTO_PORT, 5.0);
     $sender = new MqttClient(MOSQUITTO_HOST, MOSQUITTO_PORT, 'callback-failure-sender');
     $sender->connect(new ConnectionSettings(), true);
     $calls = 0;
@@ -512,6 +524,21 @@ function scenario_callback_failure_after_heartbeat(Doctrine\DBAL\Connection $db)
     echo "PASS callback-failure-after-heartbeat: OFF error reconnects, invalidates heartbeat, and later attempt recovers\n";
 }
 
+function scenario_foreign_key_rejects_dangling_active_run(EntityManagerInterface $em): void
+{
+    $db = $em->getConnection();
+    resetControl($db);
+    $rejected = false;
+    try {
+        $db->executeStatement('UPDATE watering_control SET active_run_id = 987654 WHERE id = 1');
+    } catch (ForeignKeyConstraintViolationException) {
+        $rejected = true;
+    }
+    check($rejected, 'A dangling active_run_id was accepted.');
+    check(null === freshControl($em)->getActiveRun(), 'A rejected reference changed the control row.');
+    echo "PASS foreign-key: a control row cannot reference a missing run\n";
+}
+
 // -------------------------------------------------------------------------
 // Entry point
 // -------------------------------------------------------------------------
@@ -530,18 +557,17 @@ try {
     }
 
     $kernel = new Kernel('dev', true);
-    $kernel->boot();
-    $db = $kernel->getContainer()->get('doctrine')->getManager()->getConnection();
-    check('watering_control_test' === $db->getDatabase(), 'Refusing to use a non-test database.');
+    $em = bootTestEntityManager($kernel);
 
     scenario_successful_puback();
     scenario_withheld_puback();
-    scenario_missing_suback($db);
-    scenario_rejected_suback($db);
-    scenario_suback_starts_and_invalidates_heartbeat($db);
-    scenario_reconnect_resumes_heartbeat($db);
-    scenario_callback_failure_during_suback($db);
-    scenario_callback_failure_after_heartbeat($db);
+    scenario_missing_suback($em);
+    scenario_rejected_suback($em);
+    scenario_suback_starts_and_invalidates_heartbeat($em);
+    scenario_reconnect_resumes_heartbeat($em);
+    scenario_callback_failure_during_suback($em);
+    scenario_callback_failure_after_heartbeat($em);
+    scenario_foreign_key_rejects_dangling_active_run($em);
 
     echo "PASS watering MQTT acknowledgements: PUBACK detection and SUBACK-gated heartbeat lifecycle\n";
     $kernel->shutdown();

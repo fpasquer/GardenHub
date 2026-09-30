@@ -255,6 +255,11 @@ nothing is published, and an already delivered message is edited to remove its
 buttons. Proposals created before the topic was recorded have no topic and can
 never be approved.
 
+The migration that turns watering run and proposal ids into integers deletes
+every existing proposal and its prompt counters, because buttons already sent
+to Telegram carry the old UUID. Those buttons do nothing afterwards; a still-dry
+sensor is prompted again. Watering runs are kept.
+
 One initial prompt and at most one reminder 24 hours later are allowed during
 the same dry episode for each actuator topic, including after rejection or
 expiry, so an invalidated simulator proposal does not consume the physical

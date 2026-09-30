@@ -4,15 +4,13 @@ declare(strict_types=1);
 
 use App\Kernel;
 use App\Watering\MqttWateringPublisher;
-use App\Watering\ProposalBot;
-use App\Watering\ProposalPolicy;
+use App\Entity\WateringProposal;
 use App\Watering\TelegramGateway;
-use App\Watering\WateringManager;
 use App\Watering\WateringPublisher;
-use Doctrine\DBAL\Connection;
 use Symfony\Component\Uid\Uuid;
 
 require '/app/vendor/autoload.php';
+require __DIR__.'/support.php';
 
 const SIM_TOPIC = MqttWateringPublisher::DEFAULT_TOPIC;
 const HW_TOPIC = 'zigbee2mqtt/avocado-watering';
@@ -36,27 +34,24 @@ final class ProposalFakeTelegram implements TelegramGateway
     public array $acks = [];
     public array $edits = [];
     public array $queue = [];
-    public function send(string $text, string $proposalId): int { $this->sent[] = [$text, $proposalId]; return count($this->sent); }
+    public function send(string $text, int $proposalId): int { $this->sent[] = [$text, $proposalId]; return count($this->sent); }
     public function updates(int $offset): array { return array_values(array_filter($this->queue, static fn (array $u): bool => $u['update_id'] >= $offset)); }
     public function acknowledge(string $callbackId): void { $this->acks[] = $callbackId; }
     public function edit(int $messageId, string $text): void { $this->edits[] = [$messageId, $text]; }
 }
 
 function ok(bool $yes, string $message): void { if (!$yes) { throw new RuntimeException($message); } }
-function callback(int $updateId, string $proposalId, int $user = 123, int $chat = 456, string $type = 'private', string $action = 'a'): array
+function callback(int $updateId, int $proposalId, int $user = 123, int $chat = 456, string $type = 'private', string $action = 'a'): array
 {
     return ['update_id' => $updateId, 'callback_query' => ['id' => 'cb'.$updateId, 'from' => ['id' => $user], 'message' => ['chat' => ['id' => $chat, 'type' => $type]], 'data' => 'w:'.$action.':'.$proposalId]];
 }
 
 $kernel = new Kernel('dev', true);
-$kernel->boot();
-/** @var Connection $db */
-$db = $kernel->getContainer()->get('doctrine')->getManager()->getConnection();
-ok($db->getDatabase() === 'watering_control_test', 'Unexpected database');
-$db->executeStatement('DELETE FROM watering_proposal');
+$em = bootTestEntityManager($kernel);
+$db = $em->getConnection();
+clearWateringRuns($db);
 $db->executeStatement('DELETE FROM watering_proposal_state');
-$db->executeStatement('DELETE FROM watering_run');
-$db->executeStatement('UPDATE watering_control SET active_run_id = NULL, last_request_at = NULL, monitor_seen_at = UTC_TIMESTAMP() WHERE id = 1');
+$db->executeStatement('UPDATE watering_control SET monitor_seen_at = UTC_TIMESTAMP() WHERE id = 1');
 $db->executeStatement('UPDATE watering_telegram_progress SET next_update_id = 0 WHERE id = 1');
 $db->insert('device', ['name' => 'SE01-Avocado', 'created_at' => gmdate('Y-m-d H:i:s')]);
 $deviceId = (int) $db->lastInsertId();
@@ -66,66 +61,66 @@ $insert = static function (float $value, int $ageMinutes) use ($db, $sensorId): 
     $db->insert('measurement', ['sensor_id' => $sensorId, 'value' => $value, 'type' => 'soil_moisture', 'deduplication_id' => (string) Uuid::v4(), 'measured_at' => gmdate('Y-m-d H:i:s', time() - $ageMinutes * 60), 'created_at' => gmdate('Y-m-d H:i:s')]);
 };
 $publisher = new ProposalFakePublisher();
-$watering = new WateringManager($db, $publisher, true, 'dev');
+$watering = newTestManager($em, $publisher);
 $invalidDurationRejected = false;
 try {
-    new ProposalPolicy($db, $watering, 15, 35, 35, 30, 67, SIM_TOPIC);
+    newTestPolicy($em, $watering, SIM_TOPIC, 67);
 } catch (LogicException) {
     $invalidDurationRejected = true;
 }
 ok($invalidDurationRejected, 'Proposal duration may exceed the configured per-run safety limit');
-new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev', 67, 134, 1800), 15, 35, 35, 30, 67, SIM_TOPIC);
-$policy = new ProposalPolicy($db, $watering, 15, 35, 35, 30, 3, SIM_TOPIC);
+newTestPolicy($em, newTestManager($em, $publisher, true, 'dev', 67, 134, 1800), SIM_TOPIC, 67);
+$policy = newTestPolicy($em, $watering, SIM_TOPIC);
 $telegram = new ProposalFakeTelegram();
-$bot = new ProposalBot($db, $policy, $telegram, '123', '456');
+$bot = newTestBot($em, $policy, $telegram);
 
 $insert(14, 40);
 $insert(14, 20);
 ok($policy->evaluate() === null, 'Two readings triggered');
 $insert(14, 0);
 $p = $policy->evaluate();
-ok(is_array($p), 'Three fresh consecutive readings did not trigger');
-ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'new', 'Proposal was not persisted before notification');
+ok($p instanceof WateringProposal, 'Three fresh consecutive readings did not trigger');
+ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p->getId()]) === 'new', 'Proposal was not persisted before notification');
 // Restart with the same actuator after evaluate() committed but before the Telegram claim.
-$restartedPolicy = new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev'), 15, 35, 35, 30, 3, SIM_TOPIC);
-$restartedBot = new ProposalBot($db, $restartedPolicy, $telegram, '123', '456');
+$restartedPolicy = newTestPolicy($em, newTestManager($em, $publisher), SIM_TOPIC);
+$restartedBot = newTestBot($em, $restartedPolicy, $telegram);
 $restartedBot->evaluateAndNotify();
-ok(count($telegram->sent) === 1 && $telegram->sent[0][1] === $p['id'], 'Restart did not send the persisted proposal exactly once');
+ok(count($telegram->sent) === 1 && $telegram->sent[0][1] === $p->getId(), 'Restart did not send the persisted proposal exactly once');
 ok(str_contains($telegram->sent[0][0], 'Actuator: configured MQTT actuator ('.SIM_TOPIC.')') && !str_contains($telegram->sent[0][0], 'physical pump'), 'Restarted text does not use the proposal\'s stored topic');
-ok($p['actuator_topic'] === SIM_TOPIC, 'Proposal did not persist its actuator topic');
-ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'sent', 'Recovered notification was not recorded');
+ok($p->getActuatorTopic() === SIM_TOPIC, 'Proposal did not persist its actuator topic');
+ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$p->getId()]) === 'sent', 'Recovered notification was not recorded');
 $restartedBot->evaluateAndNotify();
 ok(count($telegram->sent) === 1, 'Replay resent a recorded notification');
 ok($policy->evaluate() === null, 'Duplicate proposal created');
-ok(!$policy->claimNotification($p['id']), 'Recorded notification was claimed again');
-ok(count(json_decode($p['readings_json'], true)) === 3, 'Snapshot must contain three values');
+ok(!$policy->claimNotification($p->getId()), 'Recorded notification was claimed again');
+ok(count($p->getReadingsJson()) === 3, 'Snapshot must contain three values');
 
-$bot->process(callback(1, $p['id'], 999));
-$bot->process(callback(2, $p['id'], 123, 999));
-$bot->process(callback(3, $p['id'], 123, 456, 'group'));
-ok($db->fetchOne('SELECT status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'pending', 'Unauthorized callback changed proposal');
+$bot->process(callback(1, $p->getId(), 999));
+$bot->process(callback(2, $p->getId(), 123, 999));
+$bot->process(callback(3, $p->getId(), 123, 456, 'group'));
+ok($db->fetchOne('SELECT status FROM watering_proposal WHERE id = ?', [$p->getId()]) === 'pending', 'Unauthorized callback changed proposal');
 ok(count($telegram->acks) === 3, 'Unauthorized callbacks were not acknowledged');
-$bot->process(callback(4, $p['id'], 123, 456, 'private', 'r'));
-$bot->process(callback(4, $p['id'], 123, 456, 'private', 'a'));
-ok($db->fetchOne('SELECT status FROM watering_proposal WHERE id = ?', [$p['id']]) === 'rejected' && $publisher->calls === 0, 'Reject/replay started watering');
+$bot->process(callback(4, $p->getId(), 123, 456, 'private', 'r'));
+$bot->process(callback(4, $p->getId(), 123, 456, 'private', 'a'));
+ok($db->fetchOne('SELECT status FROM watering_proposal WHERE id = ?', [$p->getId()]) === 'rejected' && $publisher->calls === 0, 'Reject/replay started watering');
 $bot->reconcileMessages();
 ok(count($telegram->edits) === 1, 'Final message was not edited');
 ok($policy->evaluate() === null, 'Rejection prompted again immediately');
 $db->executeStatement('UPDATE watering_proposal_state SET last_prompt_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY) WHERE device_id = ?', [$deviceId]);
 $reminder = $policy->evaluate();
-ok(is_array($reminder), 'Bounded reminder missing');
+ok($reminder instanceof WateringProposal, 'Bounded reminder missing');
 ok($policy->evaluate() === null, 'Duplicate reminder created');
-ok($policy->claimNotification($reminder['id']), 'Reminder notification claim failed');
-$telegram->send('fixture', $reminder['id']); // Telegram may receive it before the process records the message ID.
+ok($policy->claimNotification($reminder->getId()), 'Reminder notification claim failed');
+$telegram->send('fixture', $reminder->getId()); // Telegram may receive it before the process records the message ID.
 $sentBeforeRestart = count($telegram->sent);
-(new ProposalBot($db, $restartedPolicy, $telegram, '123', '456'))->evaluateAndNotify();
+(newTestBot($em, $restartedPolicy, $telegram))->evaluateAndNotify();
 ok(count($telegram->sent) === $sentBeforeRestart, 'Restart resent a possibly successful notification');
-ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$reminder['id']]) === 'sending', 'Restart changed an in-flight notification');
-$policy->notificationUncertain($reminder['id']);
-(new ProposalBot($db, $restartedPolicy, $telegram, '123', '456'))->evaluateAndNotify();
+ok($db->fetchOne('SELECT notification_status FROM watering_proposal WHERE id = ?', [$reminder->getId()]) === 'sending', 'Restart changed an in-flight notification');
+$policy->notificationUncertain($reminder->getId());
+(newTestBot($em, $restartedPolicy, $telegram))->evaluateAndNotify();
 ok(count($telegram->sent) === $sentBeforeRestart, 'Restart resent an uncertain notification');
-$db->executeStatement("UPDATE watering_proposal SET expires_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 SECOND) WHERE id = ?", [$reminder['id']]);
-ok($policy->decide($reminder['id'], 'approve') === 'expired', 'Expired proposal approved');
+$db->executeStatement("UPDATE watering_proposal SET expires_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 SECOND) WHERE id = ?", [$reminder->getId()]);
+ok($policy->decide($reminder->getId(), 'approve') === 'expired', 'Expired proposal approved');
 ok($policy->evaluate() === null, 'More than one reminder prompted');
 
 $insert(18, 0);
@@ -141,13 +136,13 @@ $insert(14, 40);
 $insert(14, 20);
 $insert(14, 0);
 $fresh = $policy->evaluate();
-ok(is_array($fresh), 'Recovery did not begin a new dry episode');
-$db->executeStatement("UPDATE watering_proposal SET expires_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE) WHERE id = ?", [$fresh['id']]);
+ok($fresh instanceof WateringProposal, 'Recovery did not begin a new dry episode');
+$db->executeStatement("UPDATE watering_proposal SET expires_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE) WHERE id = ?", [$fresh->getId()]);
 
-$bot->process(callback(5, $fresh['id']));
-ok($db->fetchOne('SELECT status FROM watering_proposal WHERE id = ?', [$fresh['id']]) === 'approved', 'Approval failed');
+$bot->process(callback(5, $fresh->getId()));
+ok($db->fetchOne('SELECT status FROM watering_proposal WHERE id = ?', [$fresh->getId()]) === 'approved', 'Approval failed');
 ok($publisher->calls === 1 && (int) $db->fetchOne('SELECT COUNT(*) FROM watering_run') === 1, 'Approval did not reserve exactly one run');
-$bot->process(callback(6, $fresh['id']));
+$bot->process(callback(6, $fresh->getId()));
 ok($publisher->calls === 1, 'Replayed approval started another run');
 
 // At exactly 24 hours the attempt is eligible; one second inside is not.
@@ -160,15 +155,15 @@ $insert(14, 40);
 $insert(14, 20);
 $insert(14, 0);
 $boundary = $policy->evaluate();
-ok(is_array($boundary), '24-hour boundary rejected');
+ok($boundary instanceof WateringProposal, '24-hour boundary rejected');
 $db->executeStatement('UPDATE watering_run SET requested_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 23 HOUR)');
-ok($policy->decide($boundary['id'], 'approve') === 'failed', 'Recent attempt did not block approval');
+ok($policy->decide($boundary->getId(), 'approve') === 'failed', 'Recent attempt did not block approval');
 
 // The DB claim survives a crash before request(): restart records uncertainty.
-$db->executeStatement("UPDATE watering_proposal SET status = 'executing' WHERE id = ?", [$boundary['id']]);
+$db->executeStatement("UPDATE watering_proposal SET status = 'executing' WHERE id = ?", [$boundary->getId()]);
 $policy->expire();
-ok($db->fetchOne('SELECT status FROM watering_proposal WHERE id = ?', [$boundary['id']]) === 'uncertain', 'Restart did not close interrupted execution');
-ok($policy->decide($boundary['id'], 'approve') === 'ignored', 'Interrupted approval was retried');
+ok($db->fetchOne('SELECT status FROM watering_proposal WHERE id = ?', [$boundary->getId()]) === 'uncertain', 'Restart did not close interrupted execution');
+ok($policy->decide($boundary->getId(), 'approve') === 'ignored', 'Interrupted approval was retried');
 
 // Two independent PHP processes race on the same proposal row. Exactly one
 // may reserve a run; the other must observe the durable claim.
@@ -181,11 +176,11 @@ $insert(14, 40);
 $insert(14, 20);
 $insert(14, 0);
 $race = $policy->evaluate();
-ok(is_array($race), 'Concurrency fixture missing proposal');
+ok($race instanceof WateringProposal, 'Concurrency fixture missing proposal');
 $before = (int) $db->fetchOne('SELECT COUNT(*) FROM watering_run');
 $children = [];
 for ($i = 0; $i < 2; ++$i) {
-    $process = proc_open(['php', '/tests/proposal-approve-child.php', $race['id']], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    $process = proc_open(['php', '/tests/proposal-approve-child.php', (string) $race->getId()], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
     ok(is_resource($process), 'Could not launch approval worker');
     $children[] = [$process, $pipes];
 }
@@ -213,39 +208,39 @@ ok($policy->evaluate() === null, 'Unreasonable gap triggered');
 $db->executeStatement('DELETE FROM measurement WHERE sensor_id = ?', [$sensorId]);
 $insert(14, 40); $insert(14, 20); $insert(14, 0);
 $failed = $policy->evaluate();
-ok(is_array($failed), 'Failure fixture missing proposal');
+ok($failed instanceof WateringProposal, 'Failure fixture missing proposal');
 $publisher->fail = true;
-ok($policy->decide($failed['id'], 'approve') === 'uncertain', 'Failed publish was not uncertain');
+ok($policy->decide($failed->getId(), 'approve') === 'uncertain', 'Failed publish was not uncertain');
 ok($db->fetchOne("SELECT status FROM watering_run ORDER BY requested_at DESC, id DESC LIMIT 1") === 'uncertain', 'Failed publish did not retain uncertain run');
-ok($policy->decide($failed['id'], 'approve') === 'ignored', 'Failed approval was retried');
+ok($policy->decide($failed->getId(), 'approve') === 'ignored', 'Failed approval was retried');
 
 // The offset is durable across a new bot instance. Reprocessing after a crash
 // before saving it is also safe because the decision is already terminal.
-$telegram->queue[] = callback(20, $failed['id']);
+$telegram->queue[] = callback(20, $failed->getId());
 $bot->pollOnce();
 ok((int) $db->fetchOne('SELECT next_update_id FROM watering_telegram_progress WHERE id = 1') === 21, 'Polling offset was not persisted');
 $acks = count($telegram->acks);
-(new ProposalBot($db, $policy, $telegram, '123', '456'))->pollOnce();
+(newTestBot($em, $policy, $telegram))->pollOnce();
 ok(count($telegram->acks) === $acks, 'Restart redelivered an acknowledged update');
 
 // Actuator switching: a proposal is bound to the topic it was created for.
 $resetFixture = static function () use ($db, $sensorId, $insert, $publisher): void {
     $db->executeStatement('DELETE FROM watering_proposal');
+    clearWateringRuns($db);
     $db->executeStatement('DELETE FROM watering_proposal_state');
-    $db->executeStatement('DELETE FROM watering_run');
     $db->executeStatement('DELETE FROM measurement WHERE sensor_id = ?', [$sensorId]);
-    $db->executeStatement('UPDATE watering_control SET active_run_id = NULL, last_request_at = NULL, monitor_seen_at = UTC_TIMESTAMP() WHERE id = 1');
+    $db->executeStatement('UPDATE watering_control SET monitor_seen_at = UTC_TIMESTAMP() WHERE id = 1');
     $publisher->fail = false;
     $publisher->calls = 0;
     $insert(14, 40);
     $insert(14, 20);
     $insert(14, 0);
 };
-$stackFor = static function (string $topic, ProposalFakeTelegram $gateway) use ($db, $publisher): array {
-    $stackPolicy = new ProposalPolicy($db, new WateringManager($db, $publisher, true, 'dev'), 15, 35, 35, 30, 3, $topic);
-    return [$stackPolicy, new ProposalBot($db, $stackPolicy, $gateway, '123', '456')];
+$stackFor = static function (string $topic, ProposalFakeTelegram $gateway) use ($em, $publisher): array {
+    $stackPolicy = newTestPolicy($em, newTestManager($em, $publisher), $topic);
+    return [$stackPolicy, newTestBot($em, $stackPolicy, $gateway)];
 };
-$column = static fn (string $name, string $id): mixed => $db->fetchOne('SELECT '.$name.' FROM watering_proposal WHERE id = ?', [$id]);
+$column = static fn (string $name, int $id): mixed => $db->fetchOne('SELECT '.$name.' FROM watering_proposal WHERE id = ?', [$id]);
 $runs = static fn (): int => (int) $db->fetchOne('SELECT COUNT(*) FROM watering_run');
 
 // A simulator proposal waiting to be sent must never be sent once the hardware topic is configured.
@@ -254,15 +249,15 @@ $waiting = new ProposalFakeTelegram();
 [$simPolicy] = $stackFor(SIM_TOPIC, $waiting);
 [$hwPolicy, $hwBot] = $stackFor(HW_TOPIC, $waiting);
 $old = $simPolicy->evaluate();
-ok(is_array($old) && $old['actuator_topic'] === SIM_TOPIC, 'Simulator proposal did not record its topic');
+ok($old instanceof WateringProposal && $old->getActuatorTopic() === SIM_TOPIC, 'Simulator proposal did not record its topic');
 $hwBot->evaluateAndNotify();
-ok($column('status', $old['id']) === 'invalidated' && $column('failure', $old['id']) === 'Actuator changed', 'Waiting simulator proposal survived the actuator switch');
-ok($column('notification_status', $old['id']) === 'new' && $column('message_id', $old['id']) === null, 'Waiting simulator proposal was notified after the switch');
-ok(count($waiting->sent) === 1 && $waiting->sent[0][1] !== $old['id'], 'Only the hardware proposal may be sent');
+ok($column('status', $old->getId()) === 'invalidated' && $column('failure', $old->getId()) === 'Actuator changed', 'Waiting simulator proposal survived the actuator switch');
+ok($column('notification_status', $old->getId()) === 'new' && $column('message_id', $old->getId()) === null, 'Waiting simulator proposal was notified after the switch');
+ok(count($waiting->sent) === 1 && $waiting->sent[0][1] !== $old->getId(), 'Only the hardware proposal may be sent');
 $hardwareId = $waiting->sent[0][1];
 ok($column('actuator_topic', $hardwareId) === HW_TOPIC, 'Hardware proposal did not persist the physical topic');
 ok(str_contains($waiting->sent[0][0], 'Actuator: physical pump ('.HW_TOPIC.')') && !str_contains($waiting->sent[0][0], SIM_TOPIC), 'Hardware proposal text does not name the physical topic');
-ok($hwPolicy->decide($old['id'], 'approve') === 'ignored' && $publisher->calls === 0 && $runs() === 0, 'Invalidated waiting proposal was approved');
+ok($hwPolicy->decide($old->getId(), 'approve') === 'ignored' && $publisher->calls === 0 && $runs() === 0, 'Invalidated waiting proposal was approved');
 $hwBot->process(callback(100, $hardwareId));
 ok($column('status', $hardwareId) === 'approved' && $publisher->calls === 1 && $runs() === 1, 'Hardware proposal did not follow the normal approval flow');
 
@@ -294,15 +289,15 @@ ok($counts === [SIM_TOPIC => 1, HW_TOPIC => 1], 'Prompt counters are not tracked
 $resetFixture();
 [$simPolicy] = $stackFor(SIM_TOPIC, new ProposalFakeTelegram());
 [$hwPolicy] = $stackFor(HW_TOPIC, new ProposalFakeTelegram());
-ok(is_array($simPolicy->evaluate()), 'Simulator initial prompt missing');
+ok($simPolicy->evaluate() instanceof WateringProposal, 'Simulator initial prompt missing');
 $hwFirst = $hwPolicy->evaluate();
-ok(is_array($hwFirst), 'Invalidated simulator proposal consumed the hardware prompt');
-ok($hwPolicy->decide($hwFirst['id'], 'reject') === 'rejected' && $hwPolicy->evaluate() === null, 'Hardware prompt repeated immediately');
+ok($hwFirst instanceof WateringProposal, 'Invalidated simulator proposal consumed the hardware prompt');
+ok($hwPolicy->decide($hwFirst->getId(), 'reject') === 'rejected' && $hwPolicy->evaluate() === null, 'Hardware prompt repeated immediately');
 $ageHardwarePrompt = static fn () => $db->executeStatement('UPDATE watering_proposal_state SET last_prompt_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY) WHERE actuator_topic = ?', [HW_TOPIC]);
 $ageHardwarePrompt();
 $hwReminder = $hwPolicy->evaluate();
-ok(is_array($hwReminder), 'Hardware reminder missing');
-ok($hwPolicy->decide($hwReminder['id'], 'reject') === 'rejected', 'Hardware reminder was not decided');
+ok($hwReminder instanceof WateringProposal, 'Hardware reminder missing');
+ok($hwPolicy->decide($hwReminder->getId(), 'reject') === 'rejected', 'Hardware reminder was not decided');
 $ageHardwarePrompt();
 ok($hwPolicy->evaluate() === null, 'Hardware exceeded one initial prompt and one reminder');
 ok((int) $db->fetchOne('SELECT prompt_count FROM watering_proposal_state WHERE actuator_topic = ?', [SIM_TOPIC]) === 1, 'Hardware prompts changed the simulator counter');
@@ -311,15 +306,14 @@ ok((int) $db->fetchOne('SELECT prompt_count FROM watering_proposal_state WHERE a
 $resetFixture();
 $legacy = new ProposalFakeTelegram();
 [$hwPolicy, $hwBot] = $stackFor(HW_TOPIC, $legacy);
-$legacyRow = static function (string $notification, ?int $messageId) use ($db, $deviceId): string {
-    $id = (string) Uuid::v4();
+$legacyRow = static function (string $notification, ?int $messageId) use ($db, $deviceId): int {
     $db->insert('watering_proposal', [
-        'id' => $id, 'device_id' => $deviceId, 'status' => 'pending', 'created_at' => gmdate('Y-m-d H:i:s'),
+        'device_id' => $deviceId, 'status' => 'pending', 'created_at' => gmdate('Y-m-d H:i:s'),
         'expires_at' => gmdate('Y-m-d H:i:s', time() + 1800), 'duration_seconds' => 3,
         'readings_json' => json_encode([['value' => 14.0, 'measured_at' => gmdate('Y-m-d H:i:s')]], JSON_THROW_ON_ERROR),
         'notification_status' => $notification, 'message_id' => $messageId,
     ]);
-    return $id;
+    return (int) $db->lastInsertId();
 };
 $sentLegacy = $legacyRow('sent', 77);
 $unsentLegacy = $legacyRow('new', null);

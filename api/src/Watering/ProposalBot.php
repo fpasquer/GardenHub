@@ -4,12 +4,13 @@ declare(strict_types=1);
 
 namespace App\Watering;
 
-use Doctrine\DBAL\Connection;
+use App\Entity\WateringProposal;
+use App\Repository\WateringTelegramProgressRepository;
 
 final class ProposalBot
 {
     public function __construct(
-        private readonly Connection $db,
+        private readonly WateringTelegramProgressRepository $progress,
         private readonly ProposalPolicy $policy,
         private readonly TelegramGateway $telegram,
         private readonly string $expectedUserId,
@@ -21,15 +22,16 @@ final class ProposalBot
     {
         $this->policy->evaluate();
         foreach ($this->policy->newNotifications() as $proposal) {
-            if (!$this->policy->claimNotification($proposal['id'])) {
+            $proposalId = (int) $proposal->getId();
+            if (!$this->policy->claimNotification($proposalId)) {
                 continue;
             }
             try {
-                $id = $this->telegram->send($this->text($proposal), $proposal['id']);
-                $this->policy->recordMessage($proposal['id'], $id);
+                $id = $this->telegram->send($this->text($proposal), $proposalId);
+                $this->policy->recordMessage($proposalId, $id);
             } catch (\Throwable) {
                 // Send may have succeeded before a timeout/crash. Never resend this episode.
-                $this->policy->notificationUncertain($proposal['id']);
+                $this->policy->notificationUncertain($proposalId);
             }
         }
     }
@@ -43,8 +45,8 @@ final class ProposalBot
         $from = $callback['from']['id'] ?? null;
         $chat = $callback['message']['chat'] ?? null;
         $data = $callback['data'] ?? null;
-        if ((string) $from === $this->expectedUserId && (string) ($chat['id'] ?? '') === $this->expectedChatId && ($chat['type'] ?? null) === 'private' && is_string($data) && preg_match('/^w:([ar]):([0-9a-f-]{36})$/D', $data, $m)) {
-            $this->policy->decide($m[2], $m[1] === 'a' ? 'approve' : 'reject');
+        if ((string) $from === $this->expectedUserId && (string) ($chat['id'] ?? '') === $this->expectedChatId && ($chat['type'] ?? null) === 'private' && is_string($data) && preg_match('/^w:([ar]):([0-9]{1,10})$/D', $data, $m)) {
+            $this->policy->decide((int) $m[2], $m[1] === 'a' ? 'approve' : 'reject');
         }
         // Even rejected and replayed callbacks are answered; a failed answer replays safely.
         $this->telegram->acknowledge($callback['id']);
@@ -53,7 +55,7 @@ final class ProposalBot
     /** Offset moves only after each callback has reached a durable decision and been acknowledged. */
     public function pollOnce(): void
     {
-        $offset = (int) $this->db->fetchOne('SELECT next_update_id FROM watering_telegram_progress WHERE id = 1');
+        $offset = $this->progress->getOffset();
         foreach ($this->telegram->updates($offset) as $update) {
             $id = $update['update_id'] ?? null;
             if (!is_int($id) || $id < $offset) {
@@ -61,7 +63,7 @@ final class ProposalBot
             }
             $this->process($update);
             $offset = $id + 1;
-            $this->db->executeStatement('UPDATE watering_telegram_progress SET next_update_id = ? WHERE id = 1 AND next_update_id < ?', [$offset, $offset]);
+            $this->progress->advanceTo($offset);
         }
     }
 
@@ -69,23 +71,43 @@ final class ProposalBot
     {
         foreach ($this->policy->finalMessages() as $p) {
             try {
-                $this->telegram->edit((int) $p['message_id'], $this->text($p)."\nDecision: ".$p['status'].($p['run_id'] ? ' (run '.$p['run_id'].')' : '').($p['failure'] ? ' — '.$p['failure'] : ''));
-                $this->policy->markMessageFinal($p['id']);
+                $this->telegram->edit((int) $p->getMessageId(), $this->finalText($p));
+                $this->policy->markMessageFinal((int) $p->getId());
             } catch (\Throwable) {
                 // Persisted decision stands. A later iteration retries the display update.
             }
         }
     }
 
-    private function text(array $p): string
+    private function finalText(WateringProposal $p): string
     {
-        $lines = ['GardenHub dev watering proposal', 'Device: '.$p['device_name'], 'Actuator: '.$this->actuatorLabel($p['actuator_topic'])];
-        foreach (json_decode($p['readings_json'], true, 512, JSON_THROW_ON_ERROR) as $r) {
-            $lines[] = $r['measured_at'].' UTC: '.$r['value'].'%';
+        $runId = $p->getRun()?->getId();
+        $failure = $p->getFailure();
+
+        return sprintf(
+            "%s\nDecision: %s%s%s",
+            $this->text($p),
+            $p->getStatus(),
+            $runId ? sprintf(' (run %d)', $runId) : '',
+            $failure ? sprintf(' — %s', $failure) : '',
+        );
+    }
+
+    private function text(WateringProposal $p): string
+    {
+        $lines = [
+            'GardenHub dev watering proposal',
+            sprintf('Device: %s', $p->getDevice()?->getName()),
+            sprintf('Actuator: %s', $this->actuatorLabel($p->getActuatorTopic())),
+        ];
+        foreach ($p->getReadingsJson() as $r) {
+            $lines[] = sprintf('%s UTC: %s%%', $r['measured_at'], $r['value']);
         }
-        $lines[] = 'Last watering attempt: '.($p['last_attempt_at'] ? $p['last_attempt_at'].' UTC' : 'none');
-        $lines[] = 'Proposed watering duration: '.$p['duration_seconds'].' seconds';
-        $lines[] = 'Expires: '.$p['expires_at'].' UTC';
+        $attempt = $p->getLastAttemptAt();
+        $lines[] = sprintf('Last watering attempt: %s', $attempt ? $attempt->format('Y-m-d H:i:s').' UTC' : 'none');
+        $lines[] = sprintf('Proposed watering duration: %d seconds', $p->getDurationSeconds());
+        $lines[] = sprintf('Expires: %s UTC', $p->getExpiresAt()?->format('Y-m-d H:i:s'));
+
         return implode("\n", $lines);
     }
 
@@ -95,6 +117,8 @@ final class ProposalBot
         if ($topic === null) {
             return 'not recorded (legacy proposal)';
         }
-        return (str_starts_with($topic, 'zigbee2mqtt/') ? 'physical pump' : 'configured MQTT actuator').' ('.$topic.')';
+        $kind = str_starts_with($topic, 'zigbee2mqtt/') ? 'physical pump' : 'configured MQTT actuator';
+
+        return sprintf('%s (%s)', $kind, $topic);
     }
 }

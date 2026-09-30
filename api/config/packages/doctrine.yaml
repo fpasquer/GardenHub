@@ -13,6 +13,10 @@ doctrine:
         identity_generation_preferences:
             Doctrine\DBAL\Platforms\PostgreSQLPlatform: identity
         auto_mapping: true
+        dql:
+            numeric_functions:
+                GET_LOCK: App\Doctrine\Query\GetLockFunction
+                RELEASE_LOCK: App\Doctrine\Query\ReleaseLockFunction
         mappings:
             App:
                 type: attribute

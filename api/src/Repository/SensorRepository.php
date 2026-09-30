@@ -4,6 +4,7 @@ namespace App\Repository;
 
 use App\Entity\Sensor;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Doctrine\DBAL\LockMode;
 use Doctrine\Persistence\ManagerRegistry;
 
 /**
@@ -44,18 +45,23 @@ class SensorRepository extends ServiceEntityRepository
      */
     private function fetchIdentity(int $id, bool $forUpdate): ?array
     {
-        $sql = 'SELECT device_id, type, unit FROM sensor WHERE id = ?';
+        $query = $this->getEntityManager()->createQueryBuilder()
+            ->select('IDENTITY(s.device) AS deviceId', 's.type AS type', 's.unit AS unit')
+            ->from(Sensor::class, 's')
+            ->where('s.id = :id')
+            ->setParameter('id', $id)
+            ->getQuery();
         if ($forUpdate) {
-            $sql .= ' FOR UPDATE';
+            $query->setLockMode(LockMode::PESSIMISTIC_WRITE);
         }
 
-        $row = $this->getEntityManager()->getConnection()->fetchAssociative($sql, [$id]);
-        if (false === $row) {
+        $row = $query->getOneOrNullResult();
+        if (null === $row) {
             return null;
         }
 
         return [
-            'device_id' => (int) $row['device_id'],
+            'device_id' => (int) $row['deviceId'],
             'type' => (string) $row['type'],
             'unit' => (string) $row['unit'],
         ];

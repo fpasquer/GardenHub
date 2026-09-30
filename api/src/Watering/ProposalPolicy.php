@@ -4,16 +4,31 @@ declare(strict_types=1);
 
 namespace App\Watering;
 
-use Doctrine\DBAL\Connection;
-use Symfony\Component\Uid\Uuid;
+use App\Entity\Device;
+use App\Entity\WateringProposal;
+use App\Entity\WateringProposalState;
+use App\Repository\DeviceRepository;
+use App\Repository\MeasurementRepository;
+use App\Repository\WateringProposalRepository;
+use App\Repository\WateringProposalStateRepository;
+use App\Repository\WateringRunRepository;
 
 /** The database owns the dry episode and decision; no sensor event directly starts watering. */
 final class ProposalPolicy
 {
     private const DEVICE_NAME = 'SE01-Avocado';
+    private const READINGS = 3;
+    private const DAY_SECONDS = 86400;
+    /** One initial prompt and one reminder per actuator, until a wet reading resets the episode. */
+    private const MAX_PROMPTS = 2;
 
     public function __construct(
-        private readonly Connection $db,
+        private readonly DeviceRepository $devices,
+        private readonly MeasurementRepository $measurements,
+        private readonly WateringRunRepository $runs,
+        private readonly WateringProposalRepository $proposals,
+        private readonly WateringProposalStateRepository $states,
+        private readonly TransactionRunner $runner,
         private readonly WateringManager $watering,
         private readonly float $threshold,
         private readonly int $freshnessMinutes,
@@ -28,193 +43,231 @@ final class ProposalPolicy
     }
 
     /** Returns a newly persisted proposal, or null. Serializes evaluation by device row. */
-    public function evaluate(): ?array
+    public function evaluate(): ?WateringProposal
     {
-        return $this->db->transactional(function (Connection $db): ?array {
-            $device = $db->fetchAssociative('SELECT id, name FROM device WHERE name = ? FOR UPDATE', [self::DEVICE_NAME]);
-            if (!$device) {
-                return null;
-            }
-            $deviceId = (int) $device['id'];
-            $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
-            $nowSql = $now->format('Y-m-d H:i:s');
-            $this->invalidateOutstanding($db, $deviceId, $nowSql);
-            $this->invalidateOtherActuators($db, $deviceId);
-            $readings = $this->readings($db, $deviceId);
-            if ($readings && (float) $readings[0]['value'] >= $this->threshold) {
-                $db->executeStatement('UPDATE watering_proposal_state SET prompt_count = 0, last_prompt_at = NULL WHERE device_id = ?', [$deviceId]);
-                $db->executeStatement("UPDATE watering_proposal SET status = 'invalidated', failure = 'Sensor recovered' WHERE device_id = ? AND status = 'pending'", [$deviceId]);
-                return null;
-            }
-            if (!$this->dryReadings($readings, $now)) {
-                return null;
-            }
-            $attempt = $this->latestAttempt($db);
-            if ($attempt !== null && strtotime($attempt.' UTC') > $now->getTimestamp() - 86400) {
-                $db->executeStatement("UPDATE watering_proposal SET status = 'invalidated', failure = 'Newer watering attempt' WHERE device_id = ? AND status = 'pending'", [$deviceId]);
-                return null;
-            }
-            if ($db->fetchOne("SELECT 1 FROM watering_proposal WHERE device_id = ? AND status = 'pending' LIMIT 1", [$deviceId])) {
-                return null;
-            }
-            $state = $this->lockPromptState($db, $deviceId);
-            // One initial prompt and one reminder at least 24 hours later per actuator, until a wet reading resets the episode.
-            if ((int) $state['prompt_count'] >= 2 || ((int) $state['prompt_count'] > 0 && strtotime($state['last_prompt_at'].' UTC') > $now->getTimestamp() - 86400)) {
-                return null;
-            }
-            return $this->createProposal($db, $deviceId, $now, $readings, $attempt, (int) $state['prompt_count']);
-        });
+        return $this->runner->run(fn (): ?WateringProposal => $this->evaluateLocked());
     }
 
-    private function lockPromptState(Connection $db, int $deviceId): array
+    public function claimNotification(int $id): bool
     {
-        $db->executeStatement('INSERT IGNORE INTO watering_proposal_state (device_id, actuator_topic, prompt_count) VALUES (?, ?, 0)', [$deviceId, $this->actuatorTopic]);
-        return $db->fetchAssociative('SELECT * FROM watering_proposal_state WHERE device_id = ? AND actuator_topic = ? FOR UPDATE', [$deviceId, $this->actuatorTopic]);
+        return WateringProposal::isValidId($id)
+            && $this->proposals->claimNotification($id, $this->actuatorTopic, UtcClock::now());
     }
 
-    private function createProposal(Connection $db, int $deviceId, \DateTimeImmutable $now, array $readings, ?string $attempt, int $promptCount): array
-    {
-        $id = (string) Uuid::v4();
-        $nowSql = $now->format('Y-m-d H:i:s');
-        $snapshot = array_reverse(array_map(static fn (array $r): array => ['value' => (float) $r['value'], 'measured_at' => $r['measured_at']], array_slice($readings, 0, 3)));
-        $db->insert('watering_proposal', [
-            'id' => $id, 'device_id' => $deviceId, 'status' => 'pending', 'created_at' => $nowSql,
-            'expires_at' => $now->modify('+'.$this->validityMinutes.' minutes')->format('Y-m-d H:i:s'),
-            'duration_seconds' => $this->durationSeconds, 'readings_json' => json_encode($snapshot, JSON_THROW_ON_ERROR),
-            'last_attempt_at' => $attempt, 'notification_status' => 'new', 'actuator_topic' => $this->actuatorTopic,
-        ]);
-        $db->update('watering_proposal_state', ['prompt_count' => $promptCount + 1, 'last_prompt_at' => $nowSql], ['device_id' => $deviceId, 'actuator_topic' => $this->actuatorTopic]);
-        return $db->fetchAssociative('SELECT p.*, d.name AS device_name FROM watering_proposal p JOIN device d ON d.id = p.device_id WHERE p.id = ?', [$id]);
-    }
-
-    public function claimNotification(string $id): bool
-    {
-        return 1 === $this->db->executeStatement("UPDATE watering_proposal SET notification_status = 'sending' WHERE id = ? AND status = 'pending' AND notification_status = 'new' AND expires_at > UTC_TIMESTAMP() AND actuator_topic = ?", [$id, $this->actuatorTopic]);
-    }
-
-    /** Only unclaimed, still actionable proposals may be sent after a restart. */
+    /**
+     * Only unclaimed, still actionable proposals may be sent after a restart.
+     *
+     * @return list<WateringProposal>
+     */
     public function newNotifications(): array
     {
-        return $this->db->fetchAllAssociative("SELECT p.*, d.name AS device_name FROM watering_proposal p JOIN device d ON d.id = p.device_id WHERE p.status = 'pending' AND p.notification_status = 'new' AND p.expires_at > UTC_TIMESTAMP() AND p.actuator_topic = ? ORDER BY p.created_at, p.id", [$this->actuatorTopic]);
+        return $this->proposals->newNotifications($this->actuatorTopic, UtcClock::now());
     }
 
-    public function recordMessage(string $id, int $messageId): void
+    public function recordMessage(int $id, int $messageId): void
     {
-        $this->db->executeStatement("UPDATE watering_proposal SET message_id = ?, notification_status = 'sent' WHERE id = ? AND notification_status = 'sending'", [$messageId, $id]);
+        if (WateringProposal::isValidId($id)) {
+            $this->proposals->recordMessage($id, $messageId);
+        }
     }
 
-    public function notificationUncertain(string $id): void
+    public function notificationUncertain(int $id): void
     {
-        $this->db->executeStatement("UPDATE watering_proposal SET notification_status = 'uncertain' WHERE id = ? AND notification_status = 'sending'", [$id]);
+        if (WateringProposal::isValidId($id)) {
+            $this->proposals->markNotificationUncertain($id);
+        }
     }
 
     /** Called only after exact user and private-chat authorization. */
-    public function decide(string $id, string $action): string
+    public function decide(int $id, string $action): string
     {
-        if (!Uuid::isValid($id) || !in_array($action, ['approve', 'reject'], true)) {
+        if (!WateringProposal::isValidId($id) || !in_array($action, ['approve', 'reject'], true)) {
             return 'ignored';
         }
-        $claimed = $this->claimDecision($id, $action);
-        if ($claimed !== 'executing') {
-            return $claimed;
-        }
-        try {
-            $duration = (int) $this->db->fetchOne('SELECT duration_seconds FROM watering_proposal WHERE id = ?', [$id]);
-            $runId = $this->watering->request($duration, function (Connection $db, \DateTimeImmutable $now) use ($id): void {
-                $p = $db->fetchAssociative('SELECT * FROM watering_proposal WHERE id = ?', [$id]);
-                if (!$p || $p['status'] !== 'executing' || $p['expires_at'] <= $now->format('Y-m-d H:i:s')) {
-                    throw new \DomainException('Proposal expired or changed.');
-                }
-                $readings = $this->readings($db, (int) $p['device_id']);
-                if (!$this->dryReadings($readings, $now)) {
-                    throw new \DomainException('Sensor readings no longer support watering.');
-                }
-                $attempt = $this->latestAttempt($db);
-                if ($attempt !== null && ($attempt > $p['created_at'] || strtotime($attempt.' UTC') > $now->getTimestamp() - 86400)) {
-                    throw new \DomainException('A newer or recent watering attempt exists.');
-                }
-            });
-            $this->db->update('watering_proposal', ['status' => 'approved', 'run_id' => $runId], ['id' => $id, 'status' => 'executing']);
-            return 'approved';
-        } catch (\DomainException|\LogicException $e) {
-            $this->db->update('watering_proposal', ['status' => 'failed', 'failure' => substr($e->getMessage(), 0, 255)], ['id' => $id, 'status' => 'executing']);
-            return 'failed';
-        } catch (\Throwable) {
-            // Includes DB or MQTT uncertainty. The manager's reservation, if any, remains blocked.
-            $this->db->update('watering_proposal', ['status' => 'uncertain', 'failure' => 'Execution outcome uncertain; manual review required'], ['id' => $id, 'status' => 'executing']);
-            return 'uncertain';
-        }
-    }
+        $claimed = $this->runner->run(fn (): string => $this->claimDecision($id, $action));
 
-    private function claimDecision(string $id, string $action): string
-    {
-        return $this->db->transactional(function (Connection $db) use ($id, $action): string {
-            $p = $db->fetchAssociative('SELECT * FROM watering_proposal WHERE id = ? FOR UPDATE', [$id]);
-            if (!$p || $p['status'] !== 'pending') {
-                return 'ignored';
-            }
-            $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
-            $nowSql = $now->format('Y-m-d H:i:s');
-            if ($p['expires_at'] <= $nowSql) {
-                $db->update('watering_proposal', ['status' => 'expired', 'decided_at' => $nowSql], ['id' => $id]);
-                return 'expired';
-            }
-            // Checked before any run is reserved; a legacy NULL topic never matches.
-            if ($p['actuator_topic'] !== $this->actuatorTopic) {
-                $db->update('watering_proposal', ['status' => 'invalidated', 'failure' => 'Actuator changed', 'decided_at' => $nowSql], ['id' => $id]);
-                return 'invalidated';
-            }
-            if ($action === 'reject') {
-                $db->update('watering_proposal', ['status' => 'rejected', 'decided_at' => $nowSql], ['id' => $id]);
-                return 'rejected';
-            }
-            // A committed claim is deliberately terminal after a crash. Never automatically reissue request().
-            $db->update('watering_proposal', ['status' => 'executing', 'decided_at' => $nowSql], ['id' => $id]);
-            return 'executing';
-        });
+        return 'executing' === $claimed ? $this->execute($id) : $claimed;
     }
 
     public function expire(): void
     {
-        $this->db->executeStatement("UPDATE watering_proposal SET status = 'expired' WHERE status = 'pending' AND expires_at <= UTC_TIMESTAMP()");
-        $this->db->executeStatement("UPDATE watering_proposal SET status = 'uncertain', failure = 'Interrupted execution; manual review required' WHERE status = 'executing'");
+        $this->proposals->expireDue(UtcClock::now());
+        $this->proposals->interruptExecuting();
     }
 
+    /** @return list<WateringProposal> */
     public function finalMessages(): array
     {
-        return $this->db->fetchAllAssociative("SELECT p.*, d.name AS device_name FROM watering_proposal p JOIN device d ON d.id = p.device_id WHERE p.message_id IS NOT NULL AND p.notification_status = 'sent' AND p.status NOT IN ('pending', 'executing') ORDER BY p.created_at");
+        return $this->proposals->finalMessages();
     }
 
-    public function markMessageFinal(string $id): void
+    public function markMessageFinal(int $id): void
     {
-        $this->db->executeStatement("UPDATE watering_proposal SET notification_status = 'final' WHERE id = ? AND notification_status = 'sent'", [$id]);
+        if (WateringProposal::isValidId($id)) {
+            $this->proposals->markFinal($id);
+        }
     }
 
-    private function invalidateOutstanding(Connection $db, int $deviceId, string $now): void
+    private function evaluateLocked(): ?WateringProposal
     {
-        $db->executeStatement("UPDATE watering_proposal SET status = 'expired' WHERE device_id = ? AND status = 'pending' AND expires_at <= ?", [$deviceId, $now]);
+        $device = $this->devices->lockByName(self::DEVICE_NAME);
+        if (null === $device) {
+            return null;
+        }
+        $deviceId = (int) $device->getId();
+        $now = UtcClock::now();
+        $this->proposals->expireDue($now, $deviceId);
+        $this->proposals->invalidateOtherActuators($deviceId, $this->actuatorTopic);
+        $readings = $this->measurements->latestSoilMoisture($deviceId, self::READINGS);
+        if ([] !== $readings && $readings[0]['value'] >= $this->threshold) {
+            $this->states->resetEpisode($deviceId);
+            $this->proposals->invalidatePending($deviceId, 'Sensor recovered');
+
+            return null;
+        }
+        if (!$this->dryReadings($readings, $now)) {
+            return null;
+        }
+        $attempt = $this->runs->latest()?->getRequestedAt();
+        if (null !== $attempt && $attempt->getTimestamp() > $now->getTimestamp() - self::DAY_SECONDS) {
+            $this->proposals->invalidatePending($deviceId, 'Newer watering attempt');
+
+            return null;
+        }
+
+        return $this->proposals->hasPending($deviceId) ? null : $this->prompt($device, $now, $readings, $attempt);
     }
 
-    private function invalidateOtherActuators(Connection $db, int $deviceId): void
+    /**
+     * @param list<array{value: float, measuredAt: \DateTimeImmutable}> $readings
+     */
+    private function prompt(Device $device, \DateTimeImmutable $now, array $readings, ?\DateTimeImmutable $attempt): ?WateringProposal
     {
-        $db->executeStatement("UPDATE watering_proposal SET status = 'invalidated', failure = 'Actuator changed' WHERE device_id = ? AND status = 'pending' AND (actuator_topic IS NULL OR actuator_topic <> ?)", [$deviceId, $this->actuatorTopic]);
+        $state = $this->states->lockOrCreate($device, $this->actuatorTopic);
+        if (!$this->mayPrompt($state, $now)) {
+            return null;
+        }
+        $proposal = $this->createProposal($device, $now, $readings, $attempt);
+        $state->setPromptCount($state->getPromptCount() + 1)->setLastPromptAt($now);
+
+        return $proposal;
     }
 
-    private function readings(Connection $db, int $deviceId): array
+    private function mayPrompt(WateringProposalState $state, \DateTimeImmutable $now): bool
     {
-        return $db->fetchAllAssociative("SELECT m.value, m.measured_at, m.id FROM measurement m JOIN sensor s ON s.id = m.sensor_id WHERE s.device_id = ? AND s.type = 'soil_moisture' AND s.unit = '%' ORDER BY m.measured_at DESC, m.id DESC LIMIT 3", [$deviceId]);
-    }
-
-    private function dryReadings(array $r, \DateTimeImmutable $now): bool
-    {
-        if (count($r) !== 3) {
+        $count = $state->getPromptCount();
+        $last = $state->getLastPromptAt();
+        if ($count >= self::MAX_PROMPTS) {
             return false;
         }
-        $times = array_map(static fn (array $row): int => strtotime($row['measured_at'].' UTC'), $r);
+
+        return 0 === $count || null === $last || $last->getTimestamp() <= $now->getTimestamp() - self::DAY_SECONDS;
+    }
+
+    /**
+     * @param list<array{value: float, measuredAt: \DateTimeImmutable}> $readings
+     */
+    private function createProposal(Device $device, \DateTimeImmutable $now, array $readings, ?\DateTimeImmutable $attempt): WateringProposal
+    {
+        $snapshot = array_reverse(array_map(
+            static fn (array $r): array => ['value' => (float) $r['value'], 'measured_at' => $r['measuredAt']->format('Y-m-d H:i:s')],
+            array_slice($readings, 0, self::READINGS),
+        ));
+        $proposal = (new WateringProposal())
+            ->setDevice($device)
+            ->setStatus(WateringProposal::STATUS_PENDING)
+            ->setCreatedAt($now)
+            ->setExpiresAt($now->modify(sprintf('+%d minutes', $this->validityMinutes)))
+            ->setDurationSeconds($this->durationSeconds)
+            ->setReadingsJson($snapshot)
+            ->setLastAttemptAt($attempt)
+            ->setNotificationStatus(WateringProposal::NOTIFICATION_NEW)
+            ->setActuatorTopic($this->actuatorTopic);
+        $this->proposals->add($proposal);
+
+        return $proposal;
+    }
+
+    private function claimDecision(int $id, string $action): string
+    {
+        $p = $this->proposals->lockById($id);
+        if (null === $p || WateringProposal::STATUS_PENDING !== $p->getStatus()) {
+            return 'ignored';
+        }
+        $now = UtcClock::now();
+        $p->setDecidedAt($now);
+        if ($p->getExpiresAt() <= $now) {
+            $p->setStatus(WateringProposal::STATUS_EXPIRED);
+
+            return 'expired';
+        }
+        // Checked before any run is reserved; a legacy NULL topic never matches.
+        if ($p->getActuatorTopic() !== $this->actuatorTopic) {
+            $p->setStatus(WateringProposal::STATUS_INVALIDATED)->setFailure('Actuator changed');
+
+            return 'invalidated';
+        }
+        if ('reject' === $action) {
+            $p->setStatus(WateringProposal::STATUS_REJECTED);
+
+            return 'rejected';
+        }
+        // A committed claim is deliberately terminal after a crash. Never automatically reissue request().
+        $p->setStatus(WateringProposal::STATUS_EXECUTING);
+
+        return 'executing';
+    }
+
+    private function execute(int $id): string
+    {
+        try {
+            $duration = (int) $this->proposals->fresh($id)?->getDurationSeconds();
+            $runId = $this->watering->request($duration, fn (\DateTimeImmutable $now) => $this->assertStillValid($id, $now));
+            $this->proposals->finishExecution($id, WateringProposal::STATUS_APPROVED, null, $runId);
+
+            return 'approved';
+        } catch (\DomainException|\LogicException $e) {
+            $this->proposals->finishExecution($id, WateringProposal::STATUS_FAILED, substr($e->getMessage(), 0, 255), null);
+
+            return 'failed';
+        } catch (\Throwable) {
+            // Includes DB or MQTT uncertainty. The manager's reservation, if any, remains blocked.
+            $this->proposals->finishExecution($id, WateringProposal::STATUS_UNCERTAIN, 'Execution outcome uncertain; manual review required', null);
+
+            return 'uncertain';
+        }
+    }
+
+    /** Runs under the control lock, immediately before the run is reserved. */
+    private function assertStillValid(int $id, \DateTimeImmutable $now): void
+    {
+        $p = $this->proposals->fresh($id);
+        if (null === $p || WateringProposal::STATUS_EXECUTING !== $p->getStatus() || $p->getExpiresAt() <= $now) {
+            throw new \DomainException('Proposal expired or changed.');
+        }
+        $readings = $this->measurements->latestSoilMoisture((int) $p->getDevice()?->getId(), self::READINGS);
+        if (!$this->dryReadings($readings, $now)) {
+            throw new \DomainException('Sensor readings no longer support watering.');
+        }
+        $attempt = $this->runs->latest()?->getRequestedAt();
+        if (null !== $attempt && ($attempt > $p->getCreatedAt() || $attempt->getTimestamp() > $now->getTimestamp() - self::DAY_SECONDS)) {
+            throw new \DomainException('A newer or recent watering attempt exists.');
+        }
+    }
+
+    /**
+     * @param list<array{value: float, measuredAt: \DateTimeImmutable}> $r newest first
+     */
+    private function dryReadings(array $r, \DateTimeImmutable $now): bool
+    {
+        if (self::READINGS !== count($r)) {
+            return false;
+        }
+        $times = array_map(static fn (array $row): int => $row['measuredAt']->getTimestamp(), $r);
         if ($times[0] > $now->getTimestamp() || $now->getTimestamp() - $times[0] > $this->freshnessMinutes * 60) {
             return false;
         }
-        for ($i = 0; $i < 3; ++$i) {
+        for ($i = 0; $i < self::READINGS; ++$i) {
             $value = (float) $r[$i]['value'];
             if (!is_finite($value) || $value >= $this->threshold || $value < 0 || $value > 100) {
                 return false;
@@ -223,12 +276,7 @@ final class ProposalPolicy
                 return false;
             }
         }
-        return true;
-    }
 
-    private function latestAttempt(Connection $db): ?string
-    {
-        $v = $db->fetchOne('SELECT requested_at FROM watering_run ORDER BY requested_at DESC, id DESC LIMIT 1');
-        return $v === false ? null : (string) $v;
+        return true;
     }
 }

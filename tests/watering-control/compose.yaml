@@ -26,7 +26,7 @@ services:
 
   tests:
     image: gardenhub-api
-    entrypoint: ["sh", "-c", "php bin/console doctrine:migrations:migrate --no-interaction && php /tests/watering-control.php && php /tests/watering-mqtt-acknowledgements.php && php /tests/proposals.php"]
+    entrypoint: ["sh", "-c", "php bin/console doctrine:migrations:migrate --no-interaction && php /tests/watering-control.php && php /tests/watering-mqtt-acknowledgements.php && php /tests/proposals.php && php /tests/orm-mapping.php"]
     environment:
       APP_ENV: dev
       APP_SECRET: watering-tests-only
