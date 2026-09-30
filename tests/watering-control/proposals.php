@@ -5,8 +5,8 @@ declare(strict_types=1);
 use App\Kernel;
 use App\Watering\MqttWateringPublisher;
 use App\Entity\WateringProposal;
-use App\Watering\TelegramGateway;
-use App\Watering\WateringPublisher;
+use App\Watering\InterfaceTelegramGateway;
+use App\Watering\InterfaceWateringPublisher;
 use Symfony\Component\Uid\Uuid;
 
 require '/app/vendor/autoload.php';
@@ -15,7 +15,7 @@ require __DIR__.'/support.php';
 const SIM_TOPIC = MqttWateringPublisher::DEFAULT_TOPIC;
 const HW_TOPIC = 'zigbee2mqtt/avocado-watering';
 
-final class ProposalFakePublisher implements WateringPublisher
+final class ProposalFakePublisher implements InterfaceWateringPublisher
 {
     public int $calls = 0;
     public bool $fail = false;
@@ -28,7 +28,7 @@ final class ProposalFakePublisher implements WateringPublisher
     }
 }
 
-final class ProposalFakeTelegram implements TelegramGateway
+final class ProposalFakeTelegram implements InterfaceTelegramGateway
 {
     public array $sent = [];
     public array $acks = [];

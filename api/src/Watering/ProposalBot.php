@@ -12,7 +12,7 @@ final class ProposalBot
     public function __construct(
         private readonly WateringTelegramProgressRepository $progress,
         private readonly ProposalPolicy $policy,
-        private readonly TelegramGateway $telegram,
+        private readonly InterfaceTelegramGateway $telegram,
         private readonly string $expectedUserId,
         private readonly string $expectedChatId,
     ) {

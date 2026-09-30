@@ -58,7 +58,7 @@ services:
             $clientFactory: ~
             $telegramLogger: '@monolog.logger.telegram'
 
-    App\Watering\WateringPublisher: '@App\Watering\MqttWateringPublisher'
+    App\Watering\InterfaceWateringPublisher: '@App\Watering\MqttWateringPublisher'
 
     App\Watering\MqttWateringPublisher:
         arguments:
@@ -86,7 +86,7 @@ services:
             $durationSeconds: '%env(int:WATERING_PROPOSAL_DURATION_SECONDS)%'
             $actuatorTopic: '%env(WATERING_MQTT_TOPIC)%'
 
-    App\Watering\TelegramGateway: '@App\Watering\StreamTelegramGateway'
+    App\Watering\InterfaceTelegramGateway: '@App\Watering\StreamTelegramGateway'
 
     App\Watering\StreamTelegramGateway:
         arguments:

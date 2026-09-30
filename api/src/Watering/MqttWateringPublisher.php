@@ -8,7 +8,7 @@ use PhpMqtt\Client\ConnectionSettings;
 use PhpMqtt\Client\MqttClient;
 use PhpMqtt\Client\Repositories\MemoryRepository;
 
-final class MqttWateringPublisher implements WateringPublisher
+final class MqttWateringPublisher implements InterfaceWateringPublisher
 {
     public const DEFAULT_TOPIC = 'gardenhub/dev/watering/avocado';
     /** @deprecated Use DEFAULT_TOPIC for defaults or inject WATERING_MQTT_TOPIC. */

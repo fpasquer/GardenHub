@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace App\Watering;
 
-interface TelegramGateway
+interface InterfaceTelegramGateway
 {
     public function send(string $text, int $proposalId): int;
     public function updates(int $offset): array;

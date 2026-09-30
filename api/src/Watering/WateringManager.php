@@ -25,7 +25,7 @@ final class WateringManager
         private readonly WateringControlRepository $controls,
         private readonly WateringRunRepository $runs,
         private readonly TransactionRunner $runner,
-        private readonly WateringPublisher $publisher,
+        private readonly InterfaceWateringPublisher $publisher,
         private readonly bool $enabled,
         private readonly string $environment,
         private readonly int $maxSeconds = self::DEFAULT_MAX_SECONDS,

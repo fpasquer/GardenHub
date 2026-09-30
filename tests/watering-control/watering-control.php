@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-use App\Watering\WateringPublisher;
+use App\Watering\InterfaceWateringPublisher;
 use App\Entity\WateringRun;
 use App\Kernel;
 use Doctrine\ORM\EntityManagerInterface;
@@ -10,7 +10,7 @@ use Doctrine\ORM\EntityManagerInterface;
 require '/app/vendor/autoload.php';
 require __DIR__.'/support.php';
 
-final class FakePublisher implements WateringPublisher
+final class FakePublisher implements InterfaceWateringPublisher
 {
     public array $commands = [];
     public bool $fail = false;

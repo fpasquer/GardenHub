@@ -20,7 +20,7 @@ declare(strict_types=1);
 use App\Kernel;
 use App\Watering\MqttWateringPublisher;
 use App\Watering\WateringMonitorRunner;
-use App\Watering\WateringPublisher;
+use App\Watering\InterfaceWateringPublisher;
 use Doctrine\DBAL\Exception\ForeignKeyConstraintViolationException;
 use Doctrine\ORM\EntityManagerInterface;
 use PhpMqtt\Client\ConnectionSettings;
@@ -50,7 +50,7 @@ function pollUntil(callable $condition, float $seconds, string $message): void
     }
 }
 
-final class FakePublisher implements WateringPublisher
+final class FakePublisher implements InterfaceWateringPublisher
 {
     public array $commands = [];
     public bool $fail = false;
@@ -271,7 +271,7 @@ function stopBrokerStub(array $handle): void
     check(0 === $exit, 'Broker stub failed: '.$output);
 }
 
-function newRunner(EntityManagerInterface $em, WateringPublisher $publisher, string $host, int $port, float $subackTimeout): WateringMonitorRunner
+function newRunner(EntityManagerInterface $em, InterfaceWateringPublisher $publisher, string $host, int $port, float $subackTimeout): WateringMonitorRunner
 {
     $watering = newTestManager($em, $publisher);
 

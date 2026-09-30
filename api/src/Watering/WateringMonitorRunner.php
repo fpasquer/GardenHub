@@ -14,7 +14,7 @@ final class WateringMonitorRunner
 {
     public function __construct(
         private readonly WateringManager $watering,
-        private readonly WateringPublisher $publisher,
+        private readonly InterfaceWateringPublisher $publisher,
         private readonly LoggerInterface $logger,
         private readonly string $host,
         private readonly int $port,
