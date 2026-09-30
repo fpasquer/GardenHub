@@ -11,13 +11,13 @@ final class StreamTelegramGateway implements TelegramGateway
     {
     }
 
-    public function send(string $text, string $proposalId): int
+    public function send(string $text, int $proposalId): int
     {
         $reply = $this->call('sendMessage', [
             'chat_id' => $this->chatId, 'text' => $text,
             'reply_markup' => json_encode(['inline_keyboard' => [[
-                ['text' => 'Approve', 'callback_data' => 'w:a:'.$proposalId],
-                ['text' => 'Reject', 'callback_data' => 'w:r:'.$proposalId],
+                ['text' => 'Approve', 'callback_data' => sprintf('w:a:%d', $proposalId)],
+                ['text' => 'Reject', 'callback_data' => sprintf('w:r:%d', $proposalId)],
             ]]], JSON_THROW_ON_ERROR),
         ]);
         $id = $reply['message_id'] ?? null;

@@ -4,6 +4,7 @@ namespace App\Repository;
 
 use App\Entity\Measurement;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Doctrine\DBAL\LockMode;
 use Doctrine\Persistence\ManagerRegistry;
 
 /**
@@ -37,12 +38,40 @@ class MeasurementRepository extends ServiceEntityRepository
 
     private function fetchExists(int $sensorId, bool $forUpdate): bool
     {
-        $sql = 'SELECT 1 FROM measurement WHERE sensor_id = ? LIMIT 1';
+        $query = $this->createQueryBuilder('m')
+            ->select('m.id')
+            ->where('m.sensor = :sensor')
+            ->setParameter('sensor', $sensorId)
+            ->setMaxResults(1)
+            ->getQuery();
         if ($forUpdate) {
-            $sql .= ' FOR UPDATE';
+            $query->setLockMode(LockMode::PESSIMISTIC_WRITE);
         }
 
-        return false !== $this->getEntityManager()->getConnection()->fetchOne($sql, [$sensorId]);
+        return [] !== $query->getArrayResult();
+    }
+
+    /**
+     * Newest soil-moisture readings (%) of a device, newest first.
+     *
+     * @return list<array{value: float, measuredAt: \DateTimeImmutable}>
+     */
+    public function latestSoilMoisture(int $deviceId, int $limit): array
+    {
+        return $this->createQueryBuilder('m')
+            ->select('m.value AS value', 'm.measuredAt AS measuredAt')
+            ->join('m.sensor', 's')
+            ->where('s.device = :device')
+            ->andWhere('s.type = :type')
+            ->andWhere('s.unit = :unit')
+            ->setParameter('device', $deviceId)
+            ->setParameter('type', 'soil_moisture')
+            ->setParameter('unit', '%')
+            ->orderBy('m.measuredAt', 'DESC')
+            ->addOrderBy('m.id', 'DESC')
+            ->setMaxResults($limit)
+            ->getQuery()
+            ->getArrayResult();
     }
 
     /**

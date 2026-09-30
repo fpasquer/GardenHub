@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace App\Command;
 
+use App\Watering\AdvisoryLock;
 use App\Watering\ProposalBot;
 use App\Watering\ProposalPolicy;
-use Doctrine\DBAL\Connection;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -16,8 +16,10 @@ use Symfony\Component\Console\Output\OutputInterface;
 #[AsCommand(name: 'gardenhub:watering:proposals', description: 'Dev-only soil proposal evaluator and Telegram callback poller')]
 final class WateringProposalPollCommand extends Command
 {
+    private const LOCK_NAME = 'gardenhub_watering_proposals';
+
     public function __construct(
-        private readonly Connection $db,
+        private readonly AdvisoryLock $lock,
         private readonly ProposalPolicy $policy,
         private readonly ProposalBot $bot,
         private readonly bool $enabled,
@@ -42,7 +44,7 @@ final class WateringProposalPollCommand extends Command
         }
         // Telegram permits one getUpdates consumer per bot. The DB advisory lock
         // also protects against accidental duplicate Compose replicas.
-        if ((int) $this->db->fetchOne("SELECT GET_LOCK('gardenhub_watering_proposals', 0)") !== 1) {
+        if (!$this->lock->acquire(self::LOCK_NAME)) {
             $output->writeln('<error>Another watering proposal poller holds the lock.</error>');
             return Command::FAILURE;
         }
@@ -59,7 +61,7 @@ final class WateringProposalPollCommand extends Command
             $output->writeln('<error>Proposal poller stopped; inspect database state before restart.</error>');
             return Command::FAILURE;
         } finally {
-            $this->db->executeStatement("SELECT RELEASE_LOCK('gardenhub_watering_proposals')");
+            $this->lock->release(self::LOCK_NAME);
         }
         return Command::SUCCESS;
     }

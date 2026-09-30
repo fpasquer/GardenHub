@@ -65,7 +65,7 @@ final class SensorLockObserverConnection extends AbstractConnectionMiddleware
     {
         $statement = parent::prepare($sql);
 
-        if (!preg_match('/SELECT device_id, type, unit FROM sensor WHERE id = \?\s*FOR UPDATE/i', $sql)) {
+        if (!preg_match('/SELECT \w+\.device_id AS \w+, \w+\.type AS \w+, \w+\.unit AS \w+ FROM sensor \w+ WHERE \w+\.id = \?\s*FOR UPDATE/i', $sql)) {
             return $statement;
         }
 

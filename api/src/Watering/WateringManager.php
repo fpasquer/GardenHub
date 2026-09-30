@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace App\Watering;
 
-use Doctrine\DBAL\Connection;
-use Symfony\Component\Uid\Uuid;
+use App\Entity\WateringControl;
+use App\Entity\WateringRun;
+use App\Repository\WateringControlRepository;
+use App\Repository\WateringRunRepository;
 
 /** Durable, single-actuator safety gate for development watering. */
 final class WateringManager
@@ -16,8 +18,13 @@ final class WateringManager
     public const DEFAULT_DAILY_SECONDS = 120;
     public const DEFAULT_COOLDOWN_SECONDS = 60;
 
+    private const TIMEOUT_REASON = 'OFF not confirmed before deadline';
+    private const UNSAFE_REASON = 'Water shortage or low battery reported';
+
     public function __construct(
-        private readonly Connection $db,
+        private readonly WateringControlRepository $controls,
+        private readonly WateringRunRepository $runs,
+        private readonly TransactionRunner $runner,
         private readonly WateringPublisher $publisher,
         private readonly bool $enabled,
         private readonly string $environment,
@@ -26,7 +33,7 @@ final class WateringManager
         private readonly int $cooldownSeconds = self::DEFAULT_COOLDOWN_SECONDS,
     ) {
         if ($this->maxSeconds < 1 || $this->maxSeconds > self::MAX_SECONDS) {
-            throw new \LogicException('Watering max duration must be between 1 and '.self::MAX_SECONDS.' seconds.');
+            throw new \LogicException(sprintf('Watering max duration must be between 1 and %d seconds.', self::MAX_SECONDS));
         }
         if ($this->dailySeconds < $this->maxSeconds || $this->dailySeconds > 86400) {
             throw new \LogicException('Watering daily budget must be at least max duration and no more than 86400 seconds.');
@@ -41,56 +48,30 @@ final class WateringManager
         return $this->maxSeconds;
     }
 
-    /** Optional guard runs under the same control lock as the run reservation. */
-    public function request(int $seconds, ?callable $guard = null): string
+    /**
+     * Optional guard runs under the same control lock as the run reservation.
+     *
+     * @param (callable(\DateTimeImmutable): void)|null $guard
+     *
+     * @return int the id of the reserved run
+     */
+    public function request(int $seconds, ?callable $guard = null): int
     {
         $this->assertEnabled();
         if ($seconds < 1 || $seconds > $this->maxSeconds) {
-            throw new \DomainException('Duration must be between 1 and '.$this->maxSeconds.' seconds.');
+            throw new \DomainException(sprintf('Duration must be between 1 and %d seconds.', $this->maxSeconds));
         }
 
-        $id = (string) Uuid::v4();
-        $this->db->transactional(function (Connection $db) use ($id, $seconds, $guard): void {
-            $control = $db->fetchAssociative('SELECT * FROM watering_control WHERE id = 1 FOR UPDATE');
-            $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
-            if (!$control || $control['active_run_id'] !== null) {
-                throw new \DomainException('A watering cycle is active or requires review.');
-            }
-            if ($control['monitor_seen_at'] === null || strtotime($control['monitor_seen_at'].' UTC') < $now->getTimestamp() - 5) {
-                throw new \DomainException('Watering monitor is not reporting; refusing to start.');
-            }
-            if ($control['last_request_at'] !== null && strtotime($control['last_request_at'].' UTC') > $now->getTimestamp() - $this->cooldownSeconds) {
-                throw new \DomainException('Watering cooldown has not elapsed.');
-            }
-            $used = (int) $db->fetchOne('SELECT COALESCE(SUM(requested_seconds), 0) FROM watering_run WHERE requested_at >= ?', [$now->modify('-24 hours')->format('Y-m-d H:i:s')]);
-            if ($used + $seconds > $this->dailySeconds) {
-                throw new \DomainException('Rolling 24-hour watering limit exceeded.');
-            }
-            if ($guard !== null) {
-                $guard($db, $now);
-            }
-
-            $db->insert('watering_run', [
-                'id' => $id,
-                'requested_seconds' => $seconds,
-                'status' => 'pending',
-                'requested_at' => $now->format('Y-m-d H:i:s'),
-                // Includes a small allowance for ON acknowledgement and OFF report.
-                'deadline_at' => $now->modify('+'.($seconds + 10).' seconds')->format('Y-m-d H:i:s'),
-            ]);
-            $db->update('watering_control', ['active_run_id' => $id, 'last_request_at' => $now->format('Y-m-d H:i:s')], ['id' => 1]);
-        });
+        $id = $this->runner->run(fn (): int => $this->reserve($seconds, $guard));
 
         // The DB reservation is committed before publishing: a crash or
         // uncertain PUBACK leaves the cycle blocked, never available for retry.
         try {
             $this->publisher->publish(['watering_times' => $seconds, 'state' => 'ON']);
         } catch (\Throwable $e) {
-            $this->db->executeStatement(
-                "UPDATE watering_run SET status = 'uncertain', error = ? WHERE id = ? AND status IN ('pending', 'running')",
-                [substr($e->getMessage(), 0, 255), $id],
-            );
-            throw new \RuntimeException('Command delivery uncertain; cycle remains blocked: '.$id, 0, $e);
+            $this->runs->markUncertainIfOpen($id, substr($e->getMessage(), 0, 255));
+
+            throw new \RuntimeException(sprintf('Command delivery uncertain; cycle remains blocked: %d', $id), 0, $e);
         }
 
         return $id;
@@ -104,133 +85,176 @@ final class WateringManager
         if (!is_array($state) || !in_array($state['state'] ?? null, ['ON', 'OFF'], true)) {
             return false;
         }
-        $stop = false;
-        $this->db->transactional(function (Connection $db) use ($state, &$stop): void {
-            $control = $db->fetchAssociative('SELECT * FROM watering_control WHERE id = 1 FOR UPDATE');
-            if (!$control) {
-                throw new \RuntimeException('Run watering migration before starting the monitor.');
-            }
-            $id = $control['active_run_id'];
-            $on = $state['state'] === 'ON';
-            $unsafe = ($state['alarm_1'] ?? false) === true || ($state['battery_low'] ?? false) === true;
-            if ($id === null) {
-                $stop = $on;
-                return;
-            }
-            $run = $db->fetchAssociative('SELECT * FROM watering_run WHERE id = ?', [$id]);
-            if (!$run) {
-                throw new \RuntimeException('Active watering run is missing.');
-            }
-            $now = gmdate('Y-m-d H:i:s');
-            $db->update('watering_run', ['last_state' => $state['state'], 'last_state_at' => $now], ['id' => $id]);
 
-            // A missed deadline wins over any incoming report, even a plain OFF.
-            if ($this->isOverdue($run, $now)) {
-                $this->markTimedOut($db, $id, 'OFF not confirmed before deadline');
-                $stop = true;
-                return;
-            }
-
-            if ($unsafe && in_array($run['status'], ['pending', 'running'], true)) {
-                $db->update('watering_run', ['status' => 'uncertain', 'error' => 'Water shortage or low battery reported'], ['id' => $id]);
-                $stop = true;
-                return;
-            }
-
-            if ($on) {
-                $stop = in_array($run['status'], ['timed_out', 'uncertain'], true);
-                if ($run['status'] === 'pending') {
-                    $db->update('watering_run', ['status' => 'running', 'started_at' => $now], ['id' => $id]);
-                }
-            } elseif ($run['status'] === 'running' && $run['started_at'] !== null) {
-                $db->update('watering_run', ['status' => 'completed', 'finished_at' => $now], ['id' => $id]);
-                $db->update('watering_control', ['active_run_id' => null], ['id' => 1]);
-            }
-            // OFF without an observed ON could be a stale retained state;
-            // never clear a pending, timed-out or uncertain cycle from it.
-        });
-
-        return $stop;
+        return $this->runner->run(fn (): bool => $this->applyReport($state));
     }
 
     /** Marks overdue runs as timed out; they remain blocked until reviewed. */
     public function expire(): bool
     {
         $this->assertEnabled();
-        return $this->db->transactional(function (Connection $db): bool {
-            $control = $db->fetchAssociative('SELECT active_run_id FROM watering_control WHERE id = 1 FOR UPDATE');
-            if (!$control || $control['active_run_id'] === null) {
+
+        return $this->runner->run(function (): bool {
+            $run = $this->controls->lock()?->getActiveRun();
+            if (null === $run || !$run->isOverdue(UtcClock::now())) {
                 return false;
             }
-            $run = $db->fetchAssociative('SELECT status, deadline_at FROM watering_run WHERE id = ?', [$control['active_run_id']]);
-            if (!$run || !$this->isOverdue($run, gmdate('Y-m-d H:i:s'))) {
-                return false;
-            }
-            $this->markTimedOut($db, $control['active_run_id'], 'OFF not confirmed before deadline');
+            $this->markTimedOut($run);
+
             return true;
         });
     }
 
-    /** Same timeout rule used by expire() and observe(): only a still-open cycle can be overdue. */
-    private function isOverdue(array $run, string $now): bool
+    public function latest(): ?WateringRun
     {
-        return in_array($run['status'], ['pending', 'running'], true) && $run['deadline_at'] <= $now;
-    }
-
-    private function markTimedOut(Connection $db, string $runId, string $reason): void
-    {
-        $db->update('watering_run', ['status' => 'timed_out', 'error' => $reason], ['id' => $runId]);
-    }
-
-    public function latest(): ?array
-    {
-        $row = $this->db->fetchAssociative('SELECT * FROM watering_run ORDER BY requested_at DESC, id DESC LIMIT 1');
-        return $row ?: null;
+        return $this->runs->latest();
     }
 
     /** Inspects the run actually referenced by active_run_id, never inferred by recency. */
     public function requiresStop(): bool
     {
-        $status = $this->db->fetchOne(
-            'SELECT r.status FROM watering_control c JOIN watering_run r ON r.id = c.active_run_id WHERE c.id = 1'
-        );
-        return in_array($status, ['timed_out', 'uncertain'], true);
+        return $this->runs->requiresStop();
     }
 
     public function heartbeat(): void
     {
         $this->assertEnabled();
-        $this->db->update('watering_control', ['monitor_seen_at' => gmdate('Y-m-d H:i:s')], ['id' => 1]);
+        $this->controls->touchHeartbeat(UtcClock::now());
     }
 
     /** Clears the persisted heartbeat so a stale value can't authorize a request after a real failure. */
     public function invalidateHeartbeat(): void
     {
         $this->assertEnabled();
-        $this->db->update('watering_control', ['monitor_seen_at' => null], ['id' => 1]);
+        $this->controls->clearHeartbeat();
     }
 
     /** Manual recovery only after independently verifying that the actuator is OFF. */
     public function acknowledgeStopped(): void
     {
         $this->assertEnabled();
-        $this->db->transactional(function (Connection $db): void {
-            $control = $db->fetchAssociative('SELECT active_run_id FROM watering_control WHERE id = 1 FOR UPDATE');
-            if (!$control || $control['active_run_id'] === null) {
+        $this->runner->run(function (): void {
+            $control = $this->controls->lock();
+            $run = $control?->getActiveRun();
+            if (null === $control || null === $run) {
                 throw new \DomainException('No blocked cycle to review.');
             }
-            $run = $db->fetchAssociative('SELECT status FROM watering_run WHERE id = ?', [$control['active_run_id']]);
-            if (!$run || !in_array($run['status'], ['timed_out', 'uncertain'], true)) {
+            if (!$run->isBlocked()) {
                 throw new \DomainException('Only a blocked cycle can be manually reviewed.');
             }
-            $db->update('watering_run', ['status' => 'reviewed', 'finished_at' => gmdate('Y-m-d H:i:s')], ['id' => $control['active_run_id']]);
-            $db->update('watering_control', ['active_run_id' => null], ['id' => 1]);
+            $run->setStatus(WateringRun::STATUS_REVIEWED)->setFinishedAt(UtcClock::now());
+            $control->setActiveRun(null);
         });
+    }
+
+    private function reserve(int $seconds, ?callable $guard): int
+    {
+        $control = $this->controls->lock();
+        $now = UtcClock::now();
+        $this->assertReservable($control, $now, $seconds);
+        if (null !== $guard) {
+            $guard($now);
+        }
+
+        $run = (new WateringRun())
+            ->setRequestedSeconds($seconds)
+            ->setStatus(WateringRun::STATUS_PENDING)
+            ->setRequestedAt($now)
+            // Includes a small allowance for ON acknowledgement and OFF report.
+            ->setDeadlineAt($now->modify(sprintf('+%d seconds', $seconds + 10)));
+        $this->runs->add($run);
+        $control->setActiveRun($run)->setLastRequestAt($now);
+
+        return (int) $run->getId();
+    }
+
+    /** @phpstan-assert WateringControl $control */
+    private function assertReservable(?WateringControl $control, \DateTimeImmutable $now, int $seconds): void
+    {
+        if (null === $control || null !== $control->getActiveRun()) {
+            throw new \DomainException('A watering cycle is active or requires review.');
+        }
+        $seen = $control->getMonitorSeenAt();
+        if (null === $seen || $seen->getTimestamp() < $now->getTimestamp() - 5) {
+            throw new \DomainException('Watering monitor is not reporting; refusing to start.');
+        }
+        $last = $control->getLastRequestAt();
+        if (null !== $last && $last->getTimestamp() > $now->getTimestamp() - $this->cooldownSeconds) {
+            throw new \DomainException('Watering cooldown has not elapsed.');
+        }
+        $used = $this->runs->sumRequestedSince($now->modify('-24 hours'));
+        if ($used + $seconds > $this->dailySeconds) {
+            throw new \DomainException('Rolling 24-hour watering limit exceeded.');
+        }
+    }
+
+    /** @param array<string, mixed> $state */
+    private function applyReport(array $state): bool
+    {
+        $control = $this->controls->lock()
+            ?? throw new \RuntimeException('Run watering migration before starting the monitor.');
+        $run = $control->getActiveRun();
+        $on = 'ON' === $state['state'];
+        if (null === $run) {
+            return $on;
+        }
+
+        $now = UtcClock::now();
+        $run->setLastState($state['state'])->setLastStateAt($now);
+
+        // A missed deadline wins over any incoming report, even a plain OFF.
+        if ($run->isOverdue($now)) {
+            $this->markTimedOut($run);
+
+            return true;
+        }
+        if ($this->isUnsafe($state) && $run->isOpen()) {
+            $run->setStatus(WateringRun::STATUS_UNCERTAIN)->setError(self::UNSAFE_REASON);
+
+            return true;
+        }
+
+        return $on ? $this->applyOn($run, $now) : $this->applyOff($control, $run, $now);
+    }
+
+    private function applyOn(WateringRun $run, \DateTimeImmutable $now): bool
+    {
+        $stop = $run->isBlocked();
+        if (WateringRun::STATUS_PENDING === $run->getStatus()) {
+            $run->setStatus(WateringRun::STATUS_RUNNING)->setStartedAt($now);
+        }
+
+        return $stop;
+    }
+
+    /**
+     * OFF without an observed ON could be a stale retained state; never clear
+     * a pending, timed-out or uncertain cycle from it.
+     */
+    private function applyOff(WateringControl $control, WateringRun $run, \DateTimeImmutable $now): bool
+    {
+        if (WateringRun::STATUS_RUNNING === $run->getStatus() && null !== $run->getStartedAt()) {
+            $run->setStatus(WateringRun::STATUS_COMPLETED)->setFinishedAt($now);
+            $control->setActiveRun(null);
+        }
+
+        return false;
+    }
+
+    /** @param array<string, mixed> $state */
+    private function isUnsafe(array $state): bool
+    {
+        return true === ($state['alarm_1'] ?? false) || true === ($state['battery_low'] ?? false);
+    }
+
+    private function markTimedOut(WateringRun $run): void
+    {
+        $run->setStatus(WateringRun::STATUS_TIMED_OUT)->setError(self::TIMEOUT_REASON);
     }
 
     private function assertEnabled(): void
     {
-        if (!$this->enabled || $this->environment !== 'dev') {
+        if (!$this->enabled || 'dev' !== $this->environment) {
             throw new \LogicException('Watering control is available only in explicitly enabled development.');
         }
     }
