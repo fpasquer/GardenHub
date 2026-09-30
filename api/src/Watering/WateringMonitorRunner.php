@@ -12,6 +12,10 @@ use Psr\Log\LoggerInterface;
 /** Owns one MQTT connection attempt: connect, subscribe, confirm SUBACK, then run the heartbeat loop. */
 final class WateringMonitorRunner
 {
+    private const HEARTBEAT_INTERVAL_SECONDS = 1;
+    private const STOP_RETRY_INTERVAL_SECONDS = 5;
+    private const DEFAULT_SUBACK_TIMEOUT_SECONDS = 10.0;
+
     public function __construct(
         private readonly WateringManager $watering,
         private readonly InterfaceWateringPublisher $publisher,
@@ -20,7 +24,7 @@ final class WateringMonitorRunner
         private readonly int $port,
         private readonly string $username,
         private readonly string $password,
-        private readonly float $subackTimeoutSeconds = 10.0,
+        private readonly float $subackTimeoutSeconds = self::DEFAULT_SUBACK_TIMEOUT_SECONDS,
         private readonly string $topic = MqttWateringPublisher::DEFAULT_TOPIC,
     ) {
     }
@@ -81,13 +85,13 @@ final class WateringMonitorRunner
         try {
             $stop = $this->watering->observe($message);
             if ($stop) {
-                $this->publisher->publish(['state' => 'OFF']);
+                $this->publisher->publish(['state' => ActuatorState::Off->value]);
             }
         } catch (\Throwable $e) {
             $this->logger->error('Watering state processing failed; trying OFF.', ['error' => $e->getMessage()]);
             // Never silently discard an ON when persistence fails.
             try {
-                $this->publisher->publish(['state' => 'OFF']);
+                $this->publisher->publish(['state' => ActuatorState::Off->value]);
             } catch (\Throwable) {
                 // Keep the processing failure as the reason to reconnect.
             }
@@ -103,16 +107,16 @@ final class WateringMonitorRunner
         while (!$stopRequested()) {
             $client->loopOnce($started, true);
             $throwCallbackFailure();
-            if (microtime(true) - $lastHeartbeat >= 1) {
+            if (microtime(true) - $lastHeartbeat >= self::HEARTBEAT_INTERVAL_SECONDS) {
                 $this->watering->heartbeat();
                 $lastHeartbeat = microtime(true);
             }
             if ($this->watering->expire()) {
                 $this->logger->error('Watering deadline exceeded; cycle blocked and OFF requested.');
             }
-            if ($this->watering->requiresStop() && microtime(true) - $lastStopAttempt >= 5) {
+            if ($this->watering->requiresStop() && microtime(true) - $lastStopAttempt >= self::STOP_RETRY_INTERVAL_SECONDS) {
                 $lastStopAttempt = microtime(true);
-                $this->publisher->publish(['state' => 'OFF']);
+                $this->publisher->publish(['state' => ActuatorState::Off->value]);
             }
         }
     }

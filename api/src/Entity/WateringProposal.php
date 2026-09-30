@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Entity;
 
 use App\Repository\WateringProposalRepository;
+use App\Watering\WateringNotificationStatus;
+use App\Watering\WateringProposalStatus;
 use Doctrine\DBAL\Types\Types;
 use Doctrine\ORM\Mapping as ORM;
 use Symfony\Component\Serializer\Attribute\Groups;
@@ -19,20 +21,21 @@ class WateringProposal
     /** Ids are INT auto-increment values; callbacks outside this range are ignored. */
     public const MAX_ID = 2147483647;
 
-    public const STATUS_PENDING = 'pending';
-    public const STATUS_EXECUTING = 'executing';
-    public const STATUS_APPROVED = 'approved';
-    public const STATUS_REJECTED = 'rejected';
-    public const STATUS_EXPIRED = 'expired';
-    public const STATUS_INVALIDATED = 'invalidated';
-    public const STATUS_FAILED = 'failed';
-    public const STATUS_UNCERTAIN = 'uncertain';
+    public const STATUS_PENDING = WateringProposalStatus::Pending->value;
+    public const STATUS_EXECUTING = WateringProposalStatus::Executing->value;
+    public const STATUS_APPROVED = WateringProposalStatus::Approved->value;
+    public const STATUS_REJECTED = WateringProposalStatus::Rejected->value;
+    public const STATUS_EXPIRED = WateringProposalStatus::Expired->value;
+    public const STATUS_INVALIDATED = WateringProposalStatus::Invalidated->value;
+    public const STATUS_FAILED = WateringProposalStatus::Failed->value;
+    public const STATUS_UNCERTAIN = WateringProposalStatus::Uncertain->value;
 
-    public const NOTIFICATION_NEW = 'new';
-    public const NOTIFICATION_SENDING = 'sending';
-    public const NOTIFICATION_SENT = 'sent';
-    public const NOTIFICATION_UNCERTAIN = 'uncertain';
-    public const NOTIFICATION_FINAL = 'final';
+    public const NOTIFICATION_NEW = WateringNotificationStatus::New->value;
+    public const NOTIFICATION_SENDING = WateringNotificationStatus::Sending->value;
+    public const NOTIFICATION_SENT = WateringNotificationStatus::Sent->value;
+    public const NOTIFICATION_UNCERTAIN = WateringNotificationStatus::Uncertain->value;
+    public const NOTIFICATION_FINAL = WateringNotificationStatus::Final->value;
+    public const FAILURE_MAX_LENGTH = 255;
 
     #[ORM\Id]
     #[ORM\GeneratedValue]
@@ -90,8 +93,8 @@ class WateringProposal
     #[ORM\JoinColumn(name: 'run_id', nullable: true)]
     private ?WateringRun $run = null;
 
-    #[ORM\Column(length: 255, nullable: true)]
-    #[Assert\Length(max: 255, groups: ['validation:watering_proposal'])]
+    #[ORM\Column(length: self::FAILURE_MAX_LENGTH, nullable: true)]
+    #[Assert\Length(max: self::FAILURE_MAX_LENGTH, groups: ['validation:watering_proposal'])]
     #[Groups(['read:watering_proposal'])]
     private ?string $failure = null;
 

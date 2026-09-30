@@ -6,8 +6,14 @@ declare(strict_types=1);
 // after bulk updates, foreign-key protection and Telegram id bounds.
 
 use App\Entity\WateringProposal;
+use App\Entity\WateringRun;
 use App\Kernel;
 use App\Repository\WateringProposalRepository;
+use App\Watering\ActuatorState;
+use App\Watering\ProposalDecisionResult;
+use App\Watering\WateringNotificationStatus;
+use App\Watering\WateringProposalStatus;
+use App\Watering\WateringRunStatus;
 use Doctrine\DBAL\Exception\ForeignKeyConstraintViolationException;
 
 require '/app/vendor/autoload.php';
@@ -31,6 +37,34 @@ function throwsForeignKey(callable $statement): bool
     return false;
 }
 
+function checkEnumContracts(): void
+{
+    $contracts = [
+        [WateringRunStatus::class, WateringRun::class, 'STATUS_',
+            ['pending', 'running', 'completed', 'uncertain', 'timed_out', 'reviewed']],
+        [WateringProposalStatus::class, WateringProposal::class, 'STATUS_',
+            ['pending', 'executing', 'approved', 'rejected', 'expired', 'invalidated', 'failed', 'uncertain']],
+        [WateringNotificationStatus::class, WateringProposal::class, 'NOTIFICATION_',
+            ['new', 'sending', 'sent', 'uncertain', 'final']],
+    ];
+    foreach ($contracts as [$enum, $entity, $prefix, $expected]) {
+        check(array_column($enum::cases(), 'value') === $expected, 'Enum state values changed');
+        foreach ($enum::cases() as $case) {
+            $constant = sprintf('%s::%s%s', $entity, $prefix, strtoupper($case->value));
+            check(constant($constant) === $case->value, 'Entity alias differs from enum value');
+        }
+    }
+    check(
+        array_column(ProposalDecisionResult::cases(), 'value') ===
+            ['ignored', 'executing', 'approved', 'rejected', 'expired', 'invalidated', 'failed', 'uncertain'],
+        'Decision strings changed',
+    );
+    check(array_column(ActuatorState::cases(), 'value') === ['ON', 'OFF'], 'MQTT state strings changed');
+    check(WateringRun::ERROR_MAX_LENGTH === 255, 'Run error length changed');
+    check(WateringProposal::FAILURE_MAX_LENGTH === 255, 'Proposal failure length changed');
+}
+
+checkEnumContracts();
 $kernel = new Kernel('dev', true);
 $em = bootTestEntityManager($kernel);
 $db = $em->getConnection();
@@ -63,7 +97,13 @@ $serializer = testSerializer($kernel);
 $proposal = freshProposal($em, $proposalId);
 $json = json_decode($serializer->serialize($proposal, 'json', ['groups' => ['read:watering_proposal']]), true, 512, JSON_THROW_ON_ERROR);
 check($json['id'] === $proposalId && $json['deviceId'] === $deviceId && $json['runId'] === $runId, 'Proposal ids are not serialized as integers');
+check($json['status'] === 'executing' && $json['notificationStatus'] === 'sent', 'Proposal state serialization changed');
 check(!array_key_exists('run', $json) && !array_key_exists('device', $json), 'Proposal serialized a nested entity');
+$run = (new WateringRun())
+    ->setStatus(WateringRunStatus::Running->value)
+    ->setLastState(ActuatorState::On->value);
+$json = json_decode($serializer->serialize($run, 'json', ['groups' => ['read:watering_run']]), true, 512, JSON_THROW_ON_ERROR);
+check($json['status'] === 'running' && $json['lastState'] === 'ON', 'Run state serialization changed');
 $db->executeStatement('UPDATE watering_control SET active_run_id = ? WHERE id = 1', [$runId]);
 $json = json_decode($serializer->serialize(freshControl($em), 'json', ['groups' => ['read:watering_control']]), true, 512, JSON_THROW_ON_ERROR);
 check($json['activeRunId'] === $runId && !array_key_exists('activeRun', $json), 'Control active run is not an integer id');
@@ -128,6 +168,7 @@ $telegram = new class implements App\Watering\InterfaceTelegramGateway {
 $policy = newTestPolicy($em, newTestManager($em, $publisher), 'test/topic');
 $bot = newTestBot($em, $policy, $telegram);
 $before = $db->fetchAllAssociative('SELECT id, status FROM watering_proposal ORDER BY id');
+check($policy->decide($proposalId, 'water-now') === 'ignored', 'Unknown decision action was accepted');
 $payloads = ['w:a:0', 'w:a:-1', 'w:a:2147483648', 'w:a:99999999999', 'w:a:'.str_repeat('9', 40), 'w:a:018f4c5e-0000-7000-8000-000000000000', 'w:a:', 'w:x:1', 'garbage'];
 foreach ($payloads as $i => $data) {
     $bot->process(['update_id' => $i, 'callback_query' => ['id' => 'c'.$i, 'from' => ['id' => 123], 'message' => ['chat' => ['id' => 456, 'type' => 'private']], 'data' => $data]]);
@@ -138,4 +179,4 @@ check($before === $db->fetchAllAssociative('SELECT id, status FROM watering_prop
 $db->executeStatement('DELETE FROM watering_proposal');
 clearWateringRuns($db);
 $db->executeStatement('DELETE FROM device WHERE id = ?', [$deviceId]);
-echo "PASS orm mapping: integer JSON, fresh reads, foreign keys and callback bounds\n";
+echo "PASS orm mapping: enum string contracts, integer JSON, fresh reads, foreign keys and callback bounds\n";

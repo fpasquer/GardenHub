@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Entity;
 
 use App\Repository\WateringRunRepository;
+use App\Watering\WateringRunStatus;
 use Doctrine\ORM\Mapping as ORM;
 use Symfony\Component\Serializer\Attribute\Groups;
 use Symfony\Component\Validator\Constraints as Assert;
@@ -15,12 +16,13 @@ use Symfony\Component\Validator\Constraints as Assert;
 #[ORM\Index(name: 'idx_watering_requested', columns: ['requested_at'])]
 class WateringRun
 {
-    public const STATUS_PENDING = 'pending';
-    public const STATUS_RUNNING = 'running';
-    public const STATUS_COMPLETED = 'completed';
-    public const STATUS_UNCERTAIN = 'uncertain';
-    public const STATUS_TIMED_OUT = 'timed_out';
-    public const STATUS_REVIEWED = 'reviewed';
+    public const STATUS_PENDING = WateringRunStatus::Pending->value;
+    public const STATUS_RUNNING = WateringRunStatus::Running->value;
+    public const STATUS_COMPLETED = WateringRunStatus::Completed->value;
+    public const STATUS_UNCERTAIN = WateringRunStatus::Uncertain->value;
+    public const STATUS_TIMED_OUT = WateringRunStatus::TimedOut->value;
+    public const STATUS_REVIEWED = WateringRunStatus::Reviewed->value;
+    public const ERROR_MAX_LENGTH = 255;
 
     /** Cycles that can still time out or become uncertain. */
     public const OPEN_STATUSES = [self::STATUS_PENDING, self::STATUS_RUNNING];
@@ -70,8 +72,8 @@ class WateringRun
     #[Groups(['read:watering_run'])]
     private ?string $lastState = null;
 
-    #[ORM\Column(length: 255, nullable: true)]
-    #[Assert\Length(max: 255, groups: ['validation:watering_run'])]
+    #[ORM\Column(length: self::ERROR_MAX_LENGTH, nullable: true)]
+    #[Assert\Length(max: self::ERROR_MAX_LENGTH, groups: ['validation:watering_run'])]
     #[Groups(['read:watering_run'])]
     private ?string $error = null;
 

@@ -20,6 +20,9 @@ final class WateringManager
 
     private const TIMEOUT_REASON = 'OFF not confirmed before deadline';
     private const UNSAFE_REASON = 'Water shortage or low battery reported';
+    private const MONITOR_FRESHNESS_SECONDS = 5;
+    private const DEADLINE_ALLOWANCE_SECONDS = 10;
+    private const SECONDS_PER_DAY = 86400;
 
     public function __construct(
         private readonly WateringControlRepository $controls,
@@ -35,10 +38,10 @@ final class WateringManager
         if ($this->maxSeconds < 1 || $this->maxSeconds > self::MAX_SECONDS) {
             throw new \LogicException(sprintf('Watering max duration must be between 1 and %d seconds.', self::MAX_SECONDS));
         }
-        if ($this->dailySeconds < $this->maxSeconds || $this->dailySeconds > 86400) {
+        if ($this->dailySeconds < $this->maxSeconds || $this->dailySeconds > self::SECONDS_PER_DAY) {
             throw new \LogicException('Watering daily budget must be at least max duration and no more than 86400 seconds.');
         }
-        if ($this->cooldownSeconds < 0 || $this->cooldownSeconds > 86400) {
+        if ($this->cooldownSeconds < 0 || $this->cooldownSeconds > self::SECONDS_PER_DAY) {
             throw new \LogicException('Watering cooldown must be between 0 and 86400 seconds.');
         }
     }
@@ -67,9 +70,9 @@ final class WateringManager
         // The DB reservation is committed before publishing: a crash or
         // uncertain PUBACK leaves the cycle blocked, never available for retry.
         try {
-            $this->publisher->publish(['watering_times' => $seconds, 'state' => 'ON']);
+            $this->publisher->publish(['watering_times' => $seconds, 'state' => ActuatorState::On->value]);
         } catch (\Throwable $e) {
-            $this->runs->markUncertainIfOpen($id, substr($e->getMessage(), 0, 255));
+            $this->runs->markUncertainIfOpen($id, substr($e->getMessage(), 0, WateringRun::ERROR_MAX_LENGTH));
 
             throw new \RuntimeException(sprintf('Command delivery uncertain; cycle remains blocked: %d', $id), 0, $e);
         }
@@ -82,7 +85,7 @@ final class WateringManager
     {
         $this->assertEnabled();
         $state = json_decode($payload, true);
-        if (!is_array($state) || !in_array($state['state'] ?? null, ['ON', 'OFF'], true)) {
+        if (!is_array($state) || !in_array($state['state'] ?? null, [ActuatorState::On->value, ActuatorState::Off->value], true)) {
             return false;
         }
 
@@ -142,7 +145,7 @@ final class WateringManager
             if (!$run->isBlocked()) {
                 throw new \DomainException('Only a blocked cycle can be manually reviewed.');
             }
-            $run->setStatus(WateringRun::STATUS_REVIEWED)->setFinishedAt(UtcClock::now());
+            $run->setStatus(WateringRunStatus::Reviewed->value)->setFinishedAt(UtcClock::now());
             $control->setActiveRun(null);
         });
     }
@@ -158,10 +161,10 @@ final class WateringManager
 
         $run = (new WateringRun())
             ->setRequestedSeconds($seconds)
-            ->setStatus(WateringRun::STATUS_PENDING)
+            ->setStatus(WateringRunStatus::Pending->value)
             ->setRequestedAt($now)
             // Includes a small allowance for ON acknowledgement and OFF report.
-            ->setDeadlineAt($now->modify(sprintf('+%d seconds', $seconds + 10)));
+            ->setDeadlineAt($now->modify(sprintf('+%d seconds', $seconds + self::DEADLINE_ALLOWANCE_SECONDS)));
         $this->runs->add($run);
         $control->setActiveRun($run)->setLastRequestAt($now);
 
@@ -175,14 +178,14 @@ final class WateringManager
             throw new \DomainException('A watering cycle is active or requires review.');
         }
         $seen = $control->getMonitorSeenAt();
-        if (null === $seen || $seen->getTimestamp() < $now->getTimestamp() - 5) {
+        if (null === $seen || $seen->getTimestamp() < $now->getTimestamp() - self::MONITOR_FRESHNESS_SECONDS) {
             throw new \DomainException('Watering monitor is not reporting; refusing to start.');
         }
         $last = $control->getLastRequestAt();
         if (null !== $last && $last->getTimestamp() > $now->getTimestamp() - $this->cooldownSeconds) {
             throw new \DomainException('Watering cooldown has not elapsed.');
         }
-        $used = $this->runs->sumRequestedSince($now->modify('-24 hours'));
+        $used = $this->runs->sumRequestedSince($now->modify(sprintf('-%d seconds', self::SECONDS_PER_DAY)));
         if ($used + $seconds > $this->dailySeconds) {
             throw new \DomainException('Rolling 24-hour watering limit exceeded.');
         }
@@ -194,7 +197,7 @@ final class WateringManager
         $control = $this->controls->lock()
             ?? throw new \RuntimeException('Run watering migration before starting the monitor.');
         $run = $control->getActiveRun();
-        $on = 'ON' === $state['state'];
+        $on = ActuatorState::On->value === $state['state'];
         if (null === $run) {
             return $on;
         }
@@ -209,7 +212,7 @@ final class WateringManager
             return true;
         }
         if ($this->isUnsafe($state) && $run->isOpen()) {
-            $run->setStatus(WateringRun::STATUS_UNCERTAIN)->setError(self::UNSAFE_REASON);
+            $run->setStatus(WateringRunStatus::Uncertain->value)->setError(self::UNSAFE_REASON);
 
             return true;
         }
@@ -220,8 +223,8 @@ final class WateringManager
     private function applyOn(WateringRun $run, \DateTimeImmutable $now): bool
     {
         $stop = $run->isBlocked();
-        if (WateringRun::STATUS_PENDING === $run->getStatus()) {
-            $run->setStatus(WateringRun::STATUS_RUNNING)->setStartedAt($now);
+        if (WateringRunStatus::Pending->value === $run->getStatus()) {
+            $run->setStatus(WateringRunStatus::Running->value)->setStartedAt($now);
         }
 
         return $stop;
@@ -233,8 +236,8 @@ final class WateringManager
      */
     private function applyOff(WateringControl $control, WateringRun $run, \DateTimeImmutable $now): bool
     {
-        if (WateringRun::STATUS_RUNNING === $run->getStatus() && null !== $run->getStartedAt()) {
-            $run->setStatus(WateringRun::STATUS_COMPLETED)->setFinishedAt($now);
+        if (WateringRunStatus::Running->value === $run->getStatus() && null !== $run->getStartedAt()) {
+            $run->setStatus(WateringRunStatus::Completed->value)->setFinishedAt($now);
             $control->setActiveRun(null);
         }
 
@@ -249,7 +252,7 @@ final class WateringManager
 
     private function markTimedOut(WateringRun $run): void
     {
-        $run->setStatus(WateringRun::STATUS_TIMED_OUT)->setError(self::TIMEOUT_REASON);
+        $run->setStatus(WateringRunStatus::TimedOut->value)->setError(self::TIMEOUT_REASON);
     }
 
     private function assertEnabled(): void
