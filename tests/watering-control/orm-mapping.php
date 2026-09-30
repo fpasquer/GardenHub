@@ -93,7 +93,7 @@ check(throwsForeignKey(fn () => $db->executeStatement('UPDATE watering_control S
 $insertProposal($runId);
 check(throwsForeignKey(fn () => $db->executeStatement('DELETE FROM watering_run WHERE id = ?', [$runId])), 'A referenced run was deleted');
 
-// Telegram callbacks outside the integer range change nothing.
+// Telegram callbacks outside the integer range, including old UUID buttons, change nothing.
 $publisher = new class implements App\Watering\WateringPublisher {
     public int $calls = 0;
 

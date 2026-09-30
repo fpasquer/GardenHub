@@ -327,6 +327,20 @@ function bootMigrationServices(MigrationKernel $kernel): array
 }
 
 /**
+ * A fresh container per step: an executed migration instance is frozen and
+ * cannot run its opposite direction again.
+ *
+ * @return array{0: Connection, 1: Application, 2: DependencyFactory}
+ */
+function rebootMigrationServices(MigrationKernel $kernel): array
+{
+    $kernel->shutdown();
+    $kernel->boot();
+
+    return bootMigrationServices($kernel);
+}
+
+/**
  * @return array{0: int, 1: string} exit code and output of one migration step
  */
 function executeMigration(Application $application, string $version, bool $up): array
@@ -372,7 +386,24 @@ function seedUuidWatering(Connection $connection): void
     $connection->executeStatement($proposal, ['bbbbbbbb-0000-4000-8000-000000000001', '2026-01-01 08:00:00', 101, '00000000-0000-4000-8000-00000000000b']);
     $connection->executeStatement($proposal, ['aaaaaaaa-0000-4000-8000-000000000002', '2026-01-01 07:00:00', 102, null]);
     $connection->executeStatement($proposal, ['cccccccc-0000-4000-8000-000000000003', '2026-01-01 09:00:00', 103, '77777777-0000-4000-8000-00000000000c']);
+    // Already sent to Telegram, so its buttons carry the old UUID.
+    $connection->executeStatement("INSERT INTO watering_proposal (id, device_id, status, created_at, expires_at, duration_seconds, readings_json, notification_status, message_id) VALUES ('dddddddd-0000-4000-8000-000000000004', 1, 'pending', NOW(), DATE_ADD(NOW(), INTERVAL 30 MINUTE), 105, '[]', 'sent', 555)");
+    $connection->executeStatement("INSERT INTO watering_proposal_state (device_id, actuator_topic, prompt_count, last_prompt_at) VALUES (1, 'test/topic', 2, NOW())");
     $connection->executeStatement("UPDATE watering_control SET active_run_id = 'ffffffff-0000-4000-8000-00000000000a' WHERE id = 1");
+}
+
+function countRows(Connection $connection, string $table): int
+{
+    return (int) $connection->fetchOne('SELECT COUNT(*) FROM '.$table);
+}
+
+/** Two proposals written after the upgrade; the first is linked to run id 2. */
+function seedIntegerProposals(Connection $connection): void
+{
+    $insert = "INSERT INTO watering_proposal (device_id, status, created_at, expires_at, duration_seconds, readings_json, notification_status, run_id) VALUES (1, 'approved', NOW(), NOW(), ?, '[]', 'final', ?)";
+    $connection->executeStatement($insert, [201, 2]);
+    $connection->executeStatement($insert, [202, null]);
+    $connection->executeStatement("INSERT INTO watering_proposal_state (device_id, actuator_topic, prompt_count, last_prompt_at) VALUES (1, 'test/topic', 1, NOW())");
 }
 
 /** @return array{runs: array<int, int>, proposals: array<int, array{id: int, run: ?int}>, control: ?int} keyed by marker */
@@ -387,6 +418,8 @@ function wateringLinks(Connection $connection): array
         $proposals[(int) $row['duration_seconds']] = ['id' => $row['id'], 'run' => $row['run_id']];
     }
     $control = $connection->fetchOne('SELECT active_run_id FROM watering_control WHERE id = 1');
+    ksort($runs);
+    ksort($proposals);
 
     return ['runs' => $runs, 'proposals' => $proposals, 'control' => false === $control ? null : $control];
 }
@@ -395,7 +428,7 @@ function assertIntegerWateringIds(Connection $connection): void
 {
     $expected = [
         'runs' => [11 => 1, 22 => 2, 33 => 3],
-        'proposals' => [101 => ['id' => 2, 'run' => 2], 102 => ['id' => 1, 'run' => null], 103 => ['id' => 3, 'run' => 3]],
+        'proposals' => [],
         'control' => 1,
     ];
     $links = wateringLinks($connection);
@@ -404,7 +437,7 @@ function assertIntegerWateringIds(Connection $connection): void
         'proposals' => array_map(static fn (array $p): array => ['id' => (int) $p['id'], 'run' => null === $p['run'] ? null : (int) $p['run']], $l['proposals']),
         'control' => null === $l['control'] ? null : (int) $l['control'],
     ];
-    check($expected === $normalize($links), 'Ids must follow requested_at/created_at order and every link (including NULL) must be remapped: '.json_encode($links));
+    check($expected === $normalize($links), 'Run ids must follow requested_at order, the active run must be remapped and no proposal may survive: '.json_encode($links));
 }
 
 function assertWateringSchema(Connection $connection): void
@@ -427,46 +460,48 @@ function assertWateringSchema(Connection $connection): void
     check(0 === $leftovers, 'Temporary columns must not survive.');
 }
 
-function scenarioWateringIdMigration(Connection $connection, Application $application): void
+function scenarioWateringIdMigration(Connection $connection, Application $application, MigrationKernel $kernel): void
 {
     resetDatabase($connection);
     migrateTo($application, PRE_WATERING_IDS);
     $connection->close();
     seedUuidWatering($connection);
-    $counts = [3, 3];
+    check(4 === countRows($connection, 'watering_proposal') && 1 === countRows($connection, 'watering_proposal_state'), 'The fixture must hold a pending sent proposal and a prompt counter.');
 
     [$exit, $output] = executeMigration($application, WATERING_IDS, true);
     check(0 === $exit, 'The id migration must apply: '.$output);
-    $connection->close();
+    [$connection, $application] = rebootMigrationServices($kernel);
     assertIntegerWateringIds($connection);
     assertWateringSchema($connection);
-    check($counts === [(int) $connection->fetchOne('SELECT COUNT(*) FROM watering_run'), (int) $connection->fetchOne('SELECT COUNT(*) FROM watering_proposal')], 'Row counts must be preserved.');
+    check(3 === countRows($connection, 'watering_run'), 'Runs must be preserved.');
+    check(0 === countRows($connection, 'watering_proposal') && 0 === countRows($connection, 'watering_proposal_state'), 'Proposals and prompt counters must be discarded, including the sent pending one.');
 
-    // New rows continue after the migrated ids.
+    // New rows continue after the migrated run ids and start proposals at 1.
     $connection->executeStatement("INSERT INTO watering_run (requested_seconds, status, requested_at, deadline_at) VALUES (44, 'finished', NOW(), NOW())");
-    $connection->executeStatement("INSERT INTO watering_proposal (device_id, status, created_at, expires_at, duration_seconds, readings_json, notification_status) VALUES (1, 'pending', NOW(), NOW(), 104, '[]', 'new')");
-    check(4 === (int) $connection->fetchOne('SELECT MAX(id) FROM watering_run') && 4 === (int) $connection->fetchOne('SELECT MAX(id) FROM watering_proposal'), 'Generated ids must exceed the migrated ids.');
-    $connection->executeStatement('DELETE FROM watering_proposal WHERE duration_seconds = 104');
+    seedIntegerProposals($connection);
+    check(4 === (int) $connection->fetchOne('SELECT MAX(id) FROM watering_run') && 2 === (int) $connection->fetchOne('SELECT MAX(id) FROM watering_proposal'), 'Generated ids must exceed the migrated run ids and start proposals at 1.');
     $connection->executeStatement('DELETE FROM watering_run WHERE requested_seconds = 44');
 
     [$exit, $output] = executeMigration($application, WATERING_IDS, false);
     check(0 === $exit, 'The id migration must roll back: '.$output);
-    $connection->close();
+    [$connection, $application] = rebootMigrationServices($kernel);
     $down = wateringLinks($connection);
     check(36 === strlen((string) $down['runs'][11]) && $down['control'] === $down['runs'][11], 'The active run link must survive the rollback.');
-    check($down['proposals'][101]['run'] === $down['runs'][22] && null === $down['proposals'][102]['run'] && $down['proposals'][103]['run'] === $down['runs'][33], 'Proposal links must survive the rollback.');
-    check(3 === count(array_unique(array_column($down['proposals'], 'id'))) && 36 === strlen((string) $down['proposals'][101]['id']), 'Rolled back proposals must have unique UUIDs.');
+    check($down['proposals'][201]['run'] === $down['runs'][22] && null === $down['proposals'][202]['run'], 'Proposal links must survive the rollback.');
+    check(2 === count(array_unique(array_column($down['proposals'], 'id'))) && 36 === strlen((string) $down['proposals'][201]['id']), 'Rolled back proposals must have unique UUIDs.');
+    check(1 === countRows($connection, 'watering_proposal_state'), 'The rollback must keep the prompt counter.');
 
     [$exit, $output] = executeMigration($application, WATERING_IDS, true);
     check(0 === $exit, 'The id migration must re-apply after a rollback: '.$output);
-    $connection->close();
+    [$connection] = rebootMigrationServices($kernel);
     assertIntegerWateringIds($connection);
     assertWateringSchema($connection);
+    check(0 === countRows($connection, 'watering_proposal') && 0 === countRows($connection, 'watering_proposal_state'), 'The second upgrade must discard the proposals and prompt counters again.');
 
-    echo "PASS watering ids: order, links, NULLs, indexes, foreign keys, counts, generated ids and up/down/up\n";
+    echo "PASS watering ids: run order, active run, discarded proposals and counters, indexes, foreign keys, generated ids and up/down/up\n";
 }
 
-function scenarioWateringIdEmptyTables(Connection $connection, Application $application): void
+function scenarioWateringIdEmptyTables(Connection $connection, Application $application, MigrationKernel $kernel): void
 {
     resetDatabase($connection);
     migrateTo($application, PRE_WATERING_IDS);
@@ -474,11 +509,11 @@ function scenarioWateringIdEmptyTables(Connection $connection, Application $appl
 
     [$exit, $output] = executeMigration($application, WATERING_IDS, true);
     check(0 === $exit, 'The id migration must apply to empty tables: '.$output);
-    $connection->close();
+    [$connection, $application] = rebootMigrationServices($kernel);
     assertWateringSchema($connection);
     [$exit, $output] = executeMigration($application, WATERING_IDS, false);
     check(0 === $exit, 'The id migration must roll back empty tables: '.$output);
-    $connection->close();
+    [$connection, $application] = rebootMigrationServices($kernel);
     [$exit, $output] = executeMigration($application, WATERING_IDS, true);
     check(0 === $exit, 'The id migration must re-apply to empty tables: '.$output);
 
@@ -492,9 +527,6 @@ function scenarioWateringIdGuards(Connection $connection, Application $applicati
     $connection->close();
     seedUuidWatering($connection);
 
-    $connection->executeStatement("UPDATE watering_proposal SET run_id = 'missing' WHERE duration_seconds = 101");
-    expectMigrationAbort($application, true, 'watering_proposal.run_id references a missing', 'An orphan proposal run must abort the upgrade.');
-    $connection->executeStatement("UPDATE watering_proposal SET run_id = '00000000-0000-4000-8000-00000000000b' WHERE duration_seconds = 101");
     $connection->executeStatement("UPDATE watering_control SET active_run_id = 'missing' WHERE id = 1");
     expectMigrationAbort($application, true, 'watering_control.active_run_id references a missing', 'An orphan active run must abort the upgrade.');
     $connection->executeStatement("UPDATE watering_control SET active_run_id = 'ffffffff-0000-4000-8000-00000000000a' WHERE id = 1");
@@ -507,11 +539,12 @@ function scenarioWateringIdGuards(Connection $connection, Application $applicati
     check(0 === $exit, 'The upgrade must succeed once the data is repaired: '.$output);
     $connection->close();
 
+    seedIntegerProposals($connection);
     $connection->executeStatement('SET FOREIGN_KEY_CHECKS = 0');
-    $connection->executeStatement('UPDATE watering_proposal SET run_id = 999 WHERE duration_seconds = 101');
+    $connection->executeStatement('UPDATE watering_proposal SET run_id = 999 WHERE duration_seconds = 201');
     $connection->executeStatement('SET FOREIGN_KEY_CHECKS = 1');
     expectMigrationAbort($application, false, 'watering_proposal.run_id references a missing', 'An orphan proposal run must abort the rollback.');
-    $connection->executeStatement('UPDATE watering_proposal SET run_id = 2 WHERE duration_seconds = 101');
+    $connection->executeStatement('UPDATE watering_proposal SET run_id = 2 WHERE duration_seconds = 201');
     $connection->executeStatement('SET FOREIGN_KEY_CHECKS = 0');
     $connection->executeStatement('UPDATE watering_control SET active_run_id = 999 WHERE id = 1');
     $connection->executeStatement('SET FOREIGN_KEY_CHECKS = 1');
@@ -520,6 +553,7 @@ function scenarioWateringIdGuards(Connection $connection, Application $applicati
     $connection->executeStatement('ALTER TABLE watering_run ADD id_uuid CHAR(36) DEFAULT NULL');
     expectMigrationAbort($application, false, 'Temporary columns from an interrupted rollback', 'Leftover temporary columns must abort the rollback.');
     $connection->executeStatement('ALTER TABLE watering_run DROP COLUMN id_uuid');
+    $connection->executeStatement('DELETE FROM watering_proposal');
     assertIntegerWateringIds($connection);
 
     echo "PASS watering id guards: orphans and leftover columns abort up and down without touching the schema\n";
@@ -545,10 +579,8 @@ try {
     scenarioFreshInstall($connection, $application, $dependencyFactory);
 
     foreach (['scenarioWateringIdMigration', 'scenarioWateringIdEmptyTables', 'scenarioWateringIdGuards'] as $scenario) {
-        $kernel->shutdown();
-        $kernel->boot();
-        [$connection, $application] = bootMigrationServices($kernel);
-        $scenario($connection, $application);
+        [$connection, $application] = rebootMigrationServices($kernel);
+        $scenario($connection, $application, $kernel);
     }
 
     echo "PASS migration integration: upgrade preservation, constraint enforcement, fresh install, watering ids\n";

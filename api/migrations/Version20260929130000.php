@@ -17,6 +17,10 @@ use Doctrine\Migrations\AbstractMigration;
  * data cannot be converted, and when a previous partial run left temporary
  * columns behind.
  *
+ * Proposals and their prompt counters are deleted: Telegram buttons already
+ * sent carry the old UUID, which cannot be mapped to an integer id, so those
+ * buttons simply stop working. Runs keep their history.
+ *
  * down() restores CHAR(36) columns but cannot restore the original UUID
  * values; every run and proposal receives a fresh UUID().
  */
@@ -39,30 +43,24 @@ final class Version20260929130000 extends AbstractMigration
             'watering_control.active_run_id references a missing watering_run; fix it before migrating.',
         );
         $this->abortIf(
-            $this->orphans('watering_proposal', 'run_id') > 0,
-            'watering_proposal.run_id references a missing watering_run; fix it before migrating.',
-        );
-        $this->abortIf(
-            $this->leftoverColumns(['new_id', 'new_active_run_id', 'new_run_id']) > 0,
-            'Temporary columns from an interrupted run exist (new_id, new_active_run_id, new_run_id); drop them before retrying.',
+            $this->leftoverColumns(['new_id', 'new_active_run_id']) > 0,
+            'Temporary columns from an interrupted run exist (new_id, new_active_run_id); drop them before retrying.',
         );
     }
 
     public function up(Schema $schema): void
     {
+        $this->addSql('DELETE FROM watering_proposal');
+        $this->addSql('DELETE FROM watering_proposal_state');
         $this->addSql('ALTER TABLE watering_run ADD new_id INT DEFAULT NULL');
-        $this->addSql('ALTER TABLE watering_proposal ADD new_id INT DEFAULT NULL, ADD new_run_id INT DEFAULT NULL');
         $this->addSql('ALTER TABLE watering_control ADD new_active_run_id INT DEFAULT NULL');
         $this->addSql('UPDATE watering_run r JOIN (SELECT id, ROW_NUMBER() OVER (ORDER BY requested_at, id) AS n FROM watering_run) o ON o.id = r.id SET r.new_id = o.n');
-        $this->addSql('UPDATE watering_proposal p JOIN (SELECT id, ROW_NUMBER() OVER (ORDER BY created_at, id) AS n FROM watering_proposal) o ON o.id = p.id SET p.new_id = o.n');
         $this->addSql('UPDATE watering_control c JOIN watering_run r ON r.id = c.active_run_id SET c.new_active_run_id = r.new_id');
-        $this->addSql('UPDATE watering_proposal p JOIN watering_run r ON r.id = p.run_id SET p.new_run_id = r.new_id');
 
         $this->addSql('ALTER TABLE watering_run DROP PRIMARY KEY, DROP COLUMN id');
         $this->addSql('ALTER TABLE watering_run CHANGE new_id id INT NOT NULL AUTO_INCREMENT PRIMARY KEY');
         $this->addSql('ALTER TABLE watering_proposal DROP PRIMARY KEY, DROP COLUMN id, DROP COLUMN run_id');
-        $this->addSql('ALTER TABLE watering_proposal CHANGE new_id id INT NOT NULL AUTO_INCREMENT PRIMARY KEY');
-        $this->addSql('ALTER TABLE watering_proposal CHANGE new_run_id run_id INT DEFAULT NULL');
+        $this->addSql('ALTER TABLE watering_proposal ADD id INT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST, ADD run_id INT DEFAULT NULL');
         $this->addSql('ALTER TABLE watering_control DROP COLUMN active_run_id');
         $this->addSql('ALTER TABLE watering_control CHANGE new_active_run_id active_run_id INT DEFAULT NULL');
 
@@ -125,11 +123,13 @@ final class Version20260929130000 extends AbstractMigration
         ));
     }
 
-    /** @param list<string> $columns */
+    /** @param non-empty-list<string> $columns */
     private function leftoverColumns(array $columns): int
     {
+        $placeholders = implode(', ', array_fill(0, count($columns), '?'));
+
         return (int) $this->connection->fetchOne(
-            'SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name IN (?, ?, ?) AND column_name IN (?, ?, ?)',
+            'SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name IN (?, ?, ?) AND column_name IN ('.$placeholders.')',
             ['watering_run', 'watering_proposal', 'watering_control', ...$columns],
         );
     }
