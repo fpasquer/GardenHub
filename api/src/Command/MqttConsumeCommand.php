@@ -7,6 +7,7 @@ namespace App\Command;
 use App\Mqtt\ChirpStackUplink;
 use App\Mqtt\InterfaceMqttClientFactory;
 use App\Mqtt\WorkerMqttClientFactory;
+use PhpMqtt\Client\Contracts\MqttClient;
 use PhpMqtt\Client\Exceptions\MqttClientException;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
@@ -66,22 +67,11 @@ class MqttConsumeCommand extends Command
                 // client ID while the worker is disconnected. The factory
                 // pre-registers the subscription so messages replayed by the
                 // broker before our SUBACK still reach the callback.
-                $client = $clientFactory->create($this->clientId, $this->topic, function (string $topic, string $message) use (&$client, &$processingFailure): void {
-                    if (null !== $processingFailure) {
-                        return;
-                    }
-
-                    try {
-                        try {
-                            $this->handleMessage($topic, $message);
-                        } finally {
-                            $this->servicesResetter->reset();
-                        }
-                    } catch (\Throwable $e) {
-                        $processingFailure = $e;
-                        $client?->interrupt();
-                    }
-                });
+                $client = $clientFactory->create(
+                    $this->clientId,
+                    $this->topic,
+                    $this->createMessageCallback($client, $processingFailure),
+                );
                 $this->logger->info('Connected to MQTT broker.', ['host' => $this->host, 'topic' => $this->topic]);
                 $this->handleSuccessfulConnection();
 
@@ -108,6 +98,28 @@ class MqttConsumeCommand extends Command
 
             sleep($this->reconnectDelaySeconds);
         }
+    }
+
+    private function createMessageCallback(
+        ?MqttClient &$client,
+        ?\Throwable &$processingFailure,
+    ): \Closure {
+        return function (string $topic, string $message) use (&$client, &$processingFailure): void {
+            if (null !== $processingFailure) {
+                return;
+            }
+
+            try {
+                try {
+                    $this->handleMessage($topic, $message);
+                } finally {
+                    $this->servicesResetter->reset();
+                }
+            } catch (\Throwable $exception) {
+                $processingFailure = $exception;
+                $client?->interrupt();
+            }
+        };
     }
 
     /**
@@ -145,6 +157,25 @@ class MqttConsumeCommand extends Command
 
     private function handleMessage(string $topic, string $message): void
     {
+        $uplink = $this->parseUplink($topic, $message);
+        if (null === $uplink) {
+            return;
+        }
+
+        try {
+            $this->messageBus->dispatch($uplink);
+        } catch (TransportExceptionInterface $exception) {
+            $this->logger->error('Failed to enqueue uplink to Messenger transport; interrupting MQTT loop for reconnect.', [
+                'topic' => $topic,
+                'devEui' => $uplink->devEui,
+                'exception' => $exception->getMessage(),
+            ]);
+            throw $exception;
+        }
+    }
+
+    private function parseUplink(string $topic, string $message): ?ChirpStackUplink
+    {
         $data = json_decode($message, true);
         if (!is_array($data)) {
             $this->logger->error('Received malformed JSON uplink; discarding.', [
@@ -152,13 +183,13 @@ class MqttConsumeCommand extends Command
                 'payload_length' => strlen($message),
                 'payload_preview' => substr($message, 0, 128),
             ]);
-            return;
+            return null;
         }
 
         $devEui = $data['deviceInfo']['devEui'] ?? null;
         if (!is_string($devEui) || '' === $devEui) {
             $this->logger->warning('Uplink without deviceInfo.devEui ignored.', ['topic' => $topic]);
-            return;
+            return null;
         }
 
         $deviceName = $data['deviceInfo']['deviceName'] ?? null;
@@ -169,7 +200,7 @@ class MqttConsumeCommand extends Command
         $payload = $data['object'] ?? null;
         if (!is_array($payload) || [] === $payload) {
             $this->logger->info('Uplink without decoded payload ignored.', ['topic' => $topic, 'devEui' => $devEui]);
-            return;
+            return null;
         }
 
         // Reject events without a valid ChirpStack deduplicationId using the
@@ -177,27 +208,26 @@ class MqttConsumeCommand extends Command
         $deduplicationId = $data['deduplicationId'] ?? null;
         if (!is_string($deduplicationId) || !Uuid::isValid($deduplicationId)) {
             $this->logger->warning('Uplink without valid deduplicationId ignored.', ['topic' => $topic, 'devEui' => $devEui]);
-            return;
+            return null;
         }
 
+        return new ChirpStackUplink(
+            $devEui,
+            $payload,
+            $this->parseMeasuredAt($data['time'] ?? null),
+            $deduplicationId,
+            $deviceName,
+        );
+    }
+
+    private function parseMeasuredAt(mixed $time): \DateTimeImmutable
+    {
         try {
-            $measuredAt = isset($data['time']) ? new \DateTimeImmutable((string) $data['time']) : new \DateTimeImmutable();
+            return null !== $time
+                ? new \DateTimeImmutable((string) $time)
+                : new \DateTimeImmutable();
         } catch (\Throwable) {
-            $measuredAt = new \DateTimeImmutable();
-        }
-
-        try {
-            $this->messageBus->dispatch(new ChirpStackUplink($devEui, $payload, $measuredAt, $deduplicationId, $deviceName));
-        } catch (TransportExceptionInterface $e) {
-            // php-mqtt/client catches callback exceptions internally, so we
-            // must explicitly interrupt the loop to trigger reconnection.
-            // The message may be lost if the broker already sent PUBACK.
-            $this->logger->error('Failed to enqueue uplink to Messenger transport; interrupting MQTT loop for reconnect.', [
-                'topic' => $topic,
-                'devEui' => $devEui,
-                'exception' => $e->getMessage(),
-            ]);
-            throw $e;
+            return new \DateTimeImmutable();
         }
     }
 }
