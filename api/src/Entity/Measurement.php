@@ -36,8 +36,9 @@ use Symfony\Component\Validator\Constraints as Assert;
         // and immutable by design: no PATCH or DELETE operations.
         new Post(),
     ],
-    normalizationContext: ['groups' => ['measurement:read']],
-    denormalizationContext: ['groups' => ['measurement:write']],
+    normalizationContext: ['groups' => ['read:measurement']],
+    denormalizationContext: ['groups' => ['write:measurement']],
+    validationContext: ['groups' => ['validate:measurement']],
     paginationItemsPerPage: 100,
 )]
 #[ApiFilter(SearchFilter::class, properties: ['sensor' => 'exact'])]
@@ -49,31 +50,31 @@ class Measurement
     #[ORM\Id]
     #[ORM\GeneratedValue]
     #[ORM\Column]
-    #[Groups(['measurement:read'])]
+    #[Groups(['read:measurement'])]
     private ?int $id = null;
 
     #[ORM\ManyToOne(inversedBy: 'measurements')]
     #[ORM\JoinColumn(nullable: false)]
-    #[Assert\NotNull]
-    #[Groups(['measurement:read', 'measurement:write'])]
+    #[Assert\NotNull(groups: ['validate:measurement'])]
+    #[Groups(['read:measurement', 'write:measurement'])]
     private ?Sensor $sensor = null;
 
     #[ORM\Column]
-    #[Assert\NotNull]
-    #[Groups(['measurement:read', 'measurement:write'])]
+    #[Assert\NotNull(groups: ['validate:measurement'])]
+    #[Groups(['read:measurement', 'write:measurement'])]
     private ?float $value = null;
 
     /**
      * Moment the value was measured by the device (not when it was stored).
      */
     #[ORM\Column]
-    #[Assert\NotNull]
-    #[Assert\LessThanOrEqual('now', message: 'The measurement date cannot be in the future.')]
-    #[Groups(['measurement:read', 'measurement:write'])]
+    #[Assert\NotNull(groups: ['validate:measurement'])]
+    #[Assert\LessThanOrEqual('now', message: 'The measurement date cannot be in the future.', groups: ['validate:measurement'])]
+    #[Groups(['read:measurement', 'write:measurement'])]
     private ?\DateTimeImmutable $measuredAt = null;
 
     #[ORM\Column]
-    #[Groups(['measurement:read'])]
+    #[Groups(['read:measurement'])]
     private ?\DateTimeImmutable $createdAt = null;
 
     /**
@@ -82,9 +83,9 @@ class Measurement
      * Client-supplied on API creation.
      */
     #[ORM\Column(length: 36)]
-    #[Assert\NotBlank]
-    #[Assert\Uuid]
-    #[Groups(['measurement:read', 'measurement:write'])]
+    #[Assert\NotBlank(groups: ['validate:measurement'])]
+    #[Assert\Uuid(groups: ['validate:measurement'])]
+    #[Groups(['read:measurement', 'write:measurement'])]
     private ?string $deduplicationId = null;
 
     /**
@@ -93,9 +94,9 @@ class Measurement
      * write path; read-only over the API.
      */
     #[ORM\Column(length: 50)]
-    #[Assert\NotBlank]
-    #[Assert\Length(max: 50)]
-    #[Groups(['measurement:read'])]
+    #[Assert\NotBlank(groups: ['validate:measurement'])]
+    #[Assert\Length(max: 50, groups: ['validate:measurement'])]
+    #[Groups(['read:measurement'])]
     private ?string $type = null;
 
     public function __construct()

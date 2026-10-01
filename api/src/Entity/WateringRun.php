@@ -37,13 +37,13 @@ class WateringRun
     private ?int $id = null;
 
     #[ORM\Column]
-    #[Assert\Positive(groups: ['validation:watering_run'])]
+    #[Assert\Positive(groups: ['validate:watering_run'])]
     #[Groups(['read:watering_run'])]
     private ?int $requestedSeconds = null;
 
     #[ORM\Column(length: 20)]
-    #[Assert\NotBlank(groups: ['validation:watering_run'])]
-    #[Assert\Length(max: 20, groups: ['validation:watering_run'])]
+    #[Assert\NotBlank(groups: ['validate:watering_run'])]
+    #[Assert\Length(max: 20, groups: ['validate:watering_run'])]
     #[Groups(['read:watering_run'])]
     private ?string $status = null;
 
@@ -68,12 +68,12 @@ class WateringRun
     private ?\DateTimeImmutable $lastStateAt = null;
 
     #[ORM\Column(length: 10, nullable: true)]
-    #[Assert\Length(max: 10, groups: ['validation:watering_run'])]
+    #[Assert\Length(max: 10, groups: ['validate:watering_run'])]
     #[Groups(['read:watering_run'])]
     private ?string $lastState = null;
 
     #[ORM\Column(length: self::ERROR_MAX_LENGTH, nullable: true)]
-    #[Assert\Length(max: self::ERROR_MAX_LENGTH, groups: ['validation:watering_run'])]
+    #[Assert\Length(max: self::ERROR_MAX_LENGTH, groups: ['validate:watering_run'])]
     #[Groups(['read:watering_run'])]
     private ?string $error = null;
 

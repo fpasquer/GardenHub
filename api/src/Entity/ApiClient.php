@@ -15,7 +15,7 @@ use Symfony\Bridge\Doctrine\Validator\Constraints\UniqueEntity;
  * at creation time and can never be recovered.
  */
 #[ORM\Entity(repositoryClass: ApiClientRepository::class)]
-#[UniqueEntity(fields: 'name', message: 'An API client with this name already exists.')]
+#[UniqueEntity(fields: 'name', message: 'An API client with this name already exists.', groups: ['validate:api_client'])]
 class ApiClient
 {
     public const string ROLE_READ = 'ROLE_API_READ';

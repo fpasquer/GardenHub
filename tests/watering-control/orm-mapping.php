@@ -64,7 +64,76 @@ function checkEnumContracts(): void
     check(WateringProposal::FAILURE_MAX_LENGTH === 255, 'Proposal failure length changed');
 }
 
+function checkEntityGroups(): void
+{
+    $serializerMetadata = new Symfony\Component\Serializer\Mapping\Factory\ClassMetadataFactory(
+        new Symfony\Component\Serializer\Mapping\Loader\AttributeLoader(),
+    );
+    $validator = Symfony\Component\Validator\Validation::createValidatorBuilder()
+        ->enableAttributeMapping()->getValidator();
+    $entities = [
+        'Device' => 'device', 'Sensor' => 'sensor',
+        'Measurement' => 'measurement', 'ApiClient' => 'api_client',
+        'WateringControl' => 'watering_control',
+        'WateringProposal' => 'watering_proposal',
+        'WateringRun' => 'watering_run',
+        'WateringProposalState' => 'watering_proposal_state',
+        'WateringTelegramProgress' => 'watering_telegram_progress',
+    ];
+    foreach ($entities as $name => $groupName) {
+        $class = sprintf('App\\Entity\\%s', $name);
+        foreach ($serializerMetadata->getMetadataFor($class)->getAttributesMetadata() as $attribute) {
+            foreach ($attribute->getGroups() as $group) {
+                check(1 === preg_match('/^(read|write):[a-z]+(?:_[a-z]+)*$/D', $group), sprintf('Invalid serializer group: %s', $group));
+            }
+        }
+        $metadata = $validator->getMetadataFor($class);
+        $constraints = $metadata->getConstraints();
+        foreach ($metadata->getConstrainedProperties() as $property) {
+            foreach ($metadata->getPropertyMetadata($property) as $propertyMetadata) {
+                $constraints = array_merge($constraints, $propertyMetadata->getConstraints());
+            }
+        }
+        foreach ($constraints as $constraint) {
+            check($constraint->groups === [sprintf('validate:%s', $groupName)], sprintf('Invalid constraint group on %s', $name));
+        }
+        foreach ((new ReflectionClass($class))->getAttributes(ApiPlatform\Metadata\ApiResource::class) as $attribute) {
+            $resource = $attribute->newInstance();
+            check($resource->getNormalizationContext()['groups'] === [sprintf('read:%s', $groupName)], 'Invalid API read context');
+            check($resource->getDenormalizationContext()['groups'] === [sprintf('write:%s', $groupName)], 'Invalid API write context');
+            check($resource->getValidationContext()['groups'] === [sprintf('validate:%s', $groupName)], 'Invalid API validation context');
+        }
+    }
+}
+
+function checkNamedValidation(): void
+{
+    $validator = Symfony\Component\Validator\Validation::createValidatorBuilder()
+        ->enableAttributeMapping()->getValidator();
+    $invalidEntities = [
+        [(new App\Entity\Measurement())->setMeasuredAt(new DateTimeImmutable('+1 day')), 'measurement', 'measuredAt'],
+        [(new WateringRun())->setRequestedSeconds(0), 'watering_run', 'requestedSeconds'],
+        [(new WateringProposal())->setDurationSeconds(0), 'watering_proposal', 'durationSeconds'],
+        [(new App\Entity\WateringProposalState(new App\Entity\Device(), str_repeat('a', 256))), 'watering_proposal_state', 'actuatorTopic'],
+        [(new App\Entity\WateringTelegramProgress())->setNextUpdateId(-1), 'watering_telegram_progress', 'nextUpdateId'],
+    ];
+    foreach ($invalidEntities as [$entity, $groupName, $property]) {
+        $violations = $validator->validate($entity, null, [sprintf('validate:%s', $groupName)]);
+        $paths = [];
+        foreach ($violations as $violation) {
+            $paths[] = $violation->getPropertyPath();
+        }
+        check(in_array($property, $paths, true), sprintf('Named validation did not reject %s.%s', $groupName, $property));
+    }
+}
+
+checkEntityGroups();
+checkNamedValidation();
 checkEnumContracts();
+if (in_array('--groups-only', $argv, true)) {
+    echo "PASS entity serializer and validation group contracts\n";
+    exit(0);
+}
 $kernel = new Kernel('dev', true);
 $em = bootTestEntityManager($kernel);
 $db = $em->getConnection();

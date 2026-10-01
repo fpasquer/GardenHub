@@ -176,7 +176,11 @@ final class ChirpStackUplinkHandler
         string $devEui,
         string $field,
     ): bool {
-        $violations = $this->validator->validate($measurement);
+        $violations = $this->validator->validate(
+            $measurement,
+            null,
+            ['validate:measurement'],
+        );
         if (count($violations) > 0) {
             $this->logger->error('Measurement rejected by validation.', [
                 'devEui' => $devEui,

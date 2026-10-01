@@ -48,8 +48,8 @@ class WateringProposal
     private ?Device $device = null;
 
     #[ORM\Column(length: 24)]
-    #[Assert\NotBlank(groups: ['validation:watering_proposal'])]
-    #[Assert\Length(max: 24, groups: ['validation:watering_proposal'])]
+    #[Assert\NotBlank(groups: ['validate:watering_proposal'])]
+    #[Assert\Length(max: 24, groups: ['validate:watering_proposal'])]
     #[Groups(['read:watering_proposal'])]
     private ?string $status = null;
 
@@ -62,7 +62,7 @@ class WateringProposal
     private ?\DateTimeImmutable $expiresAt = null;
 
     #[ORM\Column]
-    #[Assert\Positive(groups: ['validation:watering_proposal'])]
+    #[Assert\Positive(groups: ['validate:watering_proposal'])]
     #[Groups(['read:watering_proposal'])]
     private ?int $durationSeconds = null;
 
@@ -80,8 +80,8 @@ class WateringProposal
     private ?int $messageId = null;
 
     #[ORM\Column(length: 24)]
-    #[Assert\NotBlank(groups: ['validation:watering_proposal'])]
-    #[Assert\Length(max: 24, groups: ['validation:watering_proposal'])]
+    #[Assert\NotBlank(groups: ['validate:watering_proposal'])]
+    #[Assert\Length(max: 24, groups: ['validate:watering_proposal'])]
     #[Groups(['read:watering_proposal'])]
     private ?string $notificationStatus = null;
 
@@ -94,13 +94,13 @@ class WateringProposal
     private ?WateringRun $run = null;
 
     #[ORM\Column(length: self::FAILURE_MAX_LENGTH, nullable: true)]
-    #[Assert\Length(max: self::FAILURE_MAX_LENGTH, groups: ['validation:watering_proposal'])]
+    #[Assert\Length(max: self::FAILURE_MAX_LENGTH, groups: ['validate:watering_proposal'])]
     #[Groups(['read:watering_proposal'])]
     private ?string $failure = null;
 
     /** NULL marks a proposal created before the topic was recorded. */
     #[ORM\Column(length: 255, nullable: true)]
-    #[Assert\Length(max: 255, groups: ['validation:watering_proposal'])]
+    #[Assert\Length(max: 255, groups: ['validate:watering_proposal'])]
     #[Groups(['read:watering_proposal'])]
     private ?string $actuatorTopic = null;
 
