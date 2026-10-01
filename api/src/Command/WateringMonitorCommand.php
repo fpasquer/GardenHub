@@ -14,6 +14,8 @@ use Symfony\Component\Console\Output\OutputInterface;
 #[AsCommand(name: 'gardenhub:watering:monitor', description: 'Track dev watering state and enforce its deadline')]
 final class WateringMonitorCommand extends Command
 {
+    private const RECONNECT_DELAY_SECONDS = 2;
+
     public function __construct(
         private readonly WateringMonitorRunner $runner,
         private readonly LoggerInterface $logger,
@@ -36,7 +38,7 @@ final class WateringMonitorCommand extends Command
             } catch (\Throwable $e) {
                 $this->logger->error('Watering monitor connection or state failure; retrying.', ['error' => $e->getMessage()]);
                 $output->writeln('<error>Watering monitor retry: '.$e->getMessage().'</error>');
-                sleep(2);
+                sleep(self::RECONNECT_DELAY_SECONDS);
             }
         }
     }

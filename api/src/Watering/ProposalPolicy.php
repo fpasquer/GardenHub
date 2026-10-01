@@ -16,6 +16,9 @@ use App\Repository\WateringRunRepository;
 /** The database owns the dry episode and decision; no sensor event directly starts watering. */
 final class ProposalPolicy
 {
+    public const ACTION_APPROVE = 'approve';
+    public const ACTION_REJECT = 'reject';
+
     private const DEVICE_NAME = 'SE01-Avocado';
     private const READINGS = 3;
     private const DAY_SECONDS = 86400;
@@ -81,12 +84,12 @@ final class ProposalPolicy
     /** Called only after exact user and private-chat authorization. */
     public function decide(int $id, string $action): string
     {
-        if (!WateringProposal::isValidId($id) || !in_array($action, ['approve', 'reject'], true)) {
-            return 'ignored';
+        if (!WateringProposal::isValidId($id) || !in_array($action, [self::ACTION_APPROVE, self::ACTION_REJECT], true)) {
+            return ProposalDecisionResult::Ignored->value;
         }
         $claimed = $this->runner->run(fn (): string => $this->claimDecision($id, $action));
 
-        return 'executing' === $claimed ? $this->execute($id) : $claimed;
+        return ProposalDecisionResult::Executing->value === $claimed ? $this->execute($id) : $claimed;
     }
 
     public function expire(): void
@@ -175,13 +178,13 @@ final class ProposalPolicy
         ));
         $proposal = (new WateringProposal())
             ->setDevice($device)
-            ->setStatus(WateringProposal::STATUS_PENDING)
+            ->setStatus(WateringProposalStatus::Pending->value)
             ->setCreatedAt($now)
             ->setExpiresAt($now->modify(sprintf('+%d minutes', $this->validityMinutes)))
             ->setDurationSeconds($this->durationSeconds)
             ->setReadingsJson($snapshot)
             ->setLastAttemptAt($attempt)
-            ->setNotificationStatus(WateringProposal::NOTIFICATION_NEW)
+            ->setNotificationStatus(WateringNotificationStatus::New->value)
             ->setActuatorTopic($this->actuatorTopic);
         $this->proposals->add($proposal);
 
@@ -191,31 +194,31 @@ final class ProposalPolicy
     private function claimDecision(int $id, string $action): string
     {
         $p = $this->proposals->lockById($id);
-        if (null === $p || WateringProposal::STATUS_PENDING !== $p->getStatus()) {
-            return 'ignored';
+        if (null === $p || WateringProposalStatus::Pending->value !== $p->getStatus()) {
+            return ProposalDecisionResult::Ignored->value;
         }
         $now = UtcClock::now();
         $p->setDecidedAt($now);
         if ($p->getExpiresAt() <= $now) {
-            $p->setStatus(WateringProposal::STATUS_EXPIRED);
+            $p->setStatus(WateringProposalStatus::Expired->value);
 
-            return 'expired';
+            return ProposalDecisionResult::Expired->value;
         }
         // Checked before any run is reserved; a legacy NULL topic never matches.
         if ($p->getActuatorTopic() !== $this->actuatorTopic) {
-            $p->setStatus(WateringProposal::STATUS_INVALIDATED)->setFailure('Actuator changed');
+            $p->setStatus(WateringProposalStatus::Invalidated->value)->setFailure('Actuator changed');
 
-            return 'invalidated';
+            return ProposalDecisionResult::Invalidated->value;
         }
-        if ('reject' === $action) {
-            $p->setStatus(WateringProposal::STATUS_REJECTED);
+        if (self::ACTION_REJECT === $action) {
+            $p->setStatus(WateringProposalStatus::Rejected->value);
 
-            return 'rejected';
+            return ProposalDecisionResult::Rejected->value;
         }
         // A committed claim is deliberately terminal after a crash. Never automatically reissue request().
-        $p->setStatus(WateringProposal::STATUS_EXECUTING);
+        $p->setStatus(WateringProposalStatus::Executing->value);
 
-        return 'executing';
+        return ProposalDecisionResult::Executing->value;
     }
 
     private function execute(int $id): string
@@ -223,18 +226,23 @@ final class ProposalPolicy
         try {
             $duration = (int) $this->proposals->fresh($id)?->getDurationSeconds();
             $runId = $this->watering->request($duration, fn (\DateTimeImmutable $now) => $this->assertStillValid($id, $now));
-            $this->proposals->finishExecution($id, WateringProposal::STATUS_APPROVED, null, $runId);
+            $this->proposals->finishExecution($id, WateringProposalStatus::Approved->value, null, $runId);
 
-            return 'approved';
+            return ProposalDecisionResult::Approved->value;
         } catch (\DomainException|\LogicException $e) {
-            $this->proposals->finishExecution($id, WateringProposal::STATUS_FAILED, substr($e->getMessage(), 0, 255), null);
+            $this->proposals->finishExecution(
+                $id,
+                WateringProposalStatus::Failed->value,
+                substr($e->getMessage(), 0, WateringProposal::FAILURE_MAX_LENGTH),
+                null,
+            );
 
-            return 'failed';
+            return ProposalDecisionResult::Failed->value;
         } catch (\Throwable) {
             // Includes DB or MQTT uncertainty. The manager's reservation, if any, remains blocked.
-            $this->proposals->finishExecution($id, WateringProposal::STATUS_UNCERTAIN, 'Execution outcome uncertain; manual review required', null);
+            $this->proposals->finishExecution($id, WateringProposalStatus::Uncertain->value, 'Execution outcome uncertain; manual review required', null);
 
-            return 'uncertain';
+            return ProposalDecisionResult::Uncertain->value;
         }
     }
 
@@ -242,7 +250,7 @@ final class ProposalPolicy
     private function assertStillValid(int $id, \DateTimeImmutable $now): void
     {
         $p = $this->proposals->fresh($id);
-        if (null === $p || WateringProposal::STATUS_EXECUTING !== $p->getStatus() || $p->getExpiresAt() <= $now) {
+        if (null === $p || WateringProposalStatus::Executing->value !== $p->getStatus() || $p->getExpiresAt() <= $now) {
             throw new \DomainException('Proposal expired or changed.');
         }
         $readings = $this->measurements->latestSoilMoisture((int) $p->getDevice()?->getId(), self::READINGS);

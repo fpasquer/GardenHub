@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace App\Watering;
 
 /** Separate from the Monolog alert transport; outbound Bot API calls only. */
-final class StreamTelegramGateway implements TelegramGateway
+final class StreamTelegramGateway implements InterfaceTelegramGateway
 {
     public function __construct(private readonly string $botToken, private readonly string $chatId)
     {

@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Mqtt;
 
 use App\Entity\Device;
@@ -166,10 +168,22 @@ final class ChirpStackUplinkHandler
             ->setDeduplicationId($uplink->deduplicationId)
             ->setType($type);
 
-        $violations = $this->validator->validate($measurement);
+        return $this->validateAndPersistMeasurement($measurement, $uplink->devEui, $field);
+    }
+
+    private function validateAndPersistMeasurement(
+        Measurement $measurement,
+        string $devEui,
+        string $field,
+    ): bool {
+        $violations = $this->validator->validate(
+            $measurement,
+            null,
+            ['validate:measurement'],
+        );
         if (count($violations) > 0) {
             $this->logger->error('Measurement rejected by validation.', [
-                'devEui' => $uplink->devEui,
+                'devEui' => $devEui,
                 'field' => $field,
                 'violations' => (string) $violations,
             ]);

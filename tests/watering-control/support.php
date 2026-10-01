@@ -21,10 +21,10 @@ use App\Repository\WateringRunRepository;
 use App\Repository\WateringTelegramProgressRepository;
 use App\Watering\ProposalBot;
 use App\Watering\ProposalPolicy;
-use App\Watering\TelegramGateway;
+use App\Watering\InterfaceTelegramGateway;
 use App\Watering\TransactionRunner;
 use App\Watering\WateringManager;
-use App\Watering\WateringPublisher;
+use App\Watering\InterfaceWateringPublisher;
 use Doctrine\DBAL\Connection;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\Persistence\ManagerRegistry;
@@ -80,7 +80,7 @@ function testRepository(EntityManagerInterface $em, string $class): object
 
 function newTestManager(
     EntityManagerInterface $em,
-    WateringPublisher $publisher,
+    InterfaceWateringPublisher $publisher,
     bool $enabled = true,
     string $environment = 'dev',
     int $maxSeconds = WateringManager::DEFAULT_MAX_SECONDS,
@@ -139,7 +139,7 @@ function newTestPolicy(
     );
 }
 
-function newTestBot(EntityManagerInterface $em, ProposalPolicy $policy, TelegramGateway $telegram): ProposalBot
+function newTestBot(EntityManagerInterface $em, ProposalPolicy $policy, InterfaceTelegramGateway $telegram): ProposalBot
 {
     /** @var WateringTelegramProgressRepository $progress */
     $progress = $em->getRepository(WateringTelegramProgress::class);

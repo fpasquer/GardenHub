@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 use App\Kernel;
 use App\Watering\MqttWateringPublisher;
-use App\Watering\WateringPublisher;
+use App\Watering\InterfaceWateringPublisher;
 
 require '/app/vendor/autoload.php';
 require __DIR__.'/support.php';
 
-final class ConcurrentFakePublisher implements WateringPublisher
+final class ConcurrentFakePublisher implements InterfaceWateringPublisher
 {
     public function publish(array $command): void { usleep(250000); }
 }

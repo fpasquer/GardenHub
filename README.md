@@ -774,7 +774,36 @@ docker compose logs --tail=100 gardenhub-grafana
 its already-injected environment, so it will not pick up either kind of
 change.
 
-### Testing Grafana alerts
+### Watering history
+
+Open **Dashboards → GardenHub → GardenHub — Watering History** for the separate
+report, alongside **GardenHub — Garden Overview**. Its direct path is
+`/d/gardenhub-watering-history`. The overview's existing watering table remains
+available too.
+
+The **Run outcomes** chart above the table shows stacked daily counts for
+completed, timed-out, uncertain, reviewed, pending, and running runs. Counts use
+each run's current status and include runs without a valid watering interval.
+Daily buckets use UTC calendar days; timestamp labels use the dashboard timezone.
+The chart uses the same time-range filter as the table, which stays at the bottom.
+
+The report includes one row per `watering_run`, newest first,
+within the dashboard time range. The range uses `started_at`, falling back to
+`requested_at` for runs that never started; timestamps use the dashboard timezone.
+Actual duration is the recorded end minus start, not `requested_seconds`.
+Estimated volume uses the pump calibration **67 seconds = 500 ml**, rounded to
+one decimal place: 67 seconds → 500.0 ml, 10 seconds → 74.6 ml, and 3 seconds → 22.4 ml.
+
+Only `completed` runs with both timestamps present and a nonnegative interval
+have duration and volume values. Other runs remain visible with empty calculated
+cells. In particular, `reviewed.finished_at` records an operator acknowledgement,
+not the actual watering end. No device joins or production schema changes are used.
+
+Dashboard files are checked by the provisioner every 30 seconds. To explicitly
+refresh Grafana after updating the file, run `make deploy-grafana`; this only
+recreates Grafana, without restarting MySQL or operating the pump.
+
+### Testing Grafana dashboards and alerts
 
 `tests/grafana-db/` runs the pinned Grafana image against this repo's actual,
 unmodified provisioning files and a disposable MySQL database, seeding
@@ -790,6 +819,22 @@ asserts that the Telegram contact point's `chatid` decodes as a string:
 
 ```bash
 docker compose -f tests/grafana-db/compose.yaml up --abort-on-container-exit --exit-code-from tests
+docker compose -f tests/grafana-db/compose.yaml down -v
+```
+
+The suite also executes the actual provisioned Watering history query through
+Grafana against a disposable `watering_run` fixture matching the current schema.
+It verifies the separate dashboard is provisioned in the GardenHub folder and
+matches the overview's watering table. It checks calibration, zero/negative durations, missing timestamps, status guards,
+timestamp types, empty history, ordering, and inclusive time-range boundaries.
+It also verifies stacked outcomes counts across multiple days and that the
+watering table remains below the chart.
+The fixture's schema changes apply only to this isolated test database.
+For a focused check without waiting for the alert scenarios:
+
+```bash
+docker compose -f tests/grafana-db/compose.yaml up -d --wait gardenhub-mysql grafana
+docker compose -f tests/grafana-db/compose.yaml run --rm -e WATERING_HISTORY_ONLY=1 tests
 docker compose -f tests/grafana-db/compose.yaml down -v
 ```
 

@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Entity;
 
 use ApiPlatform\Doctrine\Orm\Filter\OrderFilter;
@@ -29,11 +31,13 @@ use Symfony\Bridge\Doctrine\Validator\Constraints\UniqueEntity;
 #[UniqueEntity(
     fields: ['device', 'type'],
     message: 'This device already has a sensor of this type.',
+    groups: ['validate:sensor'],
 )]
-#[AssertSensorIdentityImmutable]
+#[AssertSensorIdentityImmutable(groups: ['validate:sensor'])]
 #[ApiResource(
-    normalizationContext: ['groups' => ['sensor:read']],
-    denormalizationContext: ['groups' => ['sensor:write']],
+    normalizationContext: ['groups' => ['read:sensor']],
+    denormalizationContext: ['groups' => ['write:sensor']],
+    validationContext: ['groups' => ['validate:sensor']],
     paginationItemsPerPage: 50,
 )]
 #[ApiFilter(SearchFilter::class, properties: ['device' => 'exact', 'type' => 'exact'])]
@@ -43,40 +47,40 @@ class Sensor
     #[ORM\Id]
     #[ORM\GeneratedValue]
     #[ORM\Column]
-    #[Groups(['sensor:read', 'measurement:read'])]
+    #[Groups(['read:sensor', 'read:measurement'])]
     private ?int $id = null;
 
     #[ORM\ManyToOne(inversedBy: 'sensors')]
     #[ORM\JoinColumn(nullable: false)]
-    #[Assert\NotNull]
-    #[Groups(['sensor:read', 'sensor:write'])]
+    #[Assert\NotNull(groups: ['validate:sensor'])]
+    #[Groups(['read:sensor', 'write:sensor'])]
     private ?Device $device = null;
 
     /**
      * Free-form sensor type: temperature, humidity, soil_moisture, ...
      */
     #[ORM\Column(length: 50)]
-    #[Assert\NotBlank]
-    #[Assert\Length(max: 50)]
-    #[Groups(['sensor:read', 'sensor:write', 'measurement:read'])]
+    #[Assert\NotBlank(groups: ['validate:sensor'])]
+    #[Assert\Length(max: 50, groups: ['validate:sensor'])]
+    #[Groups(['read:sensor', 'write:sensor', 'read:measurement'])]
     private ?string $type = null;
 
     /**
      * Unit of the measured value: °C, %, hPa, lux, ...
      */
     #[ORM\Column(length: 20)]
-    #[Assert\NotBlank]
-    #[Assert\Length(max: 20)]
-    #[Groups(['sensor:read', 'sensor:write', 'measurement:read'])]
+    #[Assert\NotBlank(groups: ['validate:sensor'])]
+    #[Assert\Length(max: 20, groups: ['validate:sensor'])]
+    #[Groups(['read:sensor', 'write:sensor', 'read:measurement'])]
     private ?string $unit = null;
 
     #[ORM\Column(length: 100, nullable: true)]
-    #[Assert\Length(max: 100)]
-    #[Groups(['sensor:read', 'sensor:write'])]
+    #[Assert\Length(max: 100, groups: ['validate:sensor'])]
+    #[Groups(['read:sensor', 'write:sensor'])]
     private ?string $label = null;
 
     #[ORM\Column]
-    #[Groups(['sensor:read'])]
+    #[Groups(['read:sensor'])]
     private ?\DateTimeImmutable $createdAt = null;
 
     /** @var Collection<int, Measurement> */

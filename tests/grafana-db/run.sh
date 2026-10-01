@@ -33,6 +33,163 @@ run_sql() {
     mysql -h "$MYSQL_HOST" -u root gardenhub < "$1"
 }
 
+watering_panel() {
+    curl -sf --max-time "$CURL_MAX_TIME" -u "$GRAFANA_AUTH" \
+        "$GRAFANA_URL/api/dashboards/uid/$1" \
+        | jq -e --arg uid "$1" --arg title "${2:-Watering history}" '
+            select(.dashboard.uid == $uid and .meta.folderTitle == "GardenHub"
+                and (.meta.provisionedExternalId | endswith($uid + ".json")))
+            | select($uid != "gardenhub-watering-history" or
+                (.dashboard.title == "GardenHub \u2014 Watering History" and (.dashboard.panels | length) == 2))
+            | .dashboard.panels[] | select(.title == $title)
+        '
+}
+
+assert_watering_config() {
+    printf '%s' "$1" | jq -e '
+        def property($name; $id):
+            [.fieldConfig.overrides[] | select(.matcher.options == $name)
+             | .properties[] | select(.id == $id) | .value][0];
+        .type == "table" and .targets[0].format == "table"
+        and .targets[0].datasource.uid == "gardenhub-mysql"
+        and .fieldConfig.defaults.noValue == ""
+        and .options.sortBy == []
+        and property("Started at"; "unit") == "dateTimeAsIso"
+        and property("Ended at"; "unit") == "dateTimeAsIso"
+        and property("Actual duration (seconds)"; "unit") == "suffix:s"
+        and property("Estimated volume (ml)"; "unit") == "suffix:ml"
+        and property("Estimated volume (ml)"; "decimals") == 1
+        and (.targets[0].rawSql | contains("FROM watering_run"))
+        and (.targets[0].rawSql | test("join|requested_seconds|device"; "i") | not)
+    ' >/dev/null
+}
+
+query_watering() {
+    payload=$(printf '%s' "$1" | jq --arg from "$2" --arg to "$3" '
+        {from: $from, to: $to, queries: [(.targets[0] + {intervalMs: 1000, maxDataPoints: 1000})]}
+    ')
+    result=$(curl --fail-with-body -sS --max-time "$CURL_MAX_TIME" -u "$GRAFANA_AUTH" \
+        -H 'Content-Type: application/json' -d "$payload" "$GRAFANA_URL/api/ds/query") || {
+        printf '%s\n' "$result" >&2
+        return 1
+    }
+    printf '%s' "$result" | jq -e '.results.A.error == null and (.results.A.status // 200) == 200' >/dev/null
+    printf '%s' "$result" | jq -e '.results.A.frames | length == 1' >/dev/null
+    printf '%s' "$result" | jq '.results.A.frames[0]'
+}
+
+seed_watering_history() {
+    mysql -h "$MYSQL_HOST" -u root gardenhub <<'SQL'
+INSERT INTO watering_run (id, requested_seconds, status, requested_at, deadline_at, started_at, finished_at)
+SELECT fixture.id, 999, fixture.status,
+    DATE_ADD('2026-01-01 00:00:00', INTERVAL fixture.request_offset SECOND),
+    '2026-01-01 02:00:00',
+    DATE_ADD('2026-01-01 00:00:00', INTERVAL fixture.start_offset SECOND),
+    DATE_ADD('2026-01-01 00:00:00', INTERVAL fixture.end_offset SECOND)
+FROM (
+    SELECT 1 id, 'completed' status, 60 request_offset, 60 start_offset, 127 end_offset
+    UNION ALL SELECT 2, 'completed', 120, 120, 130
+    UNION ALL SELECT 3, 'completed', 180, 180, 183
+    UNION ALL SELECT 4, 'completed', 240, 240, 240
+    UNION ALL SELECT 5, 'completed', 300, NULL, 310
+    UNION ALL SELECT 6, 'completed', 360, 360, NULL
+    UNION ALL SELECT 7, 'pending', 420, NULL, NULL
+    UNION ALL SELECT 8, 'completed', 480, 480, 479
+    UNION ALL SELECT 9, 'reviewed', 540, 540, 600
+    UNION ALL SELECT 10, 'running', 600, 600, 610
+    UNION ALL SELECT 11, 'uncertain', 660, 660, 670
+    UNION ALL SELECT 12, 'timed_out', 720, 720, 730
+    UNION ALL SELECT 13, 'pending', 780, 780, 790
+    UNION ALL SELECT 14, 'completed', -60, 840, 850
+    UNION ALL SELECT 15, 'completed', 900, -60, -50
+    UNION ALL SELECT 16, 'pending', -1, NULL, NULL
+    UNION ALL SELECT 17, 'pending', 3601, NULL, NULL
+    UNION ALL SELECT 18, 'completed', -120, 0, 3
+    UNION ALL SELECT 19, 'pending', 3600, NULL, NULL
+    UNION ALL SELECT 20, 'completed', 3600, 3600, 3603
+    UNION ALL SELECT 21, 'completed', 420, NULL, NULL
+) fixture;
+SQL
+}
+
+assert_watering_rows() {
+    printf '%s' "$1" | jq -e '
+        [.schema.fields[].name] == ["Run ID", "Status", "Started at", "Ended at",
+            "Actual duration (seconds)", "Estimated volume (ml)"]
+        and [.schema.fields[].type] == ["number", "string", "time", "time", "number", "number"]
+        and .data.values[0] == [20,19,14,13,12,11,10,9,8,21,7,6,5,4,3,2,1,18]
+        and (.data.values | transpose | sort_by(.[0]) | map([.[0], .[4], .[5]])) == [
+            [1,67,500.0], [2,10,74.6], [3,3,22.4], [4,0,0.0],
+            [5,null,null], [6,null,null], [7,null,null], [8,null,null],
+            [9,null,null], [10,null,null], [11,null,null], [12,null,null], [13,null,null],
+            [14,10,74.6], [18,3,22.4], [19,null,null], [20,3,22.4], [21,null,null]
+        ]
+        and (.data.values | transpose | map(select(.[0] == 1)) | .[0][2:4]) == [1767225660000,1767225727000]
+        and (.data.values | transpose | map(select(.[0] == 5)) | .[0][2]) == null
+        and (.data.values | transpose | map(select(.[0] == 6)) | .[0][3]) == null
+        and (.data.values | transpose | map(select(.[0] == 7)) | .[0][2:4]) == [null,null]
+    ' >/dev/null
+}
+
+check_run_outcomes() {
+    chart=$(watering_panel gardenhub-watering-history 'Run outcomes')
+    printf '%s' "$chart" | jq -e --argjson table "$1" '
+        .type == "barchart" and .options.stacking == "normal"
+        and .options.orientation == "vertical" and .options.xField == "Day"
+        and .options.legend.showLegend == true and .fieldConfig.defaults.decimals == 0
+        and (.gridPos.y + .gridPos.h) <= $table.gridPos.y
+        and .targets[0].format == "table"
+        and (.targets[0].rawSql | contains("FROM watering_run"))
+        and (.targets[0].rawSql | test("join|requested_seconds|device"; "i") | not)
+    ' >/dev/null
+    frame=$(query_watering "$chart" 1767225600000 1767229200000)
+    printf '%s' "$frame" | jq -e '
+        [.schema.fields[].name] == ["Day","Completed","Timed out","Uncertain","Reviewed","Pending","Running"]
+        and [.schema.fields[].type] == ["time","number","number","number","number","number","number"]
+        and (.data.values | transpose) == [[1767225600000,11,1,1,1,3,1]]
+    ' >/dev/null
+    frame=$(query_watering "$chart" 1767225720000 1767225780000)
+    printf '%s' "$frame" | jq -e '(.data.values | transpose) == [[1767225600000,2,0,0,0,0,0]]' >/dev/null
+    frame=$(query_watering "$chart" 1767139200000 1767142800000)
+    printf '%s' "$frame" | jq -e '[.data.values[][]] | length == 0' >/dev/null
+    mysql -h "$MYSQL_HOST" -u root gardenhub -e "
+        INSERT INTO watering_run (id, requested_seconds, status, requested_at, deadline_at, started_at, finished_at)
+        SELECT id + 100, requested_seconds, status,
+            DATE_ADD(requested_at, INTERVAL 1 DAY), DATE_ADD(deadline_at, INTERVAL 1 DAY),
+            DATE_ADD(started_at, INTERVAL 1 DAY), DATE_ADD(finished_at, INTERVAL 1 DAY)
+        FROM watering_run WHERE id IN (1,9,10,11,12,19);
+    "
+    frame=$(query_watering "$chart" 1767225600000 1767315600000)
+    printf '%s' "$frame" | jq -e '(.data.values | transpose) == [
+        [1767225600000,11,1,1,1,4,1], [1767312000000,1,1,1,1,1,1]
+    ]' >/dev/null
+    echo 'PASS: stacked daily outcomes, all status counts, day separation, empty/ranged results and table below chart'
+}
+
+check_watering_history() {
+    echo '=== Watering history: provisioned query, calibration, nulls and time range ==='
+    panel=$(watering_panel gardenhub-watering-history)
+    overview=$(watering_panel gardenhub-overview)
+    printf '%s' "$overview" | jq -e --argjson standalone "$panel" \
+        'del(.gridPos, .id) == ($standalone | del(.gridPos, .id))' >/dev/null
+    assert_watering_config "$panel"
+    mysql -h "$MYSQL_HOST" -u root gardenhub -e 'DELETE FROM watering_run;'
+    frame=$(query_watering "$panel" 1767225600000 1767229200000)
+    printf '%s' "$frame" | jq -e '[.data.values[][]] | length == 0' >/dev/null
+    seed_watering_history
+    frame=$(query_watering "$panel" 1767225600000 1767229200000)
+    assert_watering_rows "$frame"
+    frame=$(query_watering "$panel" 1767225720000 1767225780000)
+    printf '%s' "$frame" | jq -e '.data.values[0] == [3,2]' >/dev/null
+    echo 'PASS: separate dashboard in GardenHub, overview consistency, calculations, status guards, timestamps, ordering and inclusive time bounds'
+    check_run_outcomes "$panel"
+}
+
+check_watering_history
+if [ "${WATERING_HISTORY_ONLY:-0}" = 1 ]; then
+    exit 0
+fi
+
 # Inserts one measurement for an existing device/sensor_type, timestamped
 # $4 minutes before now. Lets scenarios stage precise "latest 3 readings"
 # sequences without a bespoke seed file per step.

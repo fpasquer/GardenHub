@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-use App\Watering\WateringPublisher;
+use App\Watering\InterfaceWateringPublisher;
 use App\Entity\WateringRun;
 use App\Kernel;
 use Doctrine\ORM\EntityManagerInterface;
@@ -10,7 +10,7 @@ use Doctrine\ORM\EntityManagerInterface;
 require '/app/vendor/autoload.php';
 require __DIR__.'/support.php';
 
-final class FakePublisher implements WateringPublisher
+final class FakePublisher implements InterfaceWateringPublisher
 {
     public array $commands = [];
     public bool $fail = false;
@@ -59,6 +59,9 @@ $db = $em->getConnection();
 $publisher = new FakePublisher();
 $watering = newTestManager($em, $publisher);
 
+foreach (['invalid-json', '{}', '{"state":"UNKNOWN"}', '{"state":true}', '{"state":1}'] as $payload) {
+    check(!$watering->observe($payload), 'Invalid actuator state was accepted');
+}
 rejects(fn () => $watering->request(0), 'Zero duration accepted');
 rejects(fn () => $watering->request(31), 'Excessive duration accepted');
 rejects(fn () => (newTestManager($em, $publisher, true, 'prod'))->request(3), 'Production enabled dev control');
@@ -69,6 +72,11 @@ rejects(fn () => $watering->request(3), 'Stale monitor heartbeat allowed waterin
 $watering->heartbeat();
 
 $id = $watering->request(3);
+$reservedRun = runById($em, $id);
+check(
+    $reservedRun->getDeadlineAt()->getTimestamp() - $reservedRun->getRequestedAt()->getTimestamp() === 13,
+    'Deadline acknowledgement allowance changed',
+);
 check(count($publisher->commands) === 1 && $publisher->commands[0] === ['watering_times' => 3, 'state' => 'ON'], 'Expected one non-retained ON command');
 rejects(fn () => $watering->request(3), 'Duplicate request accepted');
 check(!$watering->observe('{"state":"OFF"}'), 'OFF should not require another stop');

@@ -101,6 +101,62 @@ function violationPath(?array $body, string $expectedPath): bool
     return false;
 }
 
+function checkApiValidationGroups(SensorIdentityKernel $kernel, string $apiKey, string $deviceIri, string $sensorIri): void
+{
+    $sensor = ['device' => $deviceIri, 'type' => 'group-test', 'unit' => '%'];
+    $measurement = [
+        'sensor' => $sensorIri, 'value' => 12.3,
+        'measuredAt' => '2020-01-01T00:00:00+00:00',
+        'deduplicationId' => (string) Uuid::v4(),
+    ];
+    $cases = [
+        ['/api/devices', ['name' => ''], 'name'],
+        ['/api/devices', ['name' => str_repeat('a', 101)], 'name'],
+        ['/api/devices', ['name' => 'Identity device 1'], 'name'],
+        ['/api/devices', ['name' => 'Group test', 'devEui' => 'sid-dev-1'], 'devEui'],
+        ['/api/devices', ['name' => 'Group test', 'devEui' => str_repeat('a', 33)], 'devEui'],
+        ['/api/sensors', ['type' => 'group-test', 'unit' => '%'], 'device'],
+        ['/api/sensors', array_replace($sensor, ['type' => '']), 'type'],
+        ['/api/sensors', array_replace($sensor, ['unit' => str_repeat('a', 21)]), 'unit'],
+        ['/api/sensors', array_replace($sensor, ['type' => 'temp_b', 'unit' => 'V']), 'device'],
+        ['/api/measurements', array_diff_key($measurement, ['value' => true]), 'value'],
+        ['/api/measurements', array_replace($measurement, ['deduplicationId' => 'not-a-uuid']), 'deduplicationId'],
+        ['/api/measurements', array_replace($measurement, ['measuredAt' => '2999-01-01T00:00:00+00:00']), 'measuredAt'],
+    ];
+    foreach ($cases as [$uri, $payload, $property]) {
+        [$response, $body] = apiRequest($kernel, $apiKey, 'POST', $uri, $payload);
+        check(
+            Response::HTTP_UNPROCESSABLE_ENTITY === $response->getStatusCode() && violationPath($body, $property),
+            sprintf('Named API validation failed for %s.%s: %s', $uri, $property, $response->getContent()),
+        );
+    }
+    echo "PASS named API validation: required fields, lengths, uniqueness, UUID and future dates\n";
+}
+
+function checkApiReadGroups(SensorIdentityKernel $kernel, string $apiKey, string $deviceIri, string $sensorIri, string $measurementIri): void
+{
+    $cases = [
+        [$deviceIri, ['id', 'name', 'devEui', 'description', 'createdAt']],
+        [$sensorIri, ['id', 'device', 'type', 'unit', 'label', 'createdAt']],
+        [$measurementIri, ['id', 'sensor', 'value', 'measuredAt', 'createdAt', 'deduplicationId', 'type']],
+    ];
+    foreach ($cases as [$iri, $fields]) {
+        [$response, $body] = apiRequest($kernel, $apiKey, 'GET', $iri);
+        check(Response::HTTP_OK === $response->getStatusCode(), 'Read request failed');
+        $actual = array_values(array_filter(array_keys($body), static fn (string $field): bool => !str_starts_with($field, '@')));
+        sort($actual);
+        sort($fields);
+        check($actual === $fields, sprintf('Read fields changed for %s: %s', $iri, $response->getContent()));
+    }
+    [, $sensor] = apiRequest($kernel, $apiKey, 'GET', $sensorIri);
+    check(!array_key_exists('devEui', $sensor['device']), 'Nested device exposed additional fields');
+    [, $measurement] = apiRequest($kernel, $apiKey, 'GET', $measurementIri);
+    check(!array_key_exists('device', $measurement['sensor']), 'Nested sensor exposed additional fields');
+    check($measurement['type'] === 'temp_b', 'Read-only measurement type became writable');
+    check(!str_starts_with($measurement['createdAt'], '2999'), 'Read-only creation date became writable');
+    echo "PASS read/write groups: fields preserved, nested exposure unchanged, read-only writes ignored\n";
+}
+
 try {
     check('1' === getenv('GARDENHUB_LIFECYCLE_TESTS'), 'Run only with the isolated test Compose file.');
     $kernel = new SensorIdentityKernel('dev', true);
@@ -130,7 +186,10 @@ try {
     // -----------------------------------------------------------------
     // 1. A new sensor's device/type/unit are freely settable.
     // -----------------------------------------------------------------
-    [$response, $device1] = apiRequest($kernel, $apiKey, 'POST', '/api/devices', ['name' => 'Identity device 1', 'devEui' => 'sid-dev-1']);
+    [$response, $device1] = apiRequest($kernel, $apiKey, 'POST', '/api/devices', [
+        'name' => 'Identity device 1', 'devEui' => 'sid-dev-1',
+        'description' => 'Serialization group regression fixture',
+    ]);
     check(Response::HTTP_CREATED === $response->getStatusCode(), 'Device creation must succeed. Got: '.$response->getContent());
     $device1Iri = $device1['@id'];
 
@@ -164,13 +223,16 @@ try {
     // 3. Once a measurement exists, protected fields are rejected.
     // -----------------------------------------------------------------
     $deduplicationId = (string) Uuid::v4();
-    [$response] = apiRequest($kernel, $apiKey, 'POST', '/api/measurements', [
+    [$response, $measurement] = apiRequest($kernel, $apiKey, 'POST', '/api/measurements', [
         'sensor' => $sensorIri,
         'value' => 1.23,
         'measuredAt' => '2020-01-01T00:00:00+00:00',
         'deduplicationId' => $deduplicationId,
+        'type' => 'must-not-be-written',
+        'createdAt' => '2999-01-01T00:00:00+00:00',
     ]);
     check(Response::HTTP_CREATED === $response->getStatusCode(), 'The first measurement must be accepted. Got: '.$response->getContent());
+    $measurementIri = $measurement['@id'];
     echo "PASS measurement: the sensor's first measurement is accepted\n";
 
     [$response, $body] = apiRequest($kernel, $apiKey, 'PATCH', $sensorIri, ['type' => 'temp_c'], 'application/merge-patch+json');
@@ -218,6 +280,9 @@ try {
     check('Still the same sensor' === $sensor['label'], 'The label must not be persisted when the same request also changes a protected field.');
     check('temp_b' === $sensor['type'], 'The type must not be persisted when the request is rejected.');
     echo "PASS atomic: a rejected combined update leaves no partial change (label included)\n";
+
+    checkApiValidationGroups($kernel, $apiKey, $device1Iri, $sensorIri);
+    checkApiReadGroups($kernel, $apiKey, $device1Iri, $sensorIri, $measurementIri);
 
     $storedCount = (int) $connection->fetchOne('SELECT COUNT(*) FROM measurement WHERE sensor_id = ?', [$sensorId]);
     check(1 === $storedCount, 'Exactly one measurement must remain stored for this sensor throughout.');

@@ -38,3 +38,20 @@ CREATE TABLE measurement (
     PRIMARY KEY (id),
     CONSTRAINT fk_measurement_sensor FOREIGN KEY (sensor_id) REFERENCES sensor (id)
 ) DEFAULT CHARACTER SET utf8mb4;
+
+-- Disposable fixture only: mirrors Version20260927140000 and the integer-id
+-- conversion in Version20260929130000. No application schema is changed.
+CREATE TABLE watering_run (
+    id INT AUTO_INCREMENT NOT NULL,
+    requested_seconds INT NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    requested_at DATETIME NOT NULL,
+    deadline_at DATETIME NOT NULL,
+    started_at DATETIME DEFAULT NULL,
+    finished_at DATETIME DEFAULT NULL,
+    last_state_at DATETIME DEFAULT NULL,
+    last_state VARCHAR(10) DEFAULT NULL,
+    error VARCHAR(255) DEFAULT NULL,
+    PRIMARY KEY (id),
+    INDEX idx_watering_requested (requested_at)
+) DEFAULT CHARACTER SET utf8mb4;

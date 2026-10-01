@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Entity;
 
 use ApiPlatform\Doctrine\Orm\Filter\OrderFilter;
@@ -18,11 +20,12 @@ use Symfony\Component\Validator\Constraints as Assert;
  * A physical IoT device (e.g. an SE01 sensor node) attached to the garden.
  */
 #[ORM\Entity(repositoryClass: DeviceRepository::class)]
-#[UniqueEntity(fields: 'name', message: 'A device with this name already exists.')]
-#[UniqueEntity(fields: 'devEui', message: 'A device with this Eui already exists.')]
+#[UniqueEntity(fields: 'name', message: 'A device with this name already exists.', groups: ['validate:device'])]
+#[UniqueEntity(fields: 'devEui', message: 'A device with this Eui already exists.', groups: ['validate:device'])]
 #[ApiResource(
-    normalizationContext: ['groups' => ['device:read']],
-    denormalizationContext: ['groups' => ['device:write']],
+    normalizationContext: ['groups' => ['read:device']],
+    denormalizationContext: ['groups' => ['write:device']],
+    validationContext: ['groups' => ['validate:device']],
     paginationItemsPerPage: 30,
 )]
 #[ApiFilter(SearchFilter::class, properties: ['name' => 'partial'])]
@@ -32,13 +35,13 @@ class Device
     #[ORM\Id]
     #[ORM\GeneratedValue]
     #[ORM\Column]
-    #[Groups(['device:read', 'sensor:read'])]
+    #[Groups(['read:device', 'read:sensor'])]
     private ?int $id = null;
 
     #[ORM\Column(length: 100, unique: true)]
-    #[Assert\NotBlank]
-    #[Assert\Length(max: 100)]
-    #[Groups(['device:read', 'device:write', 'sensor:read'])]
+    #[Assert\NotBlank(groups: ['validate:device'])]
+    #[Assert\Length(max: 100, groups: ['validate:device'])]
+    #[Groups(['read:device', 'write:device', 'read:sensor'])]
     private ?string $name = null;
 
     /**
@@ -46,17 +49,17 @@ class Device
      * to this device. Optional until MQTT ingestion is implemented.
      */
     #[ORM\Column(length: 32, nullable: true, unique: true)]
-    #[Assert\Length(max: 32)]
-    #[Groups(['device:read', 'device:write'])]
+    #[Assert\Length(max: 32, groups: ['validate:device'])]
+    #[Groups(['read:device', 'write:device'])]
     private ?string $devEui = null;
 
     #[ORM\Column(length: 255, nullable: true)]
-    #[Assert\Length(max: 255)]
-    #[Groups(['device:read', 'device:write'])]
+    #[Assert\Length(max: 255, groups: ['validate:device'])]
+    #[Groups(['read:device', 'write:device'])]
     private ?string $description = null;
 
     #[ORM\Column]
-    #[Groups(['device:read'])]
+    #[Groups(['read:device'])]
     private ?\DateTimeImmutable $createdAt = null;
 
     /** @var Collection<int, Sensor> */

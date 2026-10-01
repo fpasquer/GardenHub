@@ -12,7 +12,7 @@ final class ProposalBot
     public function __construct(
         private readonly WateringTelegramProgressRepository $progress,
         private readonly ProposalPolicy $policy,
-        private readonly TelegramGateway $telegram,
+        private readonly InterfaceTelegramGateway $telegram,
         private readonly string $expectedUserId,
         private readonly string $expectedChatId,
     ) {
@@ -46,7 +46,10 @@ final class ProposalBot
         $chat = $callback['message']['chat'] ?? null;
         $data = $callback['data'] ?? null;
         if ((string) $from === $this->expectedUserId && (string) ($chat['id'] ?? '') === $this->expectedChatId && ($chat['type'] ?? null) === 'private' && is_string($data) && preg_match('/^w:([ar]):([0-9]{1,10})$/D', $data, $m)) {
-            $this->policy->decide((int) $m[2], $m[1] === 'a' ? 'approve' : 'reject');
+            $this->policy->decide(
+                (int) $m[2],
+                $m[1] === 'a' ? ProposalPolicy::ACTION_APPROVE : ProposalPolicy::ACTION_REJECT,
+            );
         }
         // Even rejected and replayed callbacks are answered; a failed answer replays safely.
         $this->telegram->acknowledge($callback['id']);

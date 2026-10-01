@@ -1,0 +1,171 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "datasource": { "type": "mysql", "uid": "gardenhub-mysql" },
+      "description": "Counts every run by its current recorded status, using started_at or requested_at when never started. Buckets are UTC calendar days; timestamps display in the dashboard timezone.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Runs",
+            "axisPlacement": "auto",
+            "fillOpacity": 85,
+            "lineWidth": 1
+          },
+          "decimals": 0,
+          "min": 0,
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Day" },
+            "properties": [{ "id": "unit", "value": "time:YYYY-MM-DD" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Completed" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#73BF69" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Timed out" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F2495C" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Uncertain" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF9830" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Reviewed" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#5794F2" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Pending" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F2CC0C" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Running" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#00B5B8" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "id": 2,
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.9,
+        "groupWidth": 0.7,
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "orientation": "vertical",
+        "showValue": "never",
+        "stacking": "normal",
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "xField": "Day",
+        "xTickLabelRotation": 0
+      },
+      "pluginVersion": "12.1.10",
+      "targets": [
+        {
+          "datasource": { "type": "mysql", "uid": "gardenhub-mysql" },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  CAST(DATE(COALESCE(started_at, requested_at)) AS DATETIME) AS `Day`,\n  SUM(status = 'completed') AS `Completed`,\n  SUM(status = 'timed_out') AS `Timed out`,\n  SUM(status = 'uncertain') AS `Uncertain`,\n  SUM(status = 'reviewed') AS `Reviewed`,\n  SUM(status = 'pending') AS `Pending`,\n  SUM(status = 'running') AS `Running`\nFROM watering_run\nWHERE COALESCE(started_at, requested_at) BETWEEN $__timeFrom() AND $__timeTo()\nGROUP BY `Day`\nORDER BY `Day`",
+          "refId": "A"
+        }
+      ],
+      "title": "Run outcomes",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "mysql",
+        "uid": "gardenhub-mysql"
+      },
+      "description": "Estimated volume uses recorded elapsed time and the calibration 67 seconds = 500 ml. Only completed runs have a confirmed interval; reviewed end timestamps record operator acknowledgement.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "noValue": "",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#5A9E6F", "value": null }]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Run ID" },
+            "properties": [{ "id": "unit", "value": "none" }, { "id": "decimals", "value": 0 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Started at" },
+            "properties": [{ "id": "unit", "value": "dateTimeAsIso" }, { "id": "custom.width", "value": 180 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Ended at" },
+            "properties": [{ "id": "unit", "value": "dateTimeAsIso" }, { "id": "custom.width", "value": 180 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Actual duration (seconds)" },
+            "properties": [{ "id": "unit", "value": "suffix:s" }, { "id": "decimals", "value": 0 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Estimated volume (ml)" },
+            "properties": [{ "id": "unit", "value": "suffix:ml" }, { "id": "decimals", "value": 1 }]
+          }
+        ]
+      },
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 9 },
+      "id": 1,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "pluginVersion": "12.1.10",
+      "targets": [
+        {
+          "datasource": { "type": "mysql", "uid": "gardenhub-mysql" },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  r.id AS `Run ID`,\n  r.status AS `Status`,\n  r.started_at AS `Started at`,\n  r.finished_at AS `Ended at`,\n  r.actual_seconds AS `Actual duration (seconds)`,\n  ROUND(r.actual_seconds * 500.0 / 67.0, 1) AS `Estimated volume (ml)`\nFROM (\n  SELECT id, status, requested_at, started_at, finished_at,\n    CASE\n      WHEN status = 'completed'\n        AND started_at IS NOT NULL\n        AND finished_at IS NOT NULL\n        AND finished_at >= started_at\n      THEN TIMESTAMPDIFF(SECOND, started_at, finished_at)\n      ELSE NULL\n    END AS actual_seconds\n  FROM watering_run\n  WHERE COALESCE(started_at, requested_at) BETWEEN $__timeFrom() AND $__timeTo()\n) r\nORDER BY COALESCE(r.started_at, r.requested_at) DESC, r.id DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Watering history",
+      "type": "table"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 41,
+  "tags": [
+    "gardenhub",
+    "iot",
+    "watering"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "GardenHub \u2014 Watering History",
+  "uid": "gardenhub-watering-history",
+  "version": 1
+}
