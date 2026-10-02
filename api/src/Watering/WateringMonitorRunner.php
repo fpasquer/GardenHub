@@ -20,28 +20,25 @@ final class WateringMonitorRunner
         private readonly WateringManager $watering,
         private readonly InterfaceWateringPublisher $publisher,
         private readonly LoggerInterface $logger,
-        private readonly string $host,
-        private readonly int $port,
-        private readonly string $username,
-        private readonly string $password,
+        private readonly WateringConfiguration $configuration,
         private readonly float $subackTimeoutSeconds = self::DEFAULT_SUBACK_TIMEOUT_SECONDS,
-        private readonly string $topic = MqttWateringPublisher::DEFAULT_TOPIC,
     ) {
     }
 
     public function isConfigured(): bool
     {
-        return '' !== $this->host && '' !== $this->username && '' !== $this->password && '' !== trim($this->topic);
+        return $this->configuration->isConfigured();
     }
 
     /** $stopRequested is polled each heartbeat iteration; production passes a closure that never stops. */
     public function runConnectionAttempt(\Closure $stopRequested): void
     {
+        $this->configuration->assertAvailable();
         // Unguarded: a failure here must abort the attempt before connecting.
         $this->watering->invalidateHeartbeat();
 
         $repository = new MemoryRepository();
-        $client = new MqttClient($this->host, $this->port, 'gardenhub-watering-monitor', repository: $repository);
+        $client = new MqttClient($this->configuration->host, $this->configuration->port, 'gardenhub-watering-monitor', repository: $repository);
         $callbackFailure = null;
         $throwCallbackFailure = static function () use (&$callbackFailure): void {
             if ($callbackFailure !== null) {
@@ -49,8 +46,8 @@ final class WateringMonitorRunner
             }
         };
         try {
-            $client->connect((new ConnectionSettings())->setUsername($this->username)->setPassword($this->password)->setKeepAliveInterval(30), true);
-            $client->subscribe($this->topic, function (string $topic, string $message) use (&$callbackFailure): void {
+            $client->connect((new ConnectionSettings())->setUsername($this->configuration->username)->setPassword($this->configuration->password)->setKeepAliveInterval(30), true);
+            $client->subscribe($this->configuration->topic, function (string $topic, string $message) use (&$callbackFailure): void {
                 if ($callbackFailure !== null) {
                     return;
                 }
@@ -63,7 +60,7 @@ final class WateringMonitorRunner
                 }
             }, MqttClient::QOS_AT_LEAST_ONCE);
             SubscriptionReadyGate::await($client, $repository, $this->subackTimeoutSeconds, $throwCallbackFailure);
-            $this->logger->info('Monitoring '.$this->topic);
+            $this->logger->info('Monitoring '.$this->configuration->topic);
             $this->runHeartbeatLoop($client, $stopRequested, $throwCallbackFailure);
         } finally {
             try {

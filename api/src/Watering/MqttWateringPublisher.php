@@ -18,36 +18,26 @@ final class MqttWateringPublisher implements InterfaceWateringPublisher
     private const CLIENT_ID_RANDOM_BYTES = 5;
 
     public function __construct(
-        private readonly string $host,
-        private readonly int $port,
-        private readonly string $username,
-        private readonly string $password,
-        private readonly string $environment,
-        private readonly string $topic = self::DEFAULT_TOPIC,
+        private readonly WateringConfiguration $configuration,
     ) {
-        if ('' === trim($this->topic) || str_contains($this->topic, '#') || str_contains($this->topic, '+') || str_ends_with($this->topic, '/set')) {
-            throw new \LogicException('Watering MQTT topic must be a concrete base topic.');
-        }
     }
 
     public function topic(): string
     {
-        return $this->topic;
+        return $this->configuration->topic;
     }
 
     public function publish(array $command): void
     {
-        if ('dev' !== $this->environment || '' === $this->host || '' === $this->username || '' === $this->password) {
-            throw new \LogicException('Development watering MQTT credentials are unavailable.');
-        }
+        $this->configuration->assertAvailable();
 
         // Injected so we can verify the PUBACK actually arrived, not just that loop() returned.
         $repository = new MemoryRepository();
-        $client = new MqttClient($this->host, $this->port, 'gardenhub-watering-publish-'.bin2hex(random_bytes(self::CLIENT_ID_RANDOM_BYTES)), repository: $repository);
+        $client = new MqttClient($this->configuration->host, $this->configuration->port, 'gardenhub-watering-publish-'.bin2hex(random_bytes(self::CLIENT_ID_RANDOM_BYTES)), repository: $repository);
         try {
-            $client->connect((new ConnectionSettings())->setUsername($this->username)->setPassword($this->password), true);
+            $client->connect((new ConnectionSettings())->setUsername($this->configuration->username)->setPassword($this->configuration->password), true);
             // Never retain actuator commands. Wait for PUBACK before returning.
-            $client->publish($this->topic.'/set', json_encode($command, JSON_THROW_ON_ERROR), MqttClient::QOS_AT_LEAST_ONCE, false);
+            $client->publish($this->configuration->topic.'/set', json_encode($command, JSON_THROW_ON_ERROR), MqttClient::QOS_AT_LEAST_ONCE, false);
             $client->loop(true, true, self::PUBACK_TIMEOUT_SECONDS);
             if ($repository->countPendingOutgoingMessages() > 0) {
                 throw new \RuntimeException('Publish acknowledgement (PUBACK) not received within timeout.');

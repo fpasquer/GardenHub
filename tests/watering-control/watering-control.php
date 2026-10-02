@@ -64,11 +64,12 @@ foreach (['invalid-json', '{}', '{"state":"UNKNOWN"}', '{"state":true}', '{"stat
 }
 rejects(fn () => $watering->request(0), 'Zero duration accepted');
 rejects(fn () => $watering->request(31), 'Excessive duration accepted');
-rejects(fn () => (newTestManager($em, $publisher, true, 'prod'))->request(3), 'Production enabled dev control');
+rejects(fn () => (newTestManager($em, $publisher, true, 'test'))->request(3), 'Unsupported environment accepted');
 rejects(fn () => (newTestManager($em, $publisher, false, 'dev'))->request(3), 'Disabled control accepted');
 rejects(fn () => $watering->request(3), 'Missing monitor heartbeat allowed watering');
 $db->executeStatement('UPDATE watering_control SET monitor_seen_at = DATE_SUB(NOW(), INTERVAL 10 SECOND) WHERE id = 1');
 rejects(fn () => $watering->request(3), 'Stale monitor heartbeat allowed watering');
+$watering = newTestManager($em, $publisher, true, 'prod');
 $watering->heartbeat();
 
 $id = $watering->request(3);

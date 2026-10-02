@@ -19,6 +19,10 @@ if (!$host || !$username || !$password || !$port || $port < 1 || $port > 65535 |
 }
 
 $base = 'gardenhub/dev/watering/avocado';
+if (getenv('WATERING_MQTT_TOPIC') !== $base) {
+    fwrite(STDERR, "Simulator refuses a non-simulator watering topic.\n");
+    exit(1);
+}
 $state = 'OFF';
 $battery = 100;
 $alarm = false;

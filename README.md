@@ -86,6 +86,157 @@ The LoRaStack and GardenHub repositories remain logically independent, but in pr
 
 ---
 
+## Production watering and deployment
+
+The real `gardenhub-watering-monitor` and `gardenhub-watering-proposals`
+services are defined in `compose.yaml`. All PHP application services run code
+from the built `gardenhub-api` image in the shared base, default to `APP_ENV=prod`,
+and receive the same watering configuration. `compose-dev.yaml` explicitly
+selects `APP_ENV=dev`, adds source mounts and development host mappings, and
+contains the simulator and Adminer. Production must use the base file alone.
+The Make helpers require Docker Compose and Python 3 (standard library only).
+
+Watering is disabled by default (`WATERING_ENABLED=false`). Enablement and
+profile selection are separate gates. Effective combinations are:
+
+| Files | Profiles | Watering services when enabled |
+| --- | --- | --- |
+| Base | none | none |
+| Base | `watering-hardware` | monitor |
+| Base | `watering-hardware,watering-proposals` | monitor and Telegram poller |
+| Base + dev | none | none; Adminer is development-only |
+| Base + dev | `watering-sim` | simulator and monitor |
+| Base + dev | `watering-sim,watering-proposals` | simulator, monitor and poller |
+| Base + dev | `watering-hardware` | monitor, no simulator |
+| Base + dev | `watering-hardware,watering-proposals` | monitor and poller, no simulator |
+
+Profiles are OR gates, not AND gates. The dev monitor's profile list explicitly
+replaces the base list. The proposal profile does not implicitly activate a
+monitor: the Make helpers refuse proposals without either monitor profile.
+Make skips watering services when disabled, even if their profiles are selected.
+Plain Compose still starts explicitly selected/profile-active services; their
+runtime guards then reject disabled or incomplete configuration before any
+MQTT/Telegram connection. Explicitly naming a service bypasses its profile, so
+prefer the guarded Make helpers. Do not select simulator and hardware modes
+together or use the simulator profile with a hardware topic.
+
+Configure production in the server's untracked root `.env` (or `.env.local`,
+which Make reads after `.env`). Set `APP_ENV=prod` explicitly if an older file
+still contains `dev`. In addition to the existing database/MQTT/Grafana variables:
+
+```dotenv
+APP_ENV=prod
+WATERING_ENABLED=true
+WATERING_MQTT_HOST=<broker-address-reachable-from-the-gardenhub-network>
+WATERING_MQTT_PORT=1883
+WATERING_MQTT_TOPIC=zigbee2mqtt/avocado-watering
+WATERING_MQTT_USERNAME=<production-watering-account>
+WATERING_MQTT_PASSWORD=<production-watering-password>
+TELEGRAM_BOT_TOKEN=<production-bot-token>
+WATERING_TELEGRAM_USER_ID=<authorized-user-id>
+WATERING_TELEGRAM_CHAT_ID=<authorized-private-chat-id>
+```
+
+The topic must be an explicit concrete base topic, not a wildcard or `/set`
+topic. Host, valid port, nonblank credentials and topic are required before
+reservation/publication. Broker authentication must also succeed. Production
+has no implicit simulator topic, development credential, or generic MQTT
+credential fallback. `WATERING_DEV_USERNAME`/`WATERING_DEV_PASSWORD` remain
+compatible only through development Compose mappings; neutral names take
+precedence. Outside Compose, explicitly provide the neutral names and topic.
+
+Limits remain configurable and unchanged: `WATERING_MAX_SECONDS=30`,
+`WATERING_DAILY_SECONDS=120` (rolling 24 hours),
+`WATERING_COOLDOWN_SECONDS=60`, `WATERING_PROPOSAL_DURATION_SECONDS=3`,
+`WATERING_PROPOSAL_THRESHOLD=15`, freshness/max-gap 35 minutes, validity
+30 minutes. Use the independently approved hardware calibration and safety
+limits; switching to production does not increase limits or change duration
+to 67 seconds. Interactive proposals require the token and both authorized
+IDs even if `TELEGRAM_ENABLED=false` (that flag controls logging, not proposals).
+
+### Cutover and startup
+
+Before production enablement, stop the Pi's hardware monitor **and** proposal
+poller, using the guarded shutdown below with both Compose files. Check for
+unresolved cycles and independently confirm that the physical pump is OFF.
+Separate databases do not provide a shared actuator lock: only one environment
+may command the real pump. Only one poller may consume updates for the same
+Telegram bot, including non-GardenHub pollers/webhooks. Use production MQTT
+credentials restricted to the concrete state and `/set` topics, then remove
+development write access to the hardware topic after cutover. Broker ACL changes
+and physical verification are operator actions, not part of GardenHub deployment.
+
+For a new database, first keep `WATERING_ENABLED=false` and run `make start` to
+build the image, start MySQL and apply migrations. After cutover and explicit
+configuration, enable watering and select profiles:
+
+```bash
+# Monitor only, base production Compose file.
+COMPOSE_PROFILES=watering-hardware make start
+# Monitor and interactive Telegram proposals.
+COMPOSE_PROFILES=watering-hardware,watering-proposals make start
+# Subsequent production deployment, clean master checkout required.
+COMPOSE_PROFILES=watering-hardware,watering-proposals make deploy
+# Development: no watering; explicitly choose simulator or hardware as needed.
+make dev
+make dev-sim
+COMPOSE_PROFILES=watering-proposals make dev-sim
+make dev-hardware
+COMPOSE_PROFILES=watering-proposals make dev-hardware
+```
+
+Development helpers explicitly force `APP_ENV=dev`. `make dev` no longer
+automatically activates the simulator. Simulator startup refuses a non-simulator
+topic before building/starting anything; the simulator itself also rejects the
+mismatch and remains hard-coded to its dev topic. Hardware startup requires an
+explicit hardware topic and never starts the simulator. Make reads both env
+files automatically; direct Compose commands must pass `.env.local` explicitly
+when it exists. Persist `COMPOSE_PROFILES` in the root env file or pass the same
+profile selection on every startup/deployment; enabling a flag alone does not
+activate a monitor.
+
+### Deployment and shutdown
+
+`make start` and `make deploy` build first, guard stops, migrate before starting
+application containers, and recreate selected services from the image. Deployment
+retains the existing always-deployed scheduler policy. Enabled/profile-active
+watering services participate in recreation and health checks; disabled/inactive
+ones are not required. Previously running watering services are still stopped
+when deactivated. A required service must be running, not restarting, and healthy;
+missing, exiting, dead or unhealthy services fail deployment. Monitor health
+requires a fresh database heartbeat established only after SUBACK, not just a
+running process. Poller health checks its anchored PHP process, not the checking
+shell. Health checks never publish or poll Telegram.
+
+The read-only `gardenhub:watering:check` refuses any unresolved `active_run_id`,
+including pending/running and uncertain/timed-out cycles. It does not expire,
+clear, acknowledge or change a run. `deploy-stop` checks before disruption,
+quiesces HTTP/API and poller request sources while leaving the monitor alive,
+then checks again immediately before stopping the monitor. A refusal at the
+second check leaves request sources stopped but the monitor running; defer
+deployment and inspect the cycle. Migration failure leaves the application tier
+stopped. Do not issue concurrent manual CLI requests or publish directly during
+deployment/shutdown; the helpers cannot control another environment or external
+publisher. A missing schema is allowed only for disabled first-time bootstrap
+with no existing monitor/poller containers; other database failures fail closed.
+
+For an idle, guarded application-tier shutdown (MySQL and Grafana remain running):
+
+```bash
+# Production; keep the same profile selection used at startup.
+COMPOSE_PROFILES=watering-hardware,watering-proposals make deploy-stop
+# Pi/development: include development configuration, then stop the fake device.
+make deploy-stop COMPOSE_FILES='-f compose.yaml -f compose-dev.yaml'
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml stop gardenhub-watering-sim
+```
+
+An uncertain/timed-out cycle must first be independently verified OFF and manually
+reviewed with `gardenhub:watering:acknowledge-stop --confirm-actuator-off` in its
+own environment. Never clear a reservation to force deployment. Do not use
+unguarded `docker compose down`, monitor recreation or direct monitor stop during
+an active cycle. Read-only inspection is available through
+`docker compose exec -T gardenhub-api php bin/console gardenhub:watering:check`.
+
 ## Watering simulator on the Pi (development only)
 
 The opt-in `gardenhub-watering-sim` service in `compose-dev.yaml` emulates the
@@ -108,8 +259,8 @@ Set these values in GardenHub's untracked root `.env` on the Pi:
 WATERING_SIM_USERNAME=watering_sim
 WATERING_SIM_PASSWORD=<simulator-password-from-broker>
 WATERING_ENABLED=true
-WATERING_DEV_USERNAME=watering_dev
-WATERING_DEV_PASSWORD=<separate-watering_dev-password-from-broker>
+WATERING_MQTT_USERNAME=watering_dev
+WATERING_MQTT_PASSWORD=<separate-watering_dev-password-from-broker>
 ```
 
 `MQTT_HOST` and `MQTT_PORT` are shared with the existing dev worker. Start only
@@ -150,12 +301,12 @@ with `false` and `100`. No real Zigbee2MQTT process is required on the Pi.
 
 ### Manual watering through GardenHub
 
-This is intentionally **development only**. The application command publishes
+The application command publishes
 to `WATERING_MQTT_TOPIC/set`, requires `WATERING_ENABLED=true` and
-`APP_ENV=dev`, and uses the MQTT identity configured in
-`WATERING_DEV_USERNAME`/`WATERING_DEV_PASSWORD`. The simulator defaults to the
-dev topic and the `watering_dev` account. The production Compose file does
-not provide watering credentials or start the monitor. The optional proposal
+`APP_ENV=dev` or `prod`, and uses the MQTT identity configured in
+`WATERING_MQTT_USERNAME`/`WATERING_MQTT_PASSWORD`. Development Compose defaults
+to the simulator topic; production requires explicit configuration and profiles.
+The optional proposal
 poller below never starts a cycle without an authorized Telegram approval.
 
 After updating the Pi checkout, run the new migration, then start the opt-in
@@ -203,7 +354,7 @@ docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
   exec gardenhub-api php bin/console gardenhub:watering:acknowledge-stop --confirm-actuator-off
 ```
 
-This manual override is dev-only and preserves the cooldown and daily budget.
+This manual override requires enabled watering and preserves the cooldown and daily budget.
 It requires an independent check that the actuator is OFF; the command itself
 does not stop or verify the pump.
 
@@ -212,7 +363,7 @@ does not stop or verify the pump.
 The optional `gardenhub-watering-proposals` service runs one outbound-only
 Telegram long poller. It has no published port or webhook. Start it only with
 the selected actuator and monitor, after applying the migration. It requires
-`APP_ENV=dev`, `WATERING_ENABLED=true`, the dev bot token, and both
+`APP_ENV=dev` or `prod`, `WATERING_ENABLED=true`, that environment's bot token, and both
 `WATERING_TELEGRAM_USER_ID` and `WATERING_TELEGRAM_CHAT_ID` set to the exact
 numeric IDs of the intended user and private chat. Set these in the untracked
 root `.env.local`; keep one `getUpdates` poller for this bot, including outside
@@ -295,8 +446,8 @@ remain simulator-safe and must be explicitly overridden for this test:
 ```dotenv
 WATERING_ENABLED=true
 WATERING_MQTT_TOPIC=zigbee2mqtt/avocado-watering
-WATERING_DEV_USERNAME=watering_hw_dev
-WATERING_DEV_PASSWORD=<separate-hardware-account-password>
+WATERING_MQTT_USERNAME=watering_hw_dev
+WATERING_MQTT_PASSWORD=<separate-hardware-account-password>
 WATERING_MAX_SECONDS=67
 WATERING_DAILY_SECONDS=134
 WATERING_COOLDOWN_SECONDS=1800
@@ -305,20 +456,16 @@ WATERING_PROPOSAL_DURATION_SECONDS=67
 
 Stop the simulator if it is running. Recreate the API, monitor, and proposal
 containers so all three receive the new topic, credentials, and limits. Start
-only the hardware and proposal profiles; `make dev` enables the simulator
-profile and should not be used for this hardware run. The commands include the
+only the hardware and proposal profiles with `make dev-hardware`; `make dev`
+does not activate watering. The commands include the
 untracked `.env.local` that holds the Telegram user and chat IDs described
 above.
 
 ```bash
 cd /opt/GardenHub
-docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  stop gardenhub-watering-sim gardenhub-watering-monitor gardenhub-watering-proposals
-docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  up -d --no-deps --force-recreate gardenhub-api
-docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  --profile watering-hardware --profile watering-proposals up -d --no-deps --force-recreate \
-  gardenhub-watering-monitor gardenhub-watering-proposals
+make deploy-stop COMPOSE_FILES='-f compose.yaml -f compose-dev.yaml'
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml stop gardenhub-watering-sim
+COMPOSE_PROFILES=watering-proposals make dev-hardware
 docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
   logs -f gardenhub-watering-monitor
 ```
@@ -344,6 +491,7 @@ physical pump is OFF before `gardenhub:watering:acknowledge-stop
 Run its isolated integration suite with:
 
 ```bash
+python3 tests/watering-control/compose-deployment.py
 docker compose -f tests/watering-control/compose.yaml run --rm tests
 docker compose -f tests/watering-control/compose.yaml down -v
 ```
@@ -530,7 +678,7 @@ How it works:
 The migration makes `deduplication_id`/`type` mandatory and adds the unique
 index. Queued `ChirpStackUplink` messages serialized by the old code lack
 `deduplicationId` and would crash the new handler, so they must be drained by
-the **old** code first. Because `api/src` is bind-mounted into the containers,
+the **old** code first. In development, `api/src` is bind-mounted into the containers,
 pulling new code before draining would change the code the drain consumer runs
 — so code is pulled only after the queues are empty and the drain consumer is
 stopped.
@@ -540,7 +688,8 @@ writer services are — so the two mysql commands below use `docker compose exec
 against that already-running container; never `exec` into a stopped service.
 Every other CLI step runs in a **one-off container**
 (`docker compose run --rm --no-deps`), which starts its own throwaway container
-using the *currently checked-out* code. `--no-deps` explicitly prevents Compose
+using the built image (or the current source mounts in development). Build the
+appropriate image before each production one-off step. `--no-deps` explicitly prevents Compose
 from starting that command's dependencies (e.g. `gardenhub-mysql`) as a side
 effect — it is not an optional precaution — so the writer services stay
 stopped for the whole procedure.
@@ -1382,8 +1531,8 @@ docker compose --profile scheduler up -d gardenhub-scheduler
 docker compose logs -f gardenhub-scheduler
 ```
 
-Production deployment (`make deploy` already includes `gardenhub-scheduler`
-in `DEPLOY_SERVICES`, so this is normally automatic; documented here for
+Production deployment (`make deploy` retains `gardenhub-scheduler`
+in its application selection, so this is normally automatic; documented here for
 reference/manual use):
 
 ```bash

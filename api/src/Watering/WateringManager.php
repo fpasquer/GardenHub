@@ -9,7 +9,7 @@ use App\Entity\WateringRun;
 use App\Repository\WateringControlRepository;
 use App\Repository\WateringRunRepository;
 
-/** Durable, single-actuator safety gate for development watering. */
+/** Durable, single-actuator safety gate for explicitly enabled watering. */
 final class WateringManager
 {
     /** Absolute actuator bound; configured limits can only be stricter. */
@@ -29,8 +29,7 @@ final class WateringManager
         private readonly WateringRunRepository $runs,
         private readonly TransactionRunner $runner,
         private readonly InterfaceWateringPublisher $publisher,
-        private readonly bool $enabled,
-        private readonly string $environment,
+        private readonly WateringConfiguration $configuration,
         private readonly int $maxSeconds = self::DEFAULT_MAX_SECONDS,
         private readonly int $dailySeconds = self::DEFAULT_DAILY_SECONDS,
         private readonly int $cooldownSeconds = self::DEFAULT_COOLDOWN_SECONDS,
@@ -255,10 +254,8 @@ final class WateringManager
         $run->setStatus(WateringRunStatus::TimedOut->value)->setError(self::TIMEOUT_REASON);
     }
 
-    private function assertEnabled(): void
+    public function assertEnabled(): void
     {
-        if (!$this->enabled || 'dev' !== $this->environment) {
-            throw new \LogicException('Watering control is available only in explicitly enabled development.');
-        }
+        $this->configuration->assertAvailable();
     }
 }
