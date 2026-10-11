@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import json
+import math
+import re
 import sys
 
 
@@ -16,7 +18,13 @@ SIM_TOPIC = 'gardenhub/dev/watering/avocado'
 
 
 def enabled(environment):
-    return str(environment.get('WATERING_ENABLED', 'false')).lower() in ('true', '1')
+    value = str(environment.get('WATERING_ENABLED', '')).strip(' \t\n\r\v').lower()
+    if value in ('true', 'yes', 'on'):
+        return True
+    if not re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?', value):
+        return False
+    number = float(value)
+    return math.isfinite(number) and number != 0
 
 
 def validate_mqtt(environment):

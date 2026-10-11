@@ -177,8 +177,16 @@ timeout. Preserve full alert-transition coverage; the focused watering-history
 mode is not a replacement for the release suite. The smoke script always cleans
 up its stack. When running Grafana manually, clean up even after a failed run.
 
-Watering is disabled by default (`WATERING_ENABLED=false`). Enablement and
-profile selection are separate gates. Effective combinations are:
+Watering is disabled by default (`WATERING_ENABLED=false`), including when the
+setting is omitted. Symfony's native `%env(bool:WATERING_ENABLED)%` and the
+deployment helper use the same boolean behavior: `true`, `yes`, `on` and valid
+nonzero decimal numbers (including negative numbers and scientific notation)
+enable watering; `false`, `no`, `off`, zero, empty and unrecognized strings
+disable it. Spellings are case-insensitive; surrounding spaces, tabs, newlines,
+carriage returns and vertical tabs are ignored. Other whitespace is not stripped.
+Numeric syntax follows PHP's integer/float validation filters: hexadecimal,
+underscores, non-finite numbers and overflow/underflow to zero do not enable it.
+Enablement and profile selection are separate gates. Effective combinations are:
 
 | Files | Profiles | Watering services when enabled |
 | --- | --- | --- |

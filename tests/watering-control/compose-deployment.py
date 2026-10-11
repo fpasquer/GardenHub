@@ -26,6 +26,36 @@ SYNTHETIC = {
     'MQTT_CLIENT_ID': 'synthetic', 'GRAFANA_MYSQL_USER': 'synthetic',
     'GRAFANA_MYSQL_PASSWORD': 'synthetic',
 }
+BOOLEAN_VALUES = [
+    ('true', True), ('yes', True), ('on', True), ('false', False),
+    ('no', False), ('off', False), ('', False), ('0', False), ('-0', False),
+    ('+0', False), ('0.0', False), ('-0.00e10', False), ('0e999999', False),
+    ('1', True), ('2', True), ('-2', True), ('+2', True), ('01', True),
+    ('0.5', True), ('-.5', True), ('1.', True), ('1.e2', True), ('1e3', True),
+    ('-1e-3', True), ('1e+0002', True), ('1e-323', True),
+    ('2e-324', False), ('3e-324', True), ('1e-400', False), ('1e309', False),
+    ('1.7976931348623158e308', True), ('1.7976931348623159e308', False),
+    ('unknown', False), ('enabled', False), ('nan', False), ('inf', False),
+    ('0x10', False), ('1_000', False), ('1,000', False), ('1e 2', False),
+    ('1 2', False), ('--2', False), ('.', False), ('\x001\x00', False),
+    ('\fyes\f', False), ('\f2\f', False), ('\u00a0yes\u00a0', False),
+    ('\u00a02\u00a0', False), ('\x1c2\x1c', False),
+]
+BOOLEAN_FIXTURES = [(None, False)] + [
+    (whitespace + spelling + whitespace, expected)
+    for value, expected in BOOLEAN_VALUES
+    for spelling in dict.fromkeys((value, value.upper(), value.title()))
+    for whitespace in ('', ' ', '\t', '\n', '\r', '\v')
+]
+
+
+def set_enabled(model, value):
+    for service in model['services'].values():
+        environment = service.get('environment', {})
+        if value is None:
+            environment.pop('WATERING_ENABLED', None)
+        else:
+            environment['WATERING_ENABLED'] = value
 
 
 def render(development=False, profiles=(), overrides=None):
@@ -80,6 +110,46 @@ def fake_docker(arguments):
 
 
 class ComposeTests(unittest.TestCase):
+    def test_boolean_fixtures_match_native_symfony(self):
+        code = r'''
+require 'vendor/autoload.php';
+$processor = new Symfony\Component\DependencyInjection\EnvVarProcessor(
+    new Symfony\Component\DependencyInjection\Container()
+);
+$values = json_decode(stream_get_contents(STDIN), true, 512, JSON_THROW_ON_ERROR);
+echo json_encode(array_map(
+    fn ($value) => $processor->getEnv(
+        'bool', 'WATERING_ENABLED', fn ($name) => $value ?? 'false'
+    ),
+    $values
+), JSON_THROW_ON_ERROR);
+'''
+        result = subprocess.run([
+            'docker', 'run', '--rm', '-i', '--network', 'none',
+            '-v', str(ROOT / 'api') + ':/app:ro', '-w', '/app',
+            '--entrypoint', 'php', 'gardenhub-api', '-r', code,
+        ], input=json.dumps([value for value, expected in BOOLEAN_FIXTURES]),
+            capture_output=True, text=True, check=True)
+        reference = json.loads(result.stdout)
+        self.assertEqual(len(reference), len(BOOLEAN_FIXTURES))
+        for (value, expected), native in zip(BOOLEAN_FIXTURES, reference):
+            with self.subTest(value=value):
+                environment = {} if value is None else {'WATERING_ENABLED': value}
+                self.assertEqual(native, expected)
+                self.assertEqual(SELECTION.enabled(environment), native)
+
+    def test_boolean_service_selection(self):
+        model = render(profiles=('watering-hardware', 'watering-proposals'), overrides=enabled_settings())
+        for value, expected in BOOLEAN_FIXTURES:
+            set_enabled(model, value)
+            for mode in ('hardware', 'deploy'):
+                with self.subTest(value=value, mode=mode):
+                    selected = set(SELECTION.select_services(model, mode))
+                    self.assertEqual('gardenhub-watering-monitor' in selected, expected)
+                    self.assertEqual('gardenhub-watering-proposals' in selected, expected)
+                    if mode == 'deploy':
+                        self.assertTrue(set(SELECTION.APPLICATION) <= selected)
+
     def test_image_backed_base_and_shared_configuration(self):
         model = render(profiles=('*',), overrides={'WATERING_DEV_USERNAME': 'legacy', 'WATERING_DEV_PASSWORD': 'legacy'})
         self.assertEqual(model['services']['gardenhub-api']['build']['target'], 'production')
@@ -164,6 +234,7 @@ class DeploymentTests(unittest.TestCase):
         return result.returncode, commands
 
     def test_enabled_services_recreated_and_disabled_skipped(self):
+        set_enabled(self.model, 'yes')
         status, commands = self.execute('deploy-up')
         self.assertEqual(status, 0)
         startup = next(command for command in commands if 'up' in command)
@@ -201,6 +272,20 @@ class DeploymentTests(unittest.TestCase):
             self.assertFalse(any(command[0] == 'curl' for command in commands))
         status, commands = self.execute('deploy-health', FAKE_MISSING='gardenhub-watering-proposals')
         self.assertNotEqual(status, 0)
+
+    def test_boolean_deployment_health_selection(self):
+        fixtures = [(None, False)] + BOOLEAN_VALUES + [(' YES\t', True), (' Off\n', False)]
+        for value, expected in fixtures:
+            with self.subTest(value=value):
+                set_enabled(self.model, value)
+                logfile = Path(self.environment['FAKE_LOG'])
+                if logfile.exists():
+                    logfile.unlink()
+                status, commands = self.execute('deploy-health')
+                self.assertEqual(status, 0)
+                inspected = {command[-1] for command in commands if command[0] == 'inspect'}
+                self.assertEqual('gardenhub-watering-monitor' in inspected, expected)
+                self.assertEqual('gardenhub-watering-proposals' in inspected, expected)
 
     def test_disabled_and_inactive_health_services(self):
         for name in SELECTION.WATERING & self.model['services'].keys():
