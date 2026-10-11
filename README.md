@@ -95,6 +95,87 @@ and receive the same watering configuration. `compose-dev.yaml` explicitly
 selects `APP_ENV=dev`, adds source mounts and development host mappings, and
 contains the simulator and Adminer. Production must use the base file alone.
 The Make helpers require Docker Compose and Python 3 (standard library only).
+Production deployment also requires `flock` (util-linux) and outbound HTTPS
+access to GitHub's API for release approval.
+
+### CI release approval
+
+CI runs for pull requests targeting `master`, pushes to `master`, and manual
+dispatches. The stable `CI Ready` check requires application integration,
+deployment/release regression tests, full Grafana integration tests, Composer
+auditing, and packaged production-image smoke/audit checks. A skipped, cancelled,
+or failed required job never qualifies as release approval. Configure the
+repository's branch protection/ruleset to require `CI Ready`; this is a GitHub
+administrator action, not a setting managed by the checkout.
+
+Production and development use separate Docker targets. The base Compose file
+selects `production` (`--no-dev`, `APP_ENV=prod`, `APP_DEBUG=0`); the development
+override selects `development` with development dependencies and debug enabled.
+The smoke suite boots the production image without source mounts, migrates a
+disposable database, validates ORM mapping/schema, warms cache as `www-data`,
+and checks HTTP health plus read/write API authorization. Watering and Telegram
+are disabled there. Grafana CI uses an internal Docker network and preinstalled
+test tools so synthetic alert credentials cannot send notifications externally.
+
+Security policy: Composer vulnerability advisories block CI, including those in
+development dependencies; abandoned packages are reported separately. Image
+audits block fixable HIGH/CRITICAL vulnerabilities in PHP and nginx images.
+Unfixed findings and lower severities remain in downloadable CI reports for
+review. Missing reports or unavailable audit services fail the gate. Do not
+silence findings with permanent exceptions: remediation or an explicitly
+reviewed, time-limited policy change belongs in a separate change.
+
+Before normal deployment, configure the server shell/service environment:
+
+```bash
+export GARDENHUB_GITHUB_REPOSITORY=owner/repository
+# Private repositories also need GARDENHUB_CI_TOKEN provisioned securely.
+# Use a fine-grained token limited to this repository, with Actions read access.
+```
+
+Do not put the token in command arguments, tracked files, or terminal output.
+These variables are read by the host Python helper, not Compose: root dotenv
+files are not automatically exported into the host shell. Public repositories
+can use unauthenticated API access, subject to GitHub's lower rate limit.
+
+`make deploy-check` verifies the latest push workflow for the exact post-pull
+SHA, workflow `ci.yml`, and deployment branch. It re-reads the latest attempt
+and requires a successful `CI Ready` job and successful workflow jobs. Older
+successful runs, PR merge-ref checks, and manual runs do not substitute for a
+missing or failed master-push run. Missing/incomplete CI, API errors, inaccessible
+repositories, and rate limits refuse deployment before build or shutdown.
+Wait for the push run to finish and retry; no automatic bypass is provided.
+
+`make deploy` serializes normal deployments with a Git-local lock and rechecks
+the approved checkout and CI immediately before guarded shutdown. Other manual
+Git/Docker actions are not controlled by that lock. `make start`, development
+helpers, and the documented emergency rollback helpers remain available without
+GitHub approval; they are explicit operator paths, not enforced release paths.
+Existing watering shutdown guards remain mandatory.
+
+CI checks the source SHA and records the tested image IDs. Production still
+rebuilds locally: mutable base tags and different host architectures mean it is
+not guaranteed to deploy the identical CI image digest. Registry/digest-based
+artifact deployment is not implemented in this release flow.
+
+Focused local checks (disposable test stacks only):
+
+```bash
+python3 tests/watering-control/compose-deployment.py
+python3 -B -m unittest discover -s tests/release-ci -v
+docker build --target development -t gardenhub-api api
+docker build --target production -t gardenhub-api:release-validation api
+docker build --target smoke-nginx -t gardenhub-smoke-nginx:release-validation api
+sh tests/production-smoke/run.sh
+docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml build tests
+docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml up --abort-on-container-exit --exit-code-from tests
+docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml down -v
+```
+
+The full Grafana suite has bounded alert waits and a dedicated 50-minute CI
+timeout. Preserve full alert-transition coverage; the focused watering-history
+mode is not a replacement for the release suite. The smoke script always cleans
+up its stack. When running Grafana manually, clean up even after a failed run.
 
 Watering is disabled by default (`WATERING_ENABLED=false`). Enablement and
 profile selection are separate gates. Effective combinations are:

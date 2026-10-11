@@ -49,13 +49,17 @@ HEALTHZ_PORT ?= 8081
 DEPLOY_HEALTH_TIMEOUT ?= 120
 DEPLOY_HEALTH_INTERVAL ?= 5
 
-.PHONY: deploy deploy-check deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana deploy-logs deploy-info
+.PHONY: deploy deploy-check deploy-ci deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana deploy-logs deploy-info
 
 # bash is required here: dash (Ubuntu's /bin/sh) has no pipefail/ERR trap
-deploy deploy-check deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana: SHELL := /bin/bash
+deploy deploy-check deploy-ci deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana: SHELL := /bin/bash
 
 deploy-check: ## Verify git/compose state is safe to deploy, then fast-forward to $(DEPLOY_REMOTE)/$(DEPLOY_BRANCH)
 	@set -Eeuo pipefail; \
+	if [[ "$${GARDENHUB_DEPLOY_LOCKED:-}" != 1 ]]; then \
+	  exec 9>"$$(git rev-parse --git-path gardenhub-deploy.lock)"; \
+	  flock -n 9 || { echo "!! Another deployment is running"; exit 1; }; \
+	fi; \
 	echo "==> [deploy-check] .env present"; \
 	test -f .env || { echo "!! .env not found in $$(pwd)"; exit 1; }; \
 	echo "==> [deploy-check] Validating compose configuration"; \
@@ -82,8 +86,13 @@ deploy-check: ## Verify git/compose state is safe to deploy, then fast-forward t
 	echo "==> [deploy-check] Validating pulled compose configuration"; \
 	$(COMPOSE) $(COMPOSE_FILES) config --quiet; \
 	sha=$$(git rev-parse HEAD); \
+	$(MAKE) --no-print-directory deploy-ci; \
 	echo "==> [deploy-check] Deploying commit $$sha"; \
 	git log -1 --pretty='    %h %s'
+
+deploy-ci: ## Refuse deployment unless exact-commit master-push CI is successful
+	@set -Eeuo pipefail; \
+	python3 scripts/check-release-ci.py --sha "$$(git rev-parse HEAD)" --branch '$(DEPLOY_BRANCH)'
 
 deploy-build: ## Build the gardenhub-api image from the current checkout
 	@set -Eeuo pipefail; \
@@ -268,9 +277,17 @@ deploy-info: ## Show current git/image/container state (read-only, safe anytime)
 # `make deploy` again. Do not rely on `make deploy` to recover a detached HEAD.
 deploy: ## Safe, end-to-end production deployment (the only target that orchestrates the others)
 	@set -Eeuo pipefail; \
+	exec 9>"$$(git rev-parse --git-path gardenhub-deploy.lock)"; \
+	flock -n 9 || { echo "!! Another deployment is running"; exit 1; }; \
+	export GARDENHUB_DEPLOY_LOCKED=1; \
 	trap '$(MAKE) --no-print-directory deploy-logs' ERR; \
 	$(MAKE) --no-print-directory deploy-check; \
+	approved_sha=$$(git rev-parse HEAD); \
 	$(MAKE) --no-print-directory deploy-build; \
+	if [[ "$$(git rev-parse HEAD)" != "$$approved_sha" || -n "$$(git status --porcelain)" ]]; then \
+	  echo "!! Checkout changed after CI approval; refusing shutdown"; exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory deploy-ci; \
 	$(MAKE) --no-print-directory deploy-stop; \
 	$(MAKE) --no-print-directory deploy-migrate; \
 	$(MAKE) --no-print-directory deploy-up; \

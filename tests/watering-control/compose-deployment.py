@@ -82,11 +82,13 @@ def fake_docker(arguments):
 class ComposeTests(unittest.TestCase):
     def test_image_backed_base_and_shared_configuration(self):
         model = render(profiles=('*',), overrides={'WATERING_DEV_USERNAME': 'legacy', 'WATERING_DEV_PASSWORD': 'legacy'})
+        self.assertEqual(model['services']['gardenhub-api']['build']['target'], 'production')
         self.assertNotIn('gardenhub-watering-sim', model['services'])
         self.assertNotIn('gardenhub-adminer', model['services'])
         for name in APPLICATION:
             service = model['services'][name]
             self.assertEqual(service['environment']['APP_ENV'], 'prod')
+            self.assertEqual(service['environment']['APP_DEBUG'], '0')
             self.assertFalse(service.get('volumes'))
             self.assertFalse(service.get('extra_hosts'))
             for key in ('WATERING_MQTT_USERNAME', 'WATERING_MQTT_PASSWORD', 'WATERING_MQTT_TOPIC'):
@@ -98,9 +100,11 @@ class ComposeTests(unittest.TestCase):
     def test_development_overrides_and_neutral_priority(self):
         legacy = {'WATERING_DEV_USERNAME': 'legacy', 'WATERING_DEV_PASSWORD': 'legacy'}
         model = render(True, ('*',), legacy)
+        self.assertEqual(model['services']['gardenhub-api']['build']['target'], 'development')
         for name in APPLICATION:
             service = model['services'][name]
             self.assertEqual(service['environment']['APP_ENV'], 'dev')
+            self.assertEqual(service['environment']['APP_DEBUG'], '1')
             self.assertTrue(service['volumes'])
             self.assertTrue(service['extra_hosts'])
             self.assertTrue(service['environment']['WATERING_MQTT_USERNAME'] == 'legacy')

@@ -8,6 +8,7 @@ name: gardenhub
 
 x-development-environment: &development-environment
   APP_ENV: dev
+  APP_DEBUG: "1"
   WATERING_MQTT_HOST: ${WATERING_MQTT_HOST:-${MQTT_HOST:-}}
   WATERING_MQTT_PORT: ${WATERING_MQTT_PORT:-${MQTT_PORT:-1883}}
   WATERING_MQTT_TOPIC: ${WATERING_MQTT_TOPIC:-gardenhub/dev/watering/avocado}
@@ -48,6 +49,8 @@ services:
       - gardenhub
 
   gardenhub-api:
+    build:
+      target: development
     environment: *development-environment
     extra_hosts: *development-hosts
     volumes:

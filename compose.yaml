@@ -2,6 +2,7 @@ name: gardenhub
 
 x-application-environment: &application-environment
   APP_ENV: ${APP_ENV:-prod}
+  APP_DEBUG: "0"
   DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
   MQTT_CLIENT_ID: ${MQTT_CLIENT_ID}
   TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
@@ -55,6 +56,7 @@ services:
   gardenhub-api:
     build:
       context: ./api
+      target: production
     image: gardenhub-api
     container_name: gardenhub-api
     restart: unless-stopped

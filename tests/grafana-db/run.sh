@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 
-apk add --no-cache curl jq mariadb-client >/dev/null
+if ! command -v curl >/dev/null || ! command -v jq >/dev/null || ! command -v mysql >/dev/null; then
+    apk add --no-cache curl jq mariadb-client >/dev/null
+fi
 
 GRAFANA_AUTH="${GRAFANA_USER}:${GRAFANA_PASSWORD}"
 RULES_URL="${GRAFANA_URL}/api/prometheus/grafana/api/v1/rules"
@@ -20,6 +22,13 @@ NO_MEASUREMENTS_TIMEOUT=480
 # Bounds each individual request so one stalled call can't silently outlast
 # the outer polling timeouts above.
 CURL_MAX_TIME=10
+
+for dashboard in gardenhub-overview gardenhub-watering-history; do
+    curl --fail --silent --show-error --max-time "$CURL_MAX_TIME" \
+        --retry 30 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
+        -u "$GRAFANA_AUTH" -o /dev/null \
+        "$GRAFANA_URL/api/dashboards/uid/$dashboard"
+done
 
 SOIL_MOISTURE_LOW="GardenHub soil moisture low"
 SOIL_MOISTURE_TIMEOUT=180
