@@ -60,19 +60,18 @@ services:
 
     App\Watering\InterfaceWateringPublisher: '@App\Watering\MqttWateringPublisher'
 
-    App\Watering\MqttWateringPublisher:
+    App\Watering\WateringConfiguration:
         arguments:
+            $enabled: '%env(bool:WATERING_ENABLED)%'
             $host: '%env(WATERING_MQTT_HOST)%'
             $port: '%env(int:WATERING_MQTT_PORT)%'
-            $username: '%env(WATERING_DEV_USERNAME)%'
-            $password: '%env(WATERING_DEV_PASSWORD)%'
+            $username: '%env(WATERING_MQTT_USERNAME)%'
+            $password: '%env(WATERING_MQTT_PASSWORD)%'
             $environment: '%kernel.environment%'
             $topic: '%env(WATERING_MQTT_TOPIC)%'
 
     App\Watering\WateringManager:
         arguments:
-            $enabled: '%env(bool:WATERING_ENABLED)%'
-            $environment: '%kernel.environment%'
             $maxSeconds: '%env(int:WATERING_MAX_SECONDS)%'
             $dailySeconds: '%env(int:WATERING_DAILY_SECONDS)%'
             $cooldownSeconds: '%env(int:WATERING_COOLDOWN_SECONDS)%'
@@ -100,24 +99,9 @@ services:
 
     App\Command\WateringProposalPollCommand:
         arguments:
-            $enabled: '%env(bool:WATERING_ENABLED)%'
-            $environment: '%kernel.environment%'
             $botToken: '%env(TELEGRAM_BOT_TOKEN)%'
             $userId: '%env(WATERING_TELEGRAM_USER_ID)%'
             $chatId: '%env(WATERING_TELEGRAM_CHAT_ID)%'
-
-    App\Watering\WateringMonitorRunner:
-        arguments:
-            $host: '%env(WATERING_MQTT_HOST)%'
-            $port: '%env(int:WATERING_MQTT_PORT)%'
-            $username: '%env(WATERING_DEV_USERNAME)%'
-            $password: '%env(WATERING_DEV_PASSWORD)%'
-            $topic: '%env(WATERING_MQTT_TOPIC)%'
-
-    App\Command\WateringMonitorCommand:
-        arguments:
-            $enabled: '%env(bool:WATERING_ENABLED)%'
-            $environment: '%kernel.environment%'
 
     App\Monolog\Telegram\InterfaceTelegramTransport: '@App\Monolog\Telegram\StreamTelegramTransport'
 

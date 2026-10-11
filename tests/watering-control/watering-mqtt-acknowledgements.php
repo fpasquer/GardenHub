@@ -275,7 +275,7 @@ function newRunner(EntityManagerInterface $em, InterfaceWateringPublisher $publi
 {
     $watering = newTestManager($em, $publisher);
 
-    return new WateringMonitorRunner($watering, $publisher, new NullLogger(), $host, $port, 'test', 'test', $subackTimeout);
+    return new WateringMonitorRunner($watering, $publisher, new NullLogger(), new App\Watering\WateringConfiguration(true, 'prod', $host, $port, 'test', 'test', MqttWateringPublisher::DEFAULT_TOPIC), $subackTimeout);
 }
 
 function heartbeatAt(Doctrine\DBAL\Connection $db): ?string
@@ -304,7 +304,7 @@ function scenario_successful_puback(): void
         $received[] = $message;
     }, MqttClient::QOS_AT_LEAST_ONCE);
 
-    $publisher = new MqttWateringPublisher(MOSQUITTO_HOST, MOSQUITTO_PORT, 'test', 'test', 'dev');
+    $publisher = new MqttWateringPublisher(new App\Watering\WateringConfiguration(true, 'prod', MOSQUITTO_HOST, MOSQUITTO_PORT, 'test', 'test', MqttWateringPublisher::DEFAULT_TOPIC));
     $publisher->publish(['watering_times' => 3, 'state' => 'ON']);
 
     pollUntil(static function () use ($subscriber, &$received): bool {
@@ -322,7 +322,7 @@ function scenario_withheld_puback(): void
 {
     $handle = spawnBrokerStub('withhold-puback', 11901);
     try {
-        $publisher = new MqttWateringPublisher(STUB_HOST, 11901, 'test', 'test', 'dev');
+        $publisher = new MqttWateringPublisher(new App\Watering\WateringConfiguration(true, 'prod', STUB_HOST, 11901, 'test', 'test', MqttWateringPublisher::DEFAULT_TOPIC));
         $start = microtime(true);
         $threw = false;
         try {

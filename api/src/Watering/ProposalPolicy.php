@@ -40,14 +40,18 @@ final class ProposalPolicy
         private readonly int $durationSeconds,
         private readonly string $actuatorTopic,
     ) {
-        if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || $durationSeconds < 1 || $durationSeconds > $watering->maxSeconds() || '' === trim($actuatorTopic)) {
-            throw new \LogicException('Invalid dev watering proposal configuration.');
+        if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || $durationSeconds < 1 || $durationSeconds > $watering->maxSeconds()) {
+            throw new \LogicException('Invalid watering proposal configuration.');
         }
     }
 
     /** Returns a newly persisted proposal, or null. Serializes evaluation by device row. */
     public function evaluate(): ?WateringProposal
     {
+        $this->watering->assertEnabled();
+        if ('' === trim($this->actuatorTopic)) {
+            throw new \LogicException('Watering proposal topic is required.');
+        }
         return $this->runner->run(fn (): ?WateringProposal => $this->evaluateLocked());
     }
 
@@ -84,6 +88,7 @@ final class ProposalPolicy
     /** Called only after exact user and private-chat authorization. */
     public function decide(int $id, string $action): string
     {
+        $this->watering->assertEnabled();
         if (!WateringProposal::isValidId($id) || !in_array($action, [self::ACTION_APPROVE, self::ACTION_REJECT], true)) {
             return ProposalDecisionResult::Ignored->value;
         }

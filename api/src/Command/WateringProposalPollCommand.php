@@ -7,13 +7,14 @@ namespace App\Command;
 use App\Watering\AdvisoryLock;
 use App\Watering\ProposalBot;
 use App\Watering\ProposalPolicy;
+use App\Watering\WateringConfiguration;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'gardenhub:watering:proposals', description: 'Dev-only soil proposal evaluator and Telegram callback poller')]
+#[AsCommand(name: 'gardenhub:watering:proposals', description: 'Soil proposal evaluator and Telegram callback poller')]
 final class WateringProposalPollCommand extends Command
 {
     private const LOCK_NAME = 'gardenhub_watering_proposals';
@@ -22,8 +23,7 @@ final class WateringProposalPollCommand extends Command
         private readonly AdvisoryLock $lock,
         private readonly ProposalPolicy $policy,
         private readonly ProposalBot $bot,
-        private readonly bool $enabled,
-        private readonly string $environment,
+        private readonly WateringConfiguration $configuration,
         private readonly string $botToken,
         private readonly string $userId,
         private readonly string $chatId,
@@ -38,8 +38,14 @@ final class WateringProposalPollCommand extends Command
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        if (!$this->enabled || $this->environment !== 'dev' || $this->botToken === '' || !ctype_digit($this->userId) || !preg_match('/^-?[0-9]+$/D', $this->chatId)) {
-            $output->writeln('<error>Dev watering proposals are disabled or interactive Telegram identity is incomplete.</error>');
+        try {
+            $this->configuration->assertAvailable();
+        } catch (\LogicException) {
+            $output->writeln('<error>Watering proposals are disabled or MQTT configuration is incomplete.</error>');
+            return Command::FAILURE;
+        }
+        if ($this->botToken === '' || !ctype_digit($this->userId) || !preg_match('/^-?[0-9]+$/D', $this->chatId)) {
+            $output->writeln('<error>Interactive Telegram identity is incomplete.</error>');
             return Command::FAILURE;
         }
         // Telegram permits one getUpdates consumer per bot. The DB advisory lock

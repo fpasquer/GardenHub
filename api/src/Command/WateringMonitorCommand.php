@@ -5,13 +5,14 @@ declare(strict_types=1);
 namespace App\Command;
 
 use App\Watering\WateringMonitorRunner;
+use App\Watering\WateringConfiguration;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'gardenhub:watering:monitor', description: 'Track dev watering state and enforce its deadline')]
+#[AsCommand(name: 'gardenhub:watering:monitor', description: 'Track watering state and enforce its deadline')]
 final class WateringMonitorCommand extends Command
 {
     private const RECONNECT_DELAY_SECONDS = 2;
@@ -19,16 +20,17 @@ final class WateringMonitorCommand extends Command
     public function __construct(
         private readonly WateringMonitorRunner $runner,
         private readonly LoggerInterface $logger,
-        private readonly bool $enabled,
-        private readonly string $environment,
+        private readonly WateringConfiguration $configuration,
     ) {
         parent::__construct();
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        if (!$this->enabled || $this->environment !== 'dev' || !$this->runner->isConfigured()) {
-            $output->writeln('<error>Development watering monitor is disabled or not configured.</error>');
+        try {
+            $this->configuration->assertAvailable();
+        } catch (\LogicException) {
+            $output->writeln('<error>Watering monitor is disabled or not configured.</error>');
             return Command::FAILURE;
         }
 

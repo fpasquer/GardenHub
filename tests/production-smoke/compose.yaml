@@ -1,0 +1,50 @@
+name: gardenhub-production-smoke
+
+x-environment: &environment
+  APP_ENV: prod
+  APP_DEBUG: "0"
+  APP_SECRET: production-smoke-only
+  DATABASE_URL: 'mysql://root@mysql:3306/production_smoke?serverVersion=8.4&charset=utf8mb4'
+  WATERING_ENABLED: "false"
+  TELEGRAM_ENABLED: "false"
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: production_smoke
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=TCP", "--silent"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+
+  gardenhub-api:
+    image: ${PRODUCTION_IMAGE:-gardenhub-api:release-validation}
+    environment: *environment
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+  nginx:
+    image: ${SMOKE_NGINX_IMAGE:-gardenhub-smoke-nginx:release-validation}
+    depends_on:
+      gardenhub-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+networks:
+  default:
+    internal: true

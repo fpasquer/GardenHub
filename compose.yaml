@@ -1,5 +1,31 @@
 name: gardenhub
 
+x-application-environment: &application-environment
+  APP_ENV: ${APP_ENV:-prod}
+  APP_DEBUG: "0"
+  DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+  MQTT_CLIENT_ID: ${MQTT_CLIENT_ID}
+  TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+  TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
+  WATERING_ENABLED: ${WATERING_ENABLED:-false}
+  WATERING_MQTT_HOST: ${WATERING_MQTT_HOST:-}
+  WATERING_MQTT_PORT: ${WATERING_MQTT_PORT:-1883}
+  WATERING_MQTT_TOPIC: ${WATERING_MQTT_TOPIC:-}
+  WATERING_MQTT_USERNAME: ${WATERING_MQTT_USERNAME:-}
+  WATERING_MQTT_PASSWORD: ${WATERING_MQTT_PASSWORD:-}
+  WATERING_MAX_SECONDS: ${WATERING_MAX_SECONDS:-30}
+  WATERING_DAILY_SECONDS: ${WATERING_DAILY_SECONDS:-120}
+  WATERING_COOLDOWN_SECONDS: ${WATERING_COOLDOWN_SECONDS:-60}
+  WATERING_PROPOSAL_THRESHOLD: ${WATERING_PROPOSAL_THRESHOLD:-15}
+  WATERING_PROPOSAL_FRESHNESS_MINUTES: ${WATERING_PROPOSAL_FRESHNESS_MINUTES:-35}
+  WATERING_PROPOSAL_MAX_GAP_MINUTES: ${WATERING_PROPOSAL_MAX_GAP_MINUTES:-35}
+  WATERING_PROPOSAL_VALIDITY_MINUTES: ${WATERING_PROPOSAL_VALIDITY_MINUTES:-30}
+  WATERING_PROPOSAL_DURATION_SECONDS: ${WATERING_PROPOSAL_DURATION_SECONDS:-3}
+  WATERING_TELEGRAM_USER_ID: ${WATERING_TELEGRAM_USER_ID:-}
+  WATERING_TELEGRAM_CHAT_ID: ${WATERING_TELEGRAM_CHAT_ID:-}
+
 services:
   gardenhub-nginx:
     image: nginx:1.30.5-alpine
@@ -30,33 +56,11 @@ services:
   gardenhub-api:
     build:
       context: ./api
+      target: production
     image: gardenhub-api
     container_name: gardenhub-api
     restart: unless-stopped
-    environment:
-      APP_ENV: ${APP_ENV:-dev}
-      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
-      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID}
-      # Telegram logging channel. Any future Messenger consumer container
-      # must receive these same 4 variables too.
-      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
-    # Source code is bind-mounted for development so changes apply without
-    # rebuilding. Composer dependencies live inside the image; rebuild the
-    # image (`docker compose up -d --build`) after changing composer.json.
-    volumes:
-      - ./api/bin:/app/bin
-      - ./api/config:/app/config
-      - ./api/migrations:/app/migrations
-      - ./api/public:/app/public
-      - ./api/src:/app/src
-      - ./api/templates:/app/templates
-      - ./api/composer.json:/app/composer.json
-      - ./api/composer.lock:/app/composer.lock
-      - ./api/symfony.lock:/app/symfony.lock
-      - ./api/.env:/app/.env
+    environment: *application-environment
     depends_on:
       gardenhub-mysql:
         condition: service_healthy
@@ -82,32 +86,11 @@ services:
     tty: true
     command: php bin/console gardenhub:mqtt:consume
     environment:
-      APP_ENV: ${APP_ENV:-dev}
-      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
+      <<: *application-environment
       MQTT_HOST: ${MQTT_HOST}
       MQTT_PORT: ${MQTT_PORT:-1883}
       MQTT_USERNAME: ${MQTT_USERNAME:-}
       MQTT_PASSWORD: ${MQTT_PASSWORD:-}
-      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID}
-      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
-    # Allows reaching a service on the Docker host itself (e.g. an MQTT
-    # broker exposed on the host loopback in the dev environment) via
-    # the hostname host.docker.internal.
-    # Note: Docker's built-in "host-gateway" resolves to the DEFAULT docker0
-    # bridge (172.17.0.1), NOT this network's gateway (172.22.0.1) — which
-    # makes it unreachable for containers on the gardenhub network. We map
-    # the name explicitly to the gardenhub gateway instead (see the pinned
-    # subnet at the bottom of this file).
-    extra_hosts:
-      - "host.docker.internal:172.22.0.1"
-    volumes:
-      - ./api/bin:/app/bin
-      - ./api/config:/app/config
-      - ./api/src:/app/src
-      - ./api/.env:/app/.env
     depends_on:
       gardenhub-api:
         condition: service_healthy
@@ -130,18 +113,7 @@ services:
     restart: unless-stopped
     tty: true
     command: php bin/console messenger:consume async --time-limit=3600
-    environment:
-      APP_ENV: ${APP_ENV:-dev}
-      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
-      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
-    volumes:
-      - ./api/bin:/app/bin
-      - ./api/config:/app/config
-      - ./api/src:/app/src
-      - ./api/.env:/app/.env
+    environment: *application-environment
     depends_on:
       gardenhub-api:
         condition: service_healthy
@@ -169,18 +141,7 @@ services:
     user: www-data
     profiles: ["scheduler"]
     command: php bin/console messenger:consume scheduler_default --no-interaction -v
-    environment:
-      APP_ENV: ${APP_ENV:-dev}
-      DATABASE_URL: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@gardenhub-mysql:3306/${MYSQL_DATABASE}?serverVersion=8.4&charset=utf8mb4"
-      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      TELEGRAM_MIN_LEVEL: ${TELEGRAM_MIN_LEVEL:-warning}
-    volumes:
-      - ./api/bin:/app/bin
-      - ./api/config:/app/config
-      - ./api/src:/app/src
-      - ./api/.env:/app/.env
+    environment: *application-environment
     depends_on:
       gardenhub-api:
         condition: service_healthy
@@ -188,6 +149,44 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'messenger:consume scheduler_default' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
+  gardenhub-watering-monitor:
+    image: gardenhub-api
+    container_name: gardenhub-watering-monitor
+    profiles: ["watering-hardware"]
+    restart: unless-stopped
+    command: php bin/console gardenhub:watering:monitor --no-debug
+    environment: *application-environment
+    depends_on:
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '^php bin/console gardenhub:watering:monitor' >/dev/null && php bin/console gardenhub:watering:check --monitor --no-debug"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - gardenhub
+
+  gardenhub-watering-proposals:
+    image: gardenhub-api
+    container_name: gardenhub-watering-proposals
+    profiles: ["watering-proposals"]
+    restart: unless-stopped
+    command: php bin/console gardenhub:watering:proposals --no-debug
+    environment: *application-environment
+    depends_on:
+      gardenhub-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '^php bin/console gardenhub:watering:proposals' >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 6

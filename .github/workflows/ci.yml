@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - master
   pull_request:
     branches:
       - master
@@ -24,7 +27,18 @@ jobs:
           # CI-only placeholder required by root compose.yaml interpolation;
           # no root-stack container is started, so no port is actually bound.
           BIND_ADDRESS: 127.0.0.1
-        run: docker compose build gardenhub-api
+        run: docker build --target development -t gardenhub-api api
+
+      - name: Run deployment tests
+        id: deployment_tests
+        continue-on-error: true
+        run: python3 tests/watering-control/compose-deployment.py
+
+      - name: Run release gate tests
+        id: release_tests
+        if: always()
+        continue-on-error: true
+        run: python3 -B -m unittest discover -s tests/release-ci -v
 
       - name: Run MQTT lifecycle tests
         id: mqtt_tests
@@ -101,6 +115,16 @@ jobs:
       - name: Fail if any test suite failed
         if: always()
         run: |
+          if [ "${{ steps.deployment_tests.outcome }}" != "success" ]; then
+            echo "Deployment tests failed"
+            exit 1
+          fi
+
+          if [ "${{ steps.release_tests.outcome }}" != "success" ]; then
+            echo "Release gate tests failed"
+            exit 1
+          fi
+
           if [ "${{ steps.mqtt_tests.outcome }}" != "success" ]; then
             echo "MQTT lifecycle tests failed"
             exit 1
@@ -130,3 +154,104 @@ jobs:
             echo "Watering control tests failed"
             exit 1
           fi
+
+  grafana:
+    name: Grafana integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Build offline test tooling
+        run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml build tests
+      - name: Run full Grafana suite
+        run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml up --abort-on-container-exit --exit-code-from tests
+      - name: Show failure diagnostics
+        if: failure()
+        run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml logs --no-color --tail=100
+      - name: Clean up Grafana stack
+        if: always()
+        run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml down -v --remove-orphans
+
+  composer-audit:
+    name: Composer dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Audit locked dependencies
+        run: |
+          mkdir -p .ci-reports
+          docker run --rm -v "$PWD/api:/app:ro" -w /app composer:2 \
+            audit --locked --format=json --abandoned=report > .ci-reports/composer.json
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: composer-audit
+          path: .ci-reports/composer.json
+          if-no-files-found: error
+
+  production:
+    name: Production image smoke and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PRODUCTION_IMAGE: gardenhub-api:${{ github.sha }}
+      SMOKE_NGINX_IMAGE: gardenhub-smoke-nginx:${{ github.sha }}
+      TRIVY_IMAGE: aquasec/trivy@sha256:086971aaf400beebd94e8300fd8ea623774419597169156cec56eec5b00dfb1e
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Build production images
+        run: |
+          docker build --target production -t "$PRODUCTION_IMAGE" api
+          docker build --target smoke-nginx -t "$SMOKE_NGINX_IMAGE" api
+      - name: Run packaged production smoke tests
+        run: sh tests/production-smoke/run.sh
+      - name: Scan production images
+        if: ${{ !cancelled() && success() }}
+        run: |
+          mkdir -p .ci-reports
+          docker image inspect "$PRODUCTION_IMAGE" "$SMOKE_NGINX_IMAGE" > .ci-reports/images.json
+          for component in api nginx; do
+            image="$PRODUCTION_IMAGE"
+            if [[ "$component" == nginx ]]; then image="$SMOKE_NGINX_IMAGE"; fi
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock:ro \
+              -v "$PWD/.ci-reports:/reports" -v trivy-cache:/root/.cache/trivy \
+              "$TRIVY_IMAGE" image --scanners vuln --format json \
+              --output "/reports/$component.json" "$image"
+          done
+          python3 scripts/check-image-audit.py .ci-reports/api.json .ci-reports/nginx.json
+      - name: Upload production audit reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: production-image-audit
+          path: .ci-reports/
+          if-no-files-found: error
+      - name: Clean up production smoke stack
+        if: always()
+        run: docker compose -f tests/production-smoke/compose.yaml down -v --remove-orphans
+
+  ready:
+    name: CI Ready
+    needs: [tests, grafana, composer-audit, production]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every release check
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          results = json.loads(os.environ['RESULTS'])
+          failed = [name for name, job in results.items() if job['result'] != 'success']
+          if failed:
+              raise SystemExit('Release checks did not succeed: ' + ', '.join(failed))
+          print('All required release checks passed.')
+          PY

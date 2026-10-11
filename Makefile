@@ -7,35 +7,59 @@ ifneq ($(wildcard .env.local),)
 COMPOSE += --env-file .env.local
 endif
 
-ifneq ($(filter dev,$(MAKECMDGOALS)),)
+ifneq ($(filter dev dev-sim dev-hardware,$(MAKECMDGOALS)),)
 COMPOSE_FILES += -f compose-dev.yaml
+endif
+
+ifneq ($(filter dev-sim,$(MAKECMDGOALS)),)
 COMPOSE += --profile watering-sim
 endif
 
-.PHONY: start dev
+ifneq ($(filter dev-hardware,$(MAKECMDGOALS)),)
+COMPOSE += --profile watering-hardware
+START_MODE := hardware
+endif
+
+START_MODE ?= start
+SELECT_SERVICES = $(COMPOSE) $(COMPOSE_FILES) config --format json | python3 scripts/compose-services.py
+
+.PHONY: start dev dev-sim dev-hardware
+start dev dev-sim dev-hardware: SHELL := /bin/bash
 
 start:
-	$(COMPOSE) $(COMPOSE_FILES) up -d --build
+	@set -Eeuo pipefail; \
+	services=$$($(SELECT_SERVICES) $(START_MODE)); \
+	$(COMPOSE) $(COMPOSE_FILES) build gardenhub-api; \
+	$(COMPOSE) $(COMPOSE_FILES) up -d --wait gardenhub-mysql; \
+	$(MAKE) --no-print-directory deploy-stop COMPOSE='$(COMPOSE)' COMPOSE_FILES='$(COMPOSE_FILES)'; \
+	$(COMPOSE) $(COMPOSE_FILES) run --rm --no-deps -T -u www-data gardenhub-api \
+	  php bin/console doctrine:migrations:migrate --no-interaction; \
+	if [[ "$(START_MODE)" == hardware ]]; then $(COMPOSE) $(COMPOSE_FILES) stop gardenhub-watering-sim; fi; \
+	$(COMPOSE) $(COMPOSE_FILES) up -d --no-build --force-recreate --wait $$services
 
-dev: start
+dev dev-sim dev-hardware: start
 
 # --- Production deployment --------------------------------------------------
 
 DEPLOY_REMOTE ?= origin
 DEPLOY_BRANCH ?= master
-DEPLOY_SERVICES := gardenhub-nginx gardenhub-api gardenhub-worker gardenhub-consumer gardenhub-scheduler
+DEPLOY_WRITERS := gardenhub-nginx gardenhub-api gardenhub-worker gardenhub-consumer gardenhub-scheduler gardenhub-watering-proposals
 HEALTHZ_HOST ?= 192.168.1.20
 HEALTHZ_PORT ?= 8081
 DEPLOY_HEALTH_TIMEOUT ?= 120
 DEPLOY_HEALTH_INTERVAL ?= 5
 
-.PHONY: deploy deploy-check deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana deploy-logs deploy-info
+.PHONY: deploy deploy-check deploy-ci deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana deploy-logs deploy-info
 
 # bash is required here: dash (Ubuntu's /bin/sh) has no pipefail/ERR trap
-deploy deploy-check deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana: SHELL := /bin/bash
+deploy deploy-check deploy-ci deploy-build deploy-stop deploy-migrate deploy-up deploy-cache deploy-health deploy-grafana: SHELL := /bin/bash
 
 deploy-check: ## Verify git/compose state is safe to deploy, then fast-forward to $(DEPLOY_REMOTE)/$(DEPLOY_BRANCH)
 	@set -Eeuo pipefail; \
+	if [[ "$${GARDENHUB_DEPLOY_LOCKED:-}" != 1 ]]; then \
+	  exec 9>"$$(git rev-parse --git-path gardenhub-deploy.lock)"; \
+	  flock -n 9 || { echo "!! Another deployment is running"; exit 1; }; \
+	fi; \
 	echo "==> [deploy-check] .env present"; \
 	test -f .env || { echo "!! .env not found in $$(pwd)"; exit 1; }; \
 	echo "==> [deploy-check] Validating compose configuration"; \
@@ -62,8 +86,13 @@ deploy-check: ## Verify git/compose state is safe to deploy, then fast-forward t
 	echo "==> [deploy-check] Validating pulled compose configuration"; \
 	$(COMPOSE) $(COMPOSE_FILES) config --quiet; \
 	sha=$$(git rev-parse HEAD); \
+	$(MAKE) --no-print-directory deploy-ci; \
 	echo "==> [deploy-check] Deploying commit $$sha"; \
 	git log -1 --pretty='    %h %s'
+
+deploy-ci: ## Refuse deployment unless exact-commit master-push CI is successful
+	@set -Eeuo pipefail; \
+	python3 scripts/check-release-ci.py --sha "$$(git rev-parse HEAD)" --branch '$(DEPLOY_BRANCH)'
 
 deploy-build: ## Build the gardenhub-api image from the current checkout
 	@set -Eeuo pipefail; \
@@ -72,8 +101,19 @@ deploy-build: ## Build the gardenhub-api image from the current checkout
 
 deploy-stop: ## Stop application containers ahead of migrations; MySQL/Grafana are left running
 	@set -Eeuo pipefail; \
-	echo "==> [deploy-stop] Stopping: $(DEPLOY_SERVICES)"; \
-	$(COMPOSE) $(COMPOSE_FILES) stop -t 30 $(DEPLOY_SERVICES)
+	$(SELECT_SERVICES) deploy >/dev/null; \
+	guard_option=; \
+	monitor=$$($(COMPOSE) $(COMPOSE_FILES) ps -a -q gardenhub-watering-monitor); \
+	poller=$$($(COMPOSE) $(COMPOSE_FILES) ps -a -q gardenhub-watering-proposals); \
+	if [[ -z "$$monitor$$poller" ]]; then guard_option=--allow-uninitialized; fi; \
+	echo "==> [deploy-stop] Read-only watering preflight"; \
+	$(COMPOSE) $(COMPOSE_FILES) run --rm --no-deps -T -u www-data gardenhub-api \
+	  php bin/console gardenhub:watering:check $$guard_option; \
+	echo "==> [deploy-stop] Quiescing request sources; monitor stays running"; \
+	$(COMPOSE) $(COMPOSE_FILES) stop -t 30 $(DEPLOY_WRITERS); \
+	$(COMPOSE) $(COMPOSE_FILES) run --rm --no-deps -T -u www-data gardenhub-api \
+	  php bin/console gardenhub:watering:check $$guard_option; \
+	$(COMPOSE) $(COMPOSE_FILES) stop -t 30 gardenhub-watering-monitor
 
 # If this fails, the app tier is intentionally left stopped rather than
 # auto-restarted: the schema may be partially migrated, and restarting old
@@ -86,8 +126,10 @@ deploy-migrate: ## Run Doctrine migrations from the newly built image, before ap
 
 deploy-up: ## Start the application containers using only the image deploy-build already produced
 	@set -Eeuo pipefail; \
-	echo "==> [deploy-up] Starting: $(DEPLOY_SERVICES)"; \
-	$(COMPOSE) $(COMPOSE_FILES) up -d --no-build --no-deps $(DEPLOY_SERVICES)
+	services=$$($(SELECT_SERVICES) deploy); \
+	$(MAKE) --no-print-directory deploy-stop COMPOSE='$(COMPOSE)' COMPOSE_FILES='$(COMPOSE_FILES)'; \
+	echo "==> [deploy-up] Recreating: $$services"; \
+	$(COMPOSE) $(COMPOSE_FILES) up -d --force-recreate --no-build --no-deps $$services
 
 deploy-cache: ## Clear/warm the Symfony prod cache as www-data (never as root)
 	@set -Eeuo pipefail; \
@@ -97,11 +139,12 @@ deploy-cache: ## Clear/warm the Symfony prod cache as www-data (never as root)
 
 deploy-health: ## Wait for required containers to become healthy, then verify the real /healthz endpoint
 	@set -Eeuo pipefail; \
-	echo "==> [deploy-health] Waiting up to $(DEPLOY_HEALTH_TIMEOUT)s for: $(DEPLOY_SERVICES)"; \
+	services=$$($(SELECT_SERVICES) deploy); \
+	echo "==> [deploy-health] Waiting up to $(DEPLOY_HEALTH_TIMEOUT)s for: $$services"; \
 	elapsed=0; \
 	while :; do \
 	  all_healthy=1; \
-	  for s in $(DEPLOY_SERVICES); do \
+	  for s in $$services; do \
 	    cid=$$($(COMPOSE) $(COMPOSE_FILES) ps -a -q $$s); \
 	    if [ -z "$$cid" ]; then \
 	      echo "!! [deploy-health] $$s: no container found"; \
@@ -114,11 +157,12 @@ deploy-health: ## Wait for required containers to become healthy, then verify th
 	      exit 1; \
 	    fi; \
 	    health=$$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $$cid); \
+	    restarting=$$(docker inspect -f '{{.State.Restarting}}' $$cid); \
 	    if [ "$$health" = "unhealthy" ]; then \
 	      echo "!! [deploy-health] $$s is unhealthy"; \
 	      exit 1; \
 	    fi; \
-	    if [ "$$health" != "healthy" ]; then \
+	    if [[ "$$state" != "running" || "$$restarting" != "false" || "$$health" != "healthy" ]]; then \
 	      all_healthy=0; \
 	    fi; \
 	  done; \
@@ -192,6 +236,7 @@ deploy-logs: ## Best-effort diagnostics: container status and recent logs (last 
 	-@echo "==> [deploy-logs] gardenhub-worker (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-worker
 	-@echo "==> [deploy-logs] gardenhub-consumer (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-consumer
 	-@echo "==> [deploy-logs] gardenhub-scheduler (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-scheduler
+	-@echo "==> [deploy-logs] watering services (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-watering-monitor gardenhub-watering-proposals
 	-@echo "==> [deploy-logs] gardenhub-nginx (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-nginx
 	-@echo "==> [deploy-logs] gardenhub-grafana (last 2m)"; $(COMPOSE) $(COMPOSE_FILES) logs --since=2m gardenhub-grafana
 
@@ -232,9 +277,17 @@ deploy-info: ## Show current git/image/container state (read-only, safe anytime)
 # `make deploy` again. Do not rely on `make deploy` to recover a detached HEAD.
 deploy: ## Safe, end-to-end production deployment (the only target that orchestrates the others)
 	@set -Eeuo pipefail; \
+	exec 9>"$$(git rev-parse --git-path gardenhub-deploy.lock)"; \
+	flock -n 9 || { echo "!! Another deployment is running"; exit 1; }; \
+	export GARDENHUB_DEPLOY_LOCKED=1; \
 	trap '$(MAKE) --no-print-directory deploy-logs' ERR; \
 	$(MAKE) --no-print-directory deploy-check; \
+	approved_sha=$$(git rev-parse HEAD); \
 	$(MAKE) --no-print-directory deploy-build; \
+	if [[ "$$(git rev-parse HEAD)" != "$$approved_sha" || -n "$$(git status --porcelain)" ]]; then \
+	  echo "!! Checkout changed after CI approval; refusing shutdown"; exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory deploy-ci; \
 	$(MAKE) --no-print-directory deploy-stop; \
 	$(MAKE) --no-print-directory deploy-migrate; \
 	$(MAKE) --no-print-directory deploy-up; \

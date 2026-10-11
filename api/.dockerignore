@@ -4,4 +4,7 @@
 .git/
 var/
 vendor/
-docker/
+docker/*
+!docker/nginx/
+docker/nginx/*
+!docker/nginx/default.conf

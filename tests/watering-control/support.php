@@ -24,6 +24,7 @@ use App\Watering\ProposalPolicy;
 use App\Watering\InterfaceTelegramGateway;
 use App\Watering\TransactionRunner;
 use App\Watering\WateringManager;
+use App\Watering\WateringConfiguration;
 use App\Watering\InterfaceWateringPublisher;
 use Doctrine\DBAL\Connection;
 use Doctrine\ORM\EntityManagerInterface;
@@ -97,8 +98,7 @@ function newTestManager(
         $runs,
         new TransactionRunner($em, testRegistry()),
         $publisher,
-        $enabled,
-        $environment,
+        new WateringConfiguration($enabled, $environment, 'mqtt', 1883, 'test', 'test', 'gardenhub/dev/watering/avocado'),
         $maxSeconds,
         $dailySeconds,
         $cooldownSeconds,
