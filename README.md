@@ -486,7 +486,15 @@ threshold, freshness, gap, validity, and duration with
 `WATERING_PROPOSAL_THRESHOLD`,
 `WATERING_PROPOSAL_FRESHNESS_MINUTES`, `WATERING_PROPOSAL_MAX_GAP_MINUTES`,
 `WATERING_PROPOSAL_VALIDITY_MINUTES`, and `WATERING_PROPOSAL_DURATION_SECONDS`.
+`WATERING_PROPOSAL_RETRY_SECONDS` controls the delay **after expiration** before
+a renewed approval request becomes eligible (positive integer, default `1800`).
 The default values are in [api/.env](api/.env).
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `WATERING_PROPOSAL_VALIDITY_MINUTES` | Telegram approval validity | 30 minutes |
+| `WATERING_PROPOSAL_RETRY_SECONDS` | Delay after expiration before renewal | 1800 seconds |
+| `WATERING_PROPOSAL_DURATION_SECONDS` | Requested pump runtime | 3 seconds |
 
 Each proposal stores the `WATERING_MQTT_TOPIC` it was created for and its
 Telegram text is rendered from that stored topic. If the configured topic later
@@ -501,12 +509,27 @@ every existing proposal and its prompt counters, because buttons already sent
 to Telegram carry the old UUID. Those buttons do nothing afterwards; a still-dry
 sensor is prompted again. Watering runs are kept.
 
-One initial prompt and at most one reminder 24 hours later are allowed during
-the same dry episode for each actuator topic, including after rejection or
-expiry, so an invalidated simulator proposal does not consume the physical
-pump's prompts. A wet reading resets
-the episode and invalidates any pending proposal. A newer watering attempt
-also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
+Expired proposals renew indefinitely while watering remains eligible, with no
+two-prompt limit. Each renewal is a new proposal with its own expiration and
+Approve / Reject callbacks; the Telegram message identifies it as renewed.
+An expiration at 12:30 with a retry interval of 1800 seconds becomes eligible
+at 13:00, not 30 minutes after the original notification. The existing poller
+checks eligibility on its next pass; no new scheduler or container is needed.
+The deadline comes from the persisted expiration, so restarting does not reset
+the delay, and downtime produces one fresh request rather than a catch-up backlog.
+
+Renewal reuses the watering safety checks, including active or blocked cycles,
+monitor freshness, cooldown, daily budget, and actuator availability. Temporary
+failures defer eligibility without changing the expired proposal or its retry
+deadline; subsequent polling passes check again. Pump duration and safety limits
+are unchanged. Approval or explicit rejection ends that renewal chain. A new,
+independent request may start after 24 hours from the watering attempt or rejection
+decision respectively, if eligibility and safety checks pass. Failed or uncertain
+execution and invalidated proposals are not automatically renewed. A changed
+actuator cannot revive an older expired chain when switching back.
+
+A wet reading resets the episode and invalidates any pending proposal. A newer
+watering attempt also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
 proposal expiry, and the 24 hour rule under the watering reservation lock;
 `WateringManager` retains its enabled, monitor heartbeat, cooldown, active
 cycle, duration, and daily budget checks. Rejected, unauthorized, replayed,
@@ -514,9 +537,18 @@ expired, and unapproved proposals never run the configured actuator. If an appro
 interrupted or command delivery is uncertain, it stays blocked for manual
 review; pressing the button again never retries the cycle. Check the proposal
 and watering run tables before any manual recovery. A failed Telegram
-send may have succeeded remotely, so that episode is not sent again. A proposal
+send may have succeeded remotely, so that same proposal is not sent again;
+after expiration it can still qualify for a fresh renewed request. A proposal
 committed before the notification claim is sent on the next poll; a failed
 message edit is retried on the next polling pass.
+
+To deploy this behavior, rebuild and recreate application services through the
+existing deployment workflow with the watering profiles enabled. Optionally set
+`WATERING_PROPOSAL_RETRY_SECONDS=1800` in the untracked root environment file;
+Compose supplies the default otherwise. No database migration is required.
+Already-expired proposals, including those previously blocked by the two-prompt
+limit, may produce one eligible renewed request after deployment. Production
+daemons must retain `APP_ENV=prod`.
 
 ### Real Zigbee2MQTT pump on the Pi (opt-in development test)
 

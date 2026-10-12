@@ -125,6 +125,30 @@ final class ComposeConfigurationTest extends TestCase
         }
     }
 
+    public function testRetryDefaultAndOverrideReachEveryApplicationService(): void
+    {
+        foreach ([false, true] as $development) {
+            foreach (['1800', '720'] as $retry) {
+                $overrides = '1800' === $retry ? [] : ['WATERING_PROPOSAL_RETRY_SECONDS' => $retry];
+                $model = ComposeModel::render($development, ['*'], $overrides);
+                foreach ($this->phpServices() as $name) {
+                    self::assertSame($retry, $model['services'][$name]['environment']['WATERING_PROPOSAL_RETRY_SECONDS']);
+                }
+            }
+        }
+    }
+
+    public function testInvalidRetryConfigurationPreventsWateringStartup(): void
+    {
+        $model = ComposeModel::render(false, ['watering-hardware', 'watering-proposals'], ComposeModel::enabledSettings());
+        foreach (['0', '-1', '1.5', 'abc', '', '999999999999999999999'] as $value) {
+            foreach ($this->phpServices() as $name) {
+                $model['services'][$name]['environment']['WATERING_PROPOSAL_RETRY_SECONDS'] = $value;
+            }
+            $this->assertRefused($model);
+        }
+    }
+
     private function select(array $model): array
     {
         $result = PythonSubject::invoke([

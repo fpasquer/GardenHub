@@ -110,6 +110,7 @@ function newTestPolicy(
     WateringManager $manager,
     string $actuatorTopic,
     int $durationSeconds = 3,
+    int|string $retrySeconds = 1800,
 ): ProposalPolicy {
     /** @var DeviceRepository $devices */
     $devices = $em->getRepository(Device::class);
@@ -136,6 +137,7 @@ function newTestPolicy(
         30,
         $durationSeconds,
         $actuatorTopic,
+        $retrySeconds,
     );
 }
 

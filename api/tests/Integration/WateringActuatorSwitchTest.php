@@ -91,7 +91,7 @@ final class WateringActuatorSwitchTest extends TestCase
             $fixture->harness->connection->fetchAllKeyValue('SELECT actuator_topic, prompt_count FROM watering_proposal_state WHERE device_id = ?', [$fixture->device]));
     }
 
-    public function testEachActuatorHasItsOwnInitialPromptAndSingleReminderLimit(): void
+    public function testEachActuatorHasIndependentRequestsAfterRejection(): void
     {
         $fixture = $this->fixture;
         [$sim] = $fixture->stack(ProposalFixture::SIM_TOPIC, new RecordingTelegramGateway());
@@ -106,7 +106,7 @@ final class WateringActuatorSwitchTest extends TestCase
         self::assertInstanceOf(WateringProposal::class, $reminder);
         self::assertSame('rejected', $hardware->decide($reminder->getId(), 'reject'));
         $this->ageHardwarePrompt();
-        self::assertNull($hardware->evaluate());
+        self::assertInstanceOf(WateringProposal::class, $hardware->evaluate());
         self::assertSame(1, (int) $fixture->harness->connection->fetchOne('SELECT prompt_count FROM watering_proposal_state WHERE actuator_topic = ?', [ProposalFixture::SIM_TOPIC]));
     }
 
@@ -135,7 +135,28 @@ final class WateringActuatorSwitchTest extends TestCase
 
     private function ageHardwarePrompt(): void
     {
-        $this->fixture->harness->connection->executeStatement('UPDATE watering_proposal_state SET last_prompt_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY) WHERE actuator_topic = ?', [ProposalFixture::HW_TOPIC]);
+        $this->fixture->harness->connection->executeStatement('UPDATE watering_proposal SET decided_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY) WHERE actuator_topic = ?', [ProposalFixture::HW_TOPIC]);
+        $this->fixture->heartbeat();
+    }
+
+    public function testSwitchBackCannotReviveAnExpiredOtherActuatorChain(): void
+    {
+        $fixture = $this->fixture;
+        $gateway = new RecordingTelegramGateway();
+        [$sim, $simBot] = $fixture->stack(ProposalFixture::SIM_TOPIC, $gateway);
+        [$hardware, $hardwareBot] = $fixture->stack(ProposalFixture::HW_TOPIC, $gateway);
+        $simBot->evaluateAndNotify();
+        $old = $gateway->sent[0][1];
+        $fixture->expireProposal($old, 1800);
+        $hardwareBot->evaluateAndNotify();
+        self::assertCount(2, $gateway->sent);
+        $fixture->expireProposal($gateway->sent[1][1], 1800);
+        $fixture->heartbeat();
+        $simBot->evaluateAndNotify();
+        self::assertCount(2, $gateway->sent);
+        self::assertSame('expired', $fixture->column('status', $old));
+        self::assertSame('ignored', $sim->decide($old, 'approve'));
+        self::assertSame([], $fixture->publisher->calls);
     }
 
     private function legacyRow(string $notification, ?int $messageId): int

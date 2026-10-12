@@ -18,6 +18,7 @@ use App\Watering\WateringManager;
 use App\Watering\WateringReadiness;
 use Doctrine\DBAL\Connection;
 use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Tester\CommandTester;
 
@@ -43,6 +44,7 @@ final class WateringProductionTest extends TestCase
             'WATERING_DAILY_SECONDS' => '120', 'WATERING_COOLDOWN_SECONDS' => '60',
             'WATERING_PROPOSAL_THRESHOLD' => '15', 'WATERING_PROPOSAL_FRESHNESS_MINUTES' => '35',
             'WATERING_PROPOSAL_MAX_GAP_MINUTES' => '35',
+            'WATERING_PROPOSAL_RETRY_SECONDS' => '1800',
             'WATERING_PROPOSAL_VALIDITY_MINUTES' => '30', 'WATERING_PROPOSAL_DURATION_SECONDS' => '3'];
         $this->environment = new ProcessEnvironment(array_keys($values));
         $this->configure($values);
@@ -80,6 +82,21 @@ final class WateringProductionTest extends TestCase
         $this->boot();
         $this->refuses(fn () => $this->kernel->getContainer()->get(WateringManager::class)->request(3));
         self::assertSame(0, (int) $this->harness->connection->fetchOne('SELECT COUNT(*) FROM watering_run'));
+    }
+
+    #[DataProvider('invalidRetries')]
+    public function testRealContainerRejectsInvalidRetryBeforePolling(string $retry): void
+    {
+        $this->configure(['WATERING_PROPOSAL_RETRY_SECONDS' => $retry]);
+        $this->boot();
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('retry must be a positive integer');
+        $this->kernel->getContainer()->get(WateringProposalPollCommand::class);
+    }
+
+    public static function invalidRetries(): array
+    {
+        return [['0'], ['-1'], ['abc'], ['1.5'], ['999999999999999999999']];
     }
 
     public function testEnabledProductionPublishesAndReadinessIsReadOnly(): void

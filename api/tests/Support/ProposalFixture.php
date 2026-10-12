@@ -71,11 +71,24 @@ final class ProposalFixture
         $this->readings();
     }
 
-    public function stack(string $topic, RecordingTelegramGateway $gateway): array
+    public function stack(string $topic, RecordingTelegramGateway $gateway, int|string $retrySeconds = 1800): array
     {
         $manager = $this->harness->manager;
-        $policy = \newTestPolicy($manager, \newTestManager($manager, $this->publisher), $topic);
+        $policy = \newTestPolicy($manager, \newTestManager($manager, $this->publisher), $topic, 3, $retrySeconds);
         return [$policy, \newTestBot($manager, $policy, $gateway)];
+    }
+
+    public function expireProposal(int $id, int $secondsAgo): void
+    {
+        $this->harness->connection->executeStatement(
+            'UPDATE watering_proposal SET expires_at = ? WHERE id = ?',
+            [gmdate('Y-m-d H:i:s', time() - $secondsAgo), $id],
+        );
+    }
+
+    public function heartbeat(): void
+    {
+        $this->harness->connection->executeStatement('UPDATE watering_control SET monitor_seen_at = UTC_TIMESTAMP() WHERE id = 1');
     }
 
     public function column(string $name, int $id): mixed

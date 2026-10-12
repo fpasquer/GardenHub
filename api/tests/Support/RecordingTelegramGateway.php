@@ -13,10 +13,14 @@ final class RecordingTelegramGateway implements InterfaceTelegramGateway
     public array $sent = [];
     public array $edits = [];
     public int $polls = 0;
+    public bool $failSend = false;
 
     public function send(string $text, int $proposalId): int
     {
         $this->sent[] = [$text, $proposalId];
+        if ($this->failSend) {
+            throw new \RuntimeException('Delivery outcome uncertain.');
+        }
         return count($this->sent);
     }
 
