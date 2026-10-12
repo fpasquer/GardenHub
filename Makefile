@@ -1,5 +1,25 @@
 SHELL := /bin/sh
 
+.PHONY: test-build test-phpunit test-report test-groups test-coverage-probe test-coverage
+test-build:
+	docker build --target test-runner -t gardenhub-tests:phpunit api
+	docker build --target production -t gardenhub-api:phpunit-production api
+	docker build --target smoke-nginx -t gardenhub-smoke-nginx:phpunit-production api
+
+test-phpunit test-report:
+	GROUP='$(GROUP)' bash tests/phpunit.sh
+
+test-groups:
+	bash tests/phpunit.sh --list-groups
+	GROUP=functional_gardenhub-coverage-collection bash tests/phpunit.sh --list-groups
+	GROUP=functional_gardenhub-scheduler-delivery bash tests/phpunit.sh --list-groups
+
+test-coverage-probe:
+	GROUP=functional_gardenhub-coverage-collection bash tests/phpunit.sh
+
+test-coverage:
+	bash tests/phpunit-coverage.sh
+
 COMPOSE := docker compose --env-file .env
 COMPOSE_FILES := -f compose.yaml
 

@@ -27,10 +27,13 @@ final class ProposalBot
                 continue;
             }
             try {
-                $id = $this->telegram->send($this->text($proposal), $proposalId);
+                $id = $this->telegram->send(
+                    $this->text($proposal, $this->policy->isRenewed($proposal)),
+                    $proposalId,
+                );
                 $this->policy->recordMessage($proposalId, $id);
             } catch (\Throwable) {
-                // Send may have succeeded before a timeout/crash. Never resend this episode.
+                // Send may have succeeded before a timeout/crash. Never resend this proposal.
                 $this->policy->notificationUncertain($proposalId);
             }
         }
@@ -96,10 +99,10 @@ final class ProposalBot
         );
     }
 
-    private function text(WateringProposal $p): string
+    private function text(WateringProposal $p, bool $renewed = false): string
     {
         $lines = [
-            'GardenHub dev watering proposal',
+            $renewed ? 'GardenHub renewed watering request' : 'GardenHub dev watering proposal',
             sprintf('Device: %s', $p->getDevice()?->getName()),
             sprintf('Actuator: %s', $this->actuatorLabel($p->getActuatorTopic())),
         ];

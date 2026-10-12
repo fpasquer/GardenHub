@@ -29,129 +29,45 @@ jobs:
           BIND_ADDRESS: 127.0.0.1
         run: docker build --target development -t gardenhub-api api
 
-      - name: Run deployment tests
-        id: deployment_tests
+      - name: Build PHPUnit runner
+        run: make test-build
+
+      - name: Run migrated PHPUnit tests
+        id: phpunit_tests
         continue-on-error: true
-        run: python3 tests/watering-control/compose-deployment.py
+        run: make test-report
 
-      - name: Run release gate tests
-        id: release_tests
+      - name: Upload PHPUnit reports
         if: always()
-        continue-on-error: true
-        run: python3 -B -m unittest discover -s tests/release-ci -v
-
-      - name: Run MQTT lifecycle tests
-        id: mqtt_tests
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/mqtt-lifecycle/compose.yaml run --rm tests
-
-      - name: Clean up MQTT lifecycle stack
-        if: always()
-        run: docker compose -f tests/mqtt-lifecycle/compose.yaml down -v
-
-      - name: Run sensor identity tests
-        id: sensor_tests
-        if: always()
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/sensor-identity/compose.yaml run --rm tests
-
-      - name: Clean up sensor identity stack
-        if: always()
-        run: docker compose -f tests/sensor-identity/compose.yaml down -v
-
-      - name: Run Telegram unit tests
-        id: telegram_unit_tests
-        if: always()
-        continue-on-error: true
-        env:
-          # Same CI-only placeholder as the build step; --no-deps means
-          # gardenhub-mysql/nginx are never started, so no port is bound.
-          BIND_ADDRESS: 127.0.0.1
-        run: |
-          set -Eeuo pipefail
-          docker compose -f compose.yaml -f compose-dev.yaml run --rm --no-deps gardenhub-api php tests/telegram_handler_test.php
-          docker compose -f compose.yaml -f compose-dev.yaml run --rm --no-deps gardenhub-api php tests/stream_telegram_transport_test.php
-
-      - name: Run Telegram daily-summary tests
-        id: telegram_summary_tests
-        if: always()
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/telegram-summary/compose.yaml run --rm tests
-
-      - name: Clean up Telegram daily-summary stack
-        if: always()
-        run: docker compose -f tests/telegram-summary/compose.yaml down -v
-
-      - name: Run scheduler-cron tests
-        id: scheduler_tests
-        if: always()
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/scheduler-cron/compose.yaml run --rm tests
-
-      - name: Clean up scheduler-cron stack
-        if: always()
-        run: docker compose -f tests/scheduler-cron/compose.yaml down -v
-
-      - name: Run watering control tests
-        id: watering_tests
-        if: always()
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/watering-control/compose.yaml run --rm tests
-
-      - name: Clean up watering control stack
-        if: always()
-        run: docker compose -f tests/watering-control/compose.yaml down -v
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phpunit-results
+          path: |
+            .test-reports/phpunit/all/
+            .test-reports/phpunit/scheduler-delivery/
+            .test-reports/phpunit/telegram-summary/
+            .test-reports/phpunit/sensor-identity/
+            .test-reports/phpunit/sensor-concurrency/
+            .test-reports/phpunit/mqtt-worker/
+            .test-reports/phpunit/mqtt-session-resume/
+            .test-reports/phpunit/mqtt-delivery/
+            .test-reports/phpunit/mqtt-identity-race/
+            .test-reports/phpunit/migration-upgrade/
+            .test-reports/phpunit/watering-orm/
+            .test-reports/phpunit/watering-control/
+            .test-reports/phpunit/watering-production/
+            .test-reports/phpunit/watering-proposals/
+            .test-reports/phpunit/watering-actuator-switch/
+            .test-reports/phpunit/watering-mqtt/
+            .test-reports/phpunit/production-smoke/
+            .test-reports/phpunit/grafana/
+          if-no-files-found: error
 
       - name: Fail if any test suite failed
         if: always()
         run: |
-          if [ "${{ steps.deployment_tests.outcome }}" != "success" ]; then
-            echo "Deployment tests failed"
-            exit 1
-          fi
-
-          if [ "${{ steps.release_tests.outcome }}" != "success" ]; then
-            echo "Release gate tests failed"
-            exit 1
-          fi
-
-          if [ "${{ steps.mqtt_tests.outcome }}" != "success" ]; then
-            echo "MQTT lifecycle tests failed"
-            exit 1
-          fi
-
-          if [ "${{ steps.sensor_tests.outcome }}" != "success" ]; then
-            echo "Sensor identity tests failed"
-            exit 1
-          fi
-
-          if [ "${{ steps.telegram_unit_tests.outcome }}" != "success" ]; then
-            echo "Telegram unit tests failed"
-            exit 1
-          fi
-
-          if [ "${{ steps.telegram_summary_tests.outcome }}" != "success" ]; then
-            echo "Telegram daily-summary tests failed"
-            exit 1
-          fi
-
-          if [ "${{ steps.scheduler_tests.outcome }}" != "success" ]; then
-            echo "Scheduler-cron tests failed"
-            exit 1
-          fi
-
-          if [ "${{ steps.watering_tests.outcome }}" != "success" ]; then
-            echo "Watering control tests failed"
+          if [ "${{ steps.phpunit_tests.outcome }}" != "success" ]; then
+            echo "PHPUnit tests failed"
             exit 1
           fi
 
@@ -163,9 +79,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: Build offline test tooling
-        run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml build tests
+        run: docker build --target test-runner -t gardenhub-tests:phpunit api
       - name: Run full Grafana suite
-        run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml up --abort-on-container-exit --exit-code-from tests
+        run: bash tests/phpunit-grafana.sh functional_gardenhub-grafana
+      - name: Upload Grafana PHPUnit results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: grafana-phpunit
+          path: .test-reports/phpunit/grafana/
+          if-no-files-found: error
       - name: Show failure diagnostics
         if: failure()
         run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml logs --no-color --tail=100
@@ -209,7 +132,16 @@ jobs:
           docker build --target production -t "$PRODUCTION_IMAGE" api
           docker build --target smoke-nginx -t "$SMOKE_NGINX_IMAGE" api
       - name: Run packaged production smoke tests
-        run: sh tests/production-smoke/run.sh
+        run: |
+          docker build --target test-runner -t gardenhub-tests:phpunit api
+          sh tests/production-smoke/run.sh
+      - name: Upload packaged smoke results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: production-smoke-phpunit
+          path: .test-reports/phpunit/production-smoke/
+          if-no-files-found: error
       - name: Scan production images
         if: ${{ !cancelled() && success() }}
         run: |

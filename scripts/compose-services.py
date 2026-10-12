@@ -47,6 +47,9 @@ def validate_mqtt(environment):
         raise ValueError('Invalid watering cooldown.')
     if not 1 <= int(environment['WATERING_PROPOSAL_DURATION_SECONDS']) <= maximum:
         raise ValueError('Invalid watering proposal duration.')
+    retry = str(environment.get('WATERING_PROPOSAL_RETRY_SECONDS', '1800')).strip()
+    if not re.fullmatch(r'\+?[1-9][0-9]*', retry) or int(retry) > sys.maxsize:
+        raise ValueError('Invalid watering proposal retry interval.')
 
 
 def validate_modes(services):

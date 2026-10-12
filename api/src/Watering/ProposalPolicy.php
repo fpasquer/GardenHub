@@ -22,8 +22,7 @@ final class ProposalPolicy
     private const DEVICE_NAME = 'SE01-Avocado';
     private const READINGS = 3;
     private const DAY_SECONDS = 86400;
-    /** One initial prompt and one reminder per actuator, until a wet reading resets the episode. */
-    private const MAX_PROMPTS = 2;
+    private readonly int $retrySeconds;
 
     public function __construct(
         private readonly DeviceRepository $devices,
@@ -39,7 +38,13 @@ final class ProposalPolicy
         private readonly int $validityMinutes,
         private readonly int $durationSeconds,
         private readonly string $actuatorTopic,
+        int|string $retrySeconds = 1800,
     ) {
+        $retry = filter_var($retrySeconds, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if (false === $retry) {
+            throw new \LogicException('Watering proposal retry must be a positive integer number of seconds.');
+        }
+        $this->retrySeconds = $retry;
         if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || $durationSeconds < 1 || $durationSeconds > $watering->maxSeconds()) {
             throw new \LogicException('Invalid watering proposal configuration.');
         }
@@ -152,24 +157,55 @@ final class ProposalPolicy
     private function prompt(Device $device, \DateTimeImmutable $now, array $readings, ?\DateTimeImmutable $attempt): ?WateringProposal
     {
         $state = $this->states->lockOrCreate($device, $this->actuatorTopic);
-        if (!$this->mayPrompt($state, $now)) {
+        $previous = $this->proposals->latestForDevice((int) $device->getId());
+        if (!$this->mayPrompt($state, $previous, $now)) {
             return null;
         }
+        $renewed = $state->getPromptCount() > 0
+            && WateringProposalStatus::Expired->value === $previous?->getStatus();
+        if ($state->getPromptCount() > 0) {
+            try {
+                $this->watering->assertProposalEligible($this->durationSeconds, $now);
+            } catch (\DomainException) {
+                return null;
+            }
+        }
         $proposal = $this->createProposal($device, $now, $readings, $attempt);
-        $state->setPromptCount($state->getPromptCount() + 1)->setLastPromptAt($now);
+        $state->setPromptCount($renewed ? 2 : 1)->setLastPromptAt($now);
 
         return $proposal;
     }
 
-    private function mayPrompt(WateringProposalState $state, \DateTimeImmutable $now): bool
+    private function mayPrompt(WateringProposalState $state, ?WateringProposal $previous, \DateTimeImmutable $now): bool
     {
-        $count = $state->getPromptCount();
-        $last = $state->getLastPromptAt();
-        if ($count >= self::MAX_PROMPTS) {
+        if (0 === $state->getPromptCount()) {
+            return true;
+        }
+        if (null === $previous || $previous->getActuatorTopic() !== $this->actuatorTopic
+            || $state->getLastPromptAt() != $previous->getCreatedAt()) {
             return false;
         }
+        $deadline = match ($previous->getStatus()) {
+            WateringProposalStatus::Expired->value => $previous->getExpiresAt(),
+            WateringProposalStatus::Rejected->value => $previous->getDecidedAt(),
+            WateringProposalStatus::Approved->value => $previous->getRun()?->getRequestedAt(),
+            default => null,
+        };
+        $delay = WateringProposalStatus::Expired->value === $previous->getStatus()
+            ? $this->retrySeconds : self::DAY_SECONDS;
 
-        return 0 === $count || null === $last || $last->getTimestamp() <= $now->getTimestamp() - self::DAY_SECONDS;
+        return null !== $deadline && $now->getTimestamp() - $deadline->getTimestamp() >= $delay;
+    }
+
+    public function isRenewed(WateringProposal $proposal): bool
+    {
+        $state = $this->states->find([
+            'device' => $proposal->getDevice(),
+            'actuatorTopic' => $proposal->getActuatorTopic(),
+        ]);
+
+        return null !== $state && $state->getPromptCount() > 1
+            && $state->getLastPromptAt() == $proposal->getCreatedAt();
     }
 
     /**

@@ -69,6 +69,19 @@ class WateringProposalRepository extends ServiceEntityRepository
             ->getArrayResult();
     }
 
+    public function latestForDevice(int $deviceId): ?WateringProposal
+    {
+        return $this->createQueryBuilder('p')
+            ->where('p.device = :device')
+            ->setParameter('device', $deviceId)
+            ->orderBy('p.createdAt', 'DESC')
+            ->addOrderBy('p.id', 'DESC')
+            ->setMaxResults(1)
+            ->getQuery()
+            ->setHint(Query::HINT_REFRESH, true)
+            ->getOneOrNullResult();
+    }
+
     /**
      * Only unclaimed, still actionable proposals may be sent after a restart.
      *

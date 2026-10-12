@@ -1,2 +1,2 @@
-FROM alpine:3.20
+FROM gardenhub-tests:phpunit
 RUN apk add --no-cache curl jq mariadb-client

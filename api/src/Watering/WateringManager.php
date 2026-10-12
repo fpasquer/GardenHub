@@ -50,6 +50,15 @@ final class WateringManager
         return $this->maxSeconds;
     }
 
+    public function assertProposalEligible(int $seconds, \DateTimeImmutable $now): void
+    {
+        $this->assertEnabled();
+        if ($seconds < 1 || $seconds > $this->maxSeconds) {
+            throw new \DomainException('Proposal duration exceeds watering limits.');
+        }
+        $this->assertReservable($this->controls->lock(), $now, $seconds);
+    }
+
     /**
      * Optional guard runs under the same control lock as the run reservation.
      *
