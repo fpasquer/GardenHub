@@ -11,19 +11,20 @@ x-environment: &environment
 services:
   mysql:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=32M", "--innodb-log-buffer-size=4M", "--max-connections=10", "--table-open-cache=64", "--table-definition-cache=400", "--temptable-max-ram=16M"]
     environment:
       MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
       MYSQL_DATABASE: production_smoke
-    tmpfs:
-      - /var/lib/mysql
+    volumes:
+      - database:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=TCP", "--silent"]
-      interval: 1s
+      interval: 2s
       timeout: 5s
       retries: 60
 
   gardenhub-api:
-    image: ${PRODUCTION_IMAGE:-gardenhub-api:release-validation}
+    image: ${PRODUCTION_IMAGE:-gardenhub-api:phpunit-production}
     environment: *environment
     depends_on:
       mysql:
@@ -35,7 +36,7 @@ services:
       retries: 30
 
   nginx:
-    image: ${SMOKE_NGINX_IMAGE:-gardenhub-smoke-nginx:release-validation}
+    image: ${SMOKE_NGINX_IMAGE:-gardenhub-smoke-nginx:phpunit-production}
     depends_on:
       gardenhub-api:
         condition: service_healthy
@@ -45,6 +46,25 @@ services:
       timeout: 5s
       retries: 30
 
+  tests:
+    image: gardenhub-tests:phpunit
+    entrypoint: ["timeout", "-s", "TERM", "-k", "10", "480", "php", "vendor/bin/phpunit"]
+    command: ["--do-not-record-test-run-history", "--testdox", "--display-all-issues", "--group", "functional_gardenhub-production-smoke", "--log-junit", "/reports/junit.xml", "--testdox-text", "/reports/testdox.txt", "tests/Integration/ProductionSmokeTest.php"]
+    environment:
+      XDEBUG_MODE: 'off'
+      GARDENHUB_ROOT: ${PWD:?Workspace path required}
+      PRODUCTION_IMAGE: ${PRODUCTION_IMAGE:-gardenhub-api:phpunit-production}
+      SMOKE_NGINX_IMAGE: ${SMOKE_NGINX_IMAGE:-gardenhub-smoke-nginx:phpunit-production}
+    volumes:
+      - ${PWD}:${PWD}:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ../../api/tests:/app/tests:ro
+      - ../../api/phpunit.xml.dist:/app/phpunit.xml.dist:ro
+      - ../../.test-reports/phpunit/production-smoke:/reports
+
 networks:
   default:
     internal: true
+
+volumes:
+  database:

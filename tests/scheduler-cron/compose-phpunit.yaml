@@ -1,0 +1,75 @@
+name: gardenhub-phpunit-scheduler
+
+services:
+  mysql:
+    image: mysql:8.4
+    command:
+      - --innodb-buffer-pool-size=32M
+      - --innodb-log-buffer-size=4M
+      - --max-connections=10
+      - --table-open-cache=64
+      - --table-definition-cache=400
+      - --temptable-max-ram=16M
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_DATABASE: ${GARDENHUB_TEST_DATABASE:-scheduler_cron}
+    volumes:
+      - database:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=TCP", "--silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    profiles: [mqtt]
+    volumes:
+      - ../mqtt-lifecycle/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "health", "-m", "ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  tests:
+    image: gardenhub-tests:phpunit
+    entrypoint: ["timeout", "-s", "TERM", "-k", "10", "${GARDENHUB_TEST_TIMEOUT:-180}", "php", "vendor/bin/phpunit"]
+    command:
+      - --do-not-record-test-run-history
+      - --testdox
+      - --display-all-issues
+      - --group
+      - ${GARDENHUB_TEST_GROUP:-functional_gardenhub-scheduler-delivery}
+      - --log-junit
+      - /reports/junit.xml
+      - --testdox-text
+      - /reports/testdox.txt
+      - ${GARDENHUB_TEST_FILE:-tests/Integration/SchedulerDeliveryTest.php}
+    environment:
+      XDEBUG_MODE: 'off'
+      GARDENHUB_ROOT: /workspace
+      APP_ENV: dev
+      APP_DEBUG: '1'
+      APP_SECRET: scheduler-cron-tests-only
+      DEFAULT_URI: 'http://localhost'
+      CORS_ALLOW_ORIGIN: '^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$'
+      DATABASE_URL: 'mysql://root@mysql:3306/${GARDENHUB_TEST_DATABASE:-scheduler_cron}?serverVersion=8.4&charset=utf8mb4'
+      GARDENHUB_LIFECYCLE_TESTS: '1'
+      TELEGRAM_ENABLED: 'true'
+      TELEGRAM_BOT_TOKEN: test-token
+      TELEGRAM_CHAT_ID: test-chat
+      TELEGRAM_MIN_LEVEL: warning
+    volumes:
+      - ../..:/workspace:ro
+      - ../../api/src:/app/src:ro
+      - ../../api/config:/app/config:ro
+      - ../../api/tests:/app/tests:ro
+      - ../../api/phpunit.xml.dist:/app/phpunit.xml.dist:ro
+      - ../../${GARDENHUB_REPORT_ROOT:-.test-reports/phpunit}/${GARDENHUB_TEST_REPORT:-scheduler-delivery}:/reports
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  database:

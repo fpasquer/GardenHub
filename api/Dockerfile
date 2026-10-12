@@ -1,6 +1,6 @@
 # GardenHub API — PHP-FPM image for Symfony / API Platform.
 # HTTP is served by the gardenhub-nginx container (FastCGI on port 9000).
-FROM php:8.4-fpm-alpine AS base
+FROM php:8.4.26-fpm-alpine AS base
 
 WORKDIR /app
 
@@ -15,6 +15,14 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 COPY composer.json composer.lock symfony.lock ./
 
 FROM base AS development-dependencies
+ENV XDEBUG_MODE=off
+RUN apk add --no-cache --virtual .xdebug-build $PHPIZE_DEPS linux-headers \
+    && MAKEFLAGS=-j1 pecl install xdebug-3.5.3 \
+    && docker-php-ext-enable xdebug \
+    && mv /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+       /usr/local/etc/php/conf.d/99-xdebug.ini \
+    && apk del .xdebug-build
+COPY docker/php/development.ini /usr/local/etc/php/conf.d/99-development.ini
 RUN composer install --prefer-dist --no-interaction --no-progress --no-scripts \
     && composer clear-cache
 
@@ -29,13 +37,23 @@ RUN composer dump-autoload --optimize \
     && composer run-script post-install-cmd --no-interaction \
     && chmod -R a+rw var
 
+FROM development AS test-runner
+RUN apk add --no-cache bash python3 make docker-cli docker-cli-compose \
+    util-linux curl git fcgi
+
 FROM base AS production-dependencies
 RUN composer install --no-dev --prefer-dist --no-interaction --no-progress --no-scripts \
     && composer clear-cache
 
 FROM production-dependencies AS production-app
 ENV APP_ENV=prod APP_DEBUG=0
-COPY . .
+COPY .env ./
+COPY bin/ bin/
+COPY config/ config/
+COPY migrations/ migrations/
+COPY public/ public/
+COPY src/ src/
+COPY templates/ templates/
 RUN composer dump-autoload --no-dev --optimize \
     && composer run-script post-install-cmd --no-interaction \
     && chown -R www-data:www-data var

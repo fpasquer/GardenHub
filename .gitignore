@@ -21,3 +21,5 @@
 .DS_Store
 Thumbs.db
 ###< OS ###
+
+/.test-reports/
