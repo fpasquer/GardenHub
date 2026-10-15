@@ -3,9 +3,16 @@ set -Eeuo pipefail
 
 cd "$(dirname "$0")/.."
 export GARDENHUB_COVERAGE=1
-export GARDENHUB_REPORT_ROOT=.test-reports/coverage/$(date +%Y%m%d-%H%M%S)-$$
-mkdir -p "$GARDENHUB_REPORT_ROOT"
-GROUP=all bash tests/phpunit.sh
+if [[ "${1:-}" == --merge-only ]]; then
+    : "${GARDENHUB_REPORT_ROOT:?Merge-only requires the current collection report root}"
+elif [[ $# == 0 ]]; then
+    export GARDENHUB_REPORT_ROOT=.test-reports/coverage/$(date +%Y%m%d-%H%M%S)-$$
+    mkdir -p "$GARDENHUB_REPORT_ROOT"
+    GROUP=ci bash tests/phpunit.sh
+else
+    echo 'Usage: phpunit-coverage.sh [--merge-only]' >&2
+    exit 2
+fi
 docker run --rm --network none --user "$(id -u):$(id -g)" \
     -v "$PWD/api/tests:/app/tests:ro" \
     -v "$PWD/$GARDENHUB_REPORT_ROOT:/reports" \

@@ -1592,17 +1592,20 @@ sensor identity/concurrency, Compose and Make deployment scenarios have migrated
 MQTT worker callback/reset/recovery, outage alerts, pre-SUBACK delivery and
 persistent-session resumption have also migrated, preserving real broker and
 fresh-process interactions.
-Remaining application, Grafana and production-smoke
-suites still use their existing runners; `make test-phpunit` is not yet the full
-repository suite. Existing CI gates for those suites remain enabled.
+Application, Grafana and production-smoke suites run through PHPUnit with
+isolated service runners. The main CI job runs core suites once under Xdebug;
+Grafana and packaged production smoke run only in their dedicated required jobs.
+Composer and production-image audits remain required by `CI Ready`.
 
 ```bash
 make test-build                 # Separate gardenhub-tests:phpunit image
-make test-phpunit               # All currently migrated PHPUnit tests
+make test-phpunit               # Complete suite
 make test-groups                # List exact independently runnable groups
 make test-report               # TestDox, timings and JUnit XML
+make test-ci                   # Core suites, excluding Grafana and packaged smoke
 make test-phpunit GROUP=unitest_gardenhub-image-audit
-make test-coverage-probe        # Separate opt-in CLI/HTTP collection proof
+make test-coverage-probe        # Focused CLI/HTTP/FPM collection proof
+make test-coverage             # Native aggregate api/src coverage, 80% required
 ```
 
 Reports are written to `.test-reports/phpunit/<group>/junit.xml` and
@@ -1620,17 +1623,27 @@ memory caps, so this check is a headroom guard, not an aggregate memory guarante
 Existing swap usage and live services must be considered before heavier suites.
 The full database/Grafana suite still needs measured 2 GB validation.
 
-Coverage is separate from normal/report runs. The opt-in probe verifies two
-development PHP executions (CLI and loopback HTTP), native coverage-fragment
-merging and a Clover denominator including uncovered source. Normal commands
-do not execute this probe. Collection is enabled explicitly through a child
-PHP prepend file and `GARDENHUB_COVERAGE_DIR`, never through production INI.
-Fragments are created in a private temporary directory and removed afterward.
-Forced-kill processes cannot flush shutdown coverage.
+Native aggregate coverage is opt-in locally and required in CI. The collection
+proof tests (CLI, loopback HTTP and real FPM) are included in core/full runs.
+Application subprocess collection uses a development-only prepend/runtime and
+`GARDENHUB_COVERAGE_DIR`, never production INI. Forced-kill processes cannot
+flush shutdown coverage. `make test-coverage` collects the same core suites as
+`make test-ci`, without repeating Grafana or packaged production smoke.
 
-Real FPM/long-running worker collection, full-suite HTML/Clover reports and the
-agreed 80% gate remain implementation work; no coverage percentage or complete
-Pi compatibility is claimed yet.
+CI enables `GARDENHUB_COVERAGE=1` during `make test-ci`, then runs
+`bash tests/phpunit-coverage.sh --merge-only` with the same report root.
+Enforcement requires every expected suite to succeed, a completed collection
+manifest, successful JUnit reports and native coverage fragments. Failed tests,
+incomplete collection and coverage below 80% all fail the required CI job.
+All `api/src` files, including uncovered files, remain in the denominator.
+Clover XML, HTML and text reports are emitted before threshold enforcement in
+`.test-reports/coverage/<run>/` and uploaded even on a below-threshold failure.
+
+New proposals persist their initial/renewed notification classification. Legacy
+proposals with an unknown classification retain their Telegram text; terminal
+reconciliation removes buttons through `editMessageReplyMarkup` and completes
+only after Telegram succeeds. API failures retry without changing the durable
+decision; expired callbacks remain rejected by the backend.
 
 The replaced-runner preservation ledger is:
 

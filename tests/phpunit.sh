@@ -12,6 +12,20 @@ if [[ "$available" -lt 262144 ]]; then
     exit 2
 fi
 report_root=${GARDENHUB_REPORT_ROOT:-.test-reports/phpunit}
+integration_groups=(
+    scheduler-delivery telegram-summary sensor-identity sensor-concurrency
+    mqtt-worker mqtt-session-resume mqtt-delivery mqtt-identity-race migration-upgrade
+    watering-orm watering-control watering-production watering-proposals
+    watering-actuator-switch watering-mqtt
+)
+if [[ "${GARDENHUB_COVERAGE:-0}" == 1 && ( "$group" == all || "$group" == ci ) && "$*" != *--list-* ]]; then
+    if [[ -d "$report_root" && -n "$(find "$report_root" -type f -print -quit)" ]]; then
+        echo 'Coverage collection requires a fresh report root.' >&2
+        exit 2
+    fi
+    mkdir -p "$report_root"
+    printf '%s\n' "$group" "${integration_groups[@]}" > "$report_root/expected-suites.txt"
+fi
 mkdir -p .test-reports/phpunit/cache "$report_root/$group"
 exec 9>.test-reports/phpunit/run.lock
 flock -n 9 || { echo 'Another PHPUnit run is active.' >&2; exit 2; }
@@ -36,7 +50,7 @@ if [[ "$group" == functional_gardenhub-scheduler-delivery || "$group" == functio
     fi
     set -- tests/Integration "$@"
 fi
-if [[ "$group" != all ]]; then
+if [[ "$group" != all && "$group" != ci ]]; then
     set -- --group "$group" "$@"
 fi
 if [[ "${GARDENHUB_COVERAGE:-0}" == 1 ]]; then
@@ -55,23 +69,19 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
     vendor/bin/phpunit --do-not-record-test-run-history \
     --testdox --display-all-issues --log-junit /reports/junit.xml \
     --testdox-text /reports/testdox.txt "$@"
-if [[ "$group" == all && "$*" != *--list-* ]]; then
-    bash tests/phpunit-integration.sh functional_gardenhub-scheduler-delivery
-    bash tests/phpunit-integration.sh functional_gardenhub-telegram-summary
-    bash tests/phpunit-integration.sh functional_gardenhub-sensor-identity
-    bash tests/phpunit-integration.sh functional_gardenhub-sensor-concurrency
-    bash tests/phpunit-integration.sh functional_gardenhub-mqtt-worker
-    bash tests/phpunit-integration.sh functional_gardenhub-mqtt-session-resume
-    bash tests/phpunit-integration.sh functional_gardenhub-mqtt-delivery
-    bash tests/phpunit-integration.sh functional_gardenhub-mqtt-identity-race
-    bash tests/phpunit-integration.sh functional_gardenhub-migration-upgrade
-    bash tests/phpunit-integration.sh functional_gardenhub-watering-orm
-    bash tests/phpunit-integration.sh functional_gardenhub-watering-control
-    bash tests/phpunit-integration.sh functional_gardenhub-watering-production
-    bash tests/phpunit-integration.sh functional_gardenhub-watering-proposals
-    bash tests/phpunit-integration.sh functional_gardenhub-watering-actuator-switch
-    bash tests/phpunit-integration.sh functional_gardenhub-watering-mqtt
-    if [[ "${GARDENHUB_COVERAGE:-0}" != 1 ]]; then
+if [[ ( "$group" == all || "$group" == ci ) && "$*" != *--list-* ]]; then
+    for integration_group in "${integration_groups[@]}"; do
+        bash tests/phpunit-integration.sh "functional_gardenhub-$integration_group"
+    done
+    if [[ "${GARDENHUB_COVERAGE:-0}" == 1 ]]; then
+        while IFS= read -r suite; do
+            [[ -s "$report_root/$suite/aggregate.cov" && -s "$report_root/$suite/junit.xml" ]] || {
+                echo "Coverage collection incomplete: $suite" >&2
+                exit 1
+            }
+        done < "$report_root/expected-suites.txt"
+        touch "$report_root/collection-complete"
+    elif [[ "$group" == all ]]; then
         sh tests/production-smoke/run.sh
         bash tests/phpunit-grafana.sh functional_gardenhub-grafana
     fi

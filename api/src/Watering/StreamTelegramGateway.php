@@ -7,8 +7,11 @@ namespace App\Watering;
 /** Separate from the Monolog alert transport; outbound Bot API calls only. */
 final class StreamTelegramGateway implements InterfaceTelegramGateway
 {
-    public function __construct(private readonly string $botToken, private readonly string $chatId)
-    {
+    public function __construct(
+        private readonly string $botToken,
+        private readonly string $chatId,
+        private readonly string $apiUrl = 'https://api.telegram.org',
+    ) {
     }
 
     public function send(string $text, int $proposalId): int
@@ -48,12 +51,21 @@ final class StreamTelegramGateway implements InterfaceTelegramGateway
         $this->call('editMessageText', ['chat_id' => $this->chatId, 'message_id' => $messageId, 'text' => $text, 'reply_markup' => json_encode(['inline_keyboard' => []], JSON_THROW_ON_ERROR)]);
     }
 
+    public function removeButtons(int $messageId): void
+    {
+        $this->call('editMessageReplyMarkup', [
+            'chat_id' => $this->chatId,
+            'message_id' => $messageId,
+            'reply_markup' => json_encode(['inline_keyboard' => []], JSON_THROW_ON_ERROR),
+        ]);
+    }
+
     private function call(string $method, array $params, int $timeout = 8): mixed
     {
         if ($this->botToken === '' || $this->chatId === '') {
             throw new \LogicException('Interactive Telegram bot is not configured.');
         }
-        $url = 'https://api.telegram.org/bot'.$this->botToken.'/'.$method;
+        $url = sprintf('%s/bot%s/%s', $this->apiUrl, $this->botToken, $method);
         $context = stream_context_create(['http' => [
             'method' => 'POST', 'header' => 'Content-Type: application/x-www-form-urlencoded',
             'content' => http_build_query($params), 'timeout' => $timeout, 'ignore_errors' => true,

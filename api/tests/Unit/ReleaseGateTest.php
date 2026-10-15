@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace App\Tests\Unit;
 
 use App\Tests\Support\PythonSubject;
+use App\Tests\Support\Command;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Yaml\Yaml;
 
 #[Group('unitest_gardenhub-release-gate')]
 final class ReleaseGateTest extends TestCase
@@ -24,6 +26,36 @@ final class ReleaseGateTest extends TestCase
         $result = $this->check();
         self::assertNull($result['exception']);
         self::assertSame(42, $result['value']);
+    }
+
+    public function testCiTriggersAndRequiredReleaseJobsRemainUnchanged(): void
+    {
+        $workflow = Yaml::parseFile(Command::root().'/.github/workflows/ci.yml');
+        self::assertSame([
+            'push' => ['branches' => ['master']],
+            'pull_request' => ['branches' => ['master']],
+            'workflow_dispatch' => null,
+        ], $workflow['on']);
+        self::assertSame(['tests', 'grafana', 'composer-audit', 'production'],
+            $workflow['jobs']['ready']['needs']);
+        self::assertSame('always()', $workflow['jobs']['ready']['if']);
+        $steps = array_column($workflow['jobs']['tests']['steps'], null, 'name');
+        self::assertSame('make test-ci', $steps['Run migrated PHPUnit tests']['run']);
+        self::assertSame('1', $steps['Run migrated PHPUnit tests']['env']['GARDENHUB_COVERAGE']);
+        self::assertSame('bash tests/phpunit-coverage.sh --merge-only',
+            $steps['Enforce native PHPUnit coverage']['run']);
+        self::assertStringContainsString("steps.phpunit_tests.outcome == 'success'",
+            $steps['Enforce native PHPUnit coverage']['if']);
+        foreach (['steps.phpunit_tests.outcome', 'steps.coverage.outcome', 'exit 1'] as $guard) {
+            self::assertStringContainsString($guard, $steps['Fail if any test suite failed']['run']);
+        }
+        foreach (['Upload PHPUnit reports', 'Upload native coverage reports'] as $name) {
+            self::assertTrue($steps[$name]['with']['include-hidden-files']);
+        }
+        self::assertStringContainsString('functional_gardenhub-grafana',
+            implode("\n", array_column($workflow['jobs']['grafana']['steps'], 'run')));
+        self::assertStringContainsString('tests/production-smoke/run.sh',
+            implode("\n", array_column($workflow['jobs']['production']['steps'], 'run')));
     }
 
     #[DataProvider('invalidIdentities')]

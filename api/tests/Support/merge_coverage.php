@@ -5,17 +5,15 @@ declare(strict_types=1);
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 use App\Tests\Support\CoverageGate;
+use App\Tests\Support\CoverageCollection;
 use SebastianBergmann\CodeCoverage\Report\Facade;
 use SebastianBergmann\CodeCoverage\Serialization\Merger;
-use Symfony\Component\Finder\Finder;
 
 $directory = $argv[1] ?? '/reports';
-$fragments = [];
-foreach ((new Finder())->files()->name('*.cov')->in($directory) as $file) {
-    $fragments[] = $file->getRealPath();
-}
-if ([] === $fragments) {
-    throw new RuntimeException('No trusted native coverage fragments found.');
+$fragments = CoverageCollection::fragments($directory);
+foreach ($fragments as $fragment) {
+    $children = glob(dirname($fragment).'/child-*.cov');
+    $fragments = [...$fragments, ...$children];
 }
 $merged = (new Merger())->merge($fragments);
 $report = Facade::fromSerializedData($merged);

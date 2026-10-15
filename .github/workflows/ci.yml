@@ -35,39 +35,47 @@ jobs:
       - name: Run migrated PHPUnit tests
         id: phpunit_tests
         continue-on-error: true
-        run: make test-report
+        env:
+          GARDENHUB_COVERAGE: '1'
+          GARDENHUB_REPORT_ROOT: .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: make test-ci
+
+      - name: Enforce native PHPUnit coverage
+        id: coverage
+        if: ${{ !cancelled() && steps.phpunit_tests.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GARDENHUB_REPORT_ROOT: .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash tests/phpunit-coverage.sh --merge-only
 
       - name: Upload PHPUnit reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: phpunit-results
+          include-hidden-files: true
           path: |
-            .test-reports/phpunit/all/
-            .test-reports/phpunit/scheduler-delivery/
-            .test-reports/phpunit/telegram-summary/
-            .test-reports/phpunit/sensor-identity/
-            .test-reports/phpunit/sensor-concurrency/
-            .test-reports/phpunit/mqtt-worker/
-            .test-reports/phpunit/mqtt-session-resume/
-            .test-reports/phpunit/mqtt-delivery/
-            .test-reports/phpunit/mqtt-identity-race/
-            .test-reports/phpunit/migration-upgrade/
-            .test-reports/phpunit/watering-orm/
-            .test-reports/phpunit/watering-control/
-            .test-reports/phpunit/watering-production/
-            .test-reports/phpunit/watering-proposals/
-            .test-reports/phpunit/watering-actuator-switch/
-            .test-reports/phpunit/watering-mqtt/
-            .test-reports/phpunit/production-smoke/
-            .test-reports/phpunit/grafana/
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/**/junit.xml
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/**/testdox.txt
           if-no-files-found: error
+
+      - name: Upload native coverage reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phpunit-coverage
+          include-hidden-files: true
+          path: |
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/clover.xml
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/html/
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/summary.txt
+          if-no-files-found: warn
 
       - name: Fail if any test suite failed
         if: always()
         run: |
-          if [ "${{ steps.phpunit_tests.outcome }}" != "success" ]; then
-            echo "PHPUnit tests failed"
+          if [ "${{ steps.phpunit_tests.outcome }}" != "success" ] || [ "${{ steps.coverage.outcome }}" != "success" ]; then
+            echo "PHPUnit tests or native coverage enforcement failed"
             exit 1
           fi
 

@@ -39,6 +39,84 @@ final class WateringProposalTest extends TestCase
             ProposalFixture::SIM_TOPIC, 67);
     }
 
+    #[DataProvider('notificationDecisions')]
+    public function testNotificationHeadingSurvivesDecisionAndRestart(bool $renewed, string $decision): void
+    {
+        $fixture = $this->fixture;
+        $fixture->readings();
+        $fixture->bot->evaluateAndNotify();
+        if ($renewed) {
+            $fixture->expireProposal($fixture->telegram->sent[0][1], 1800);
+            $fixture->heartbeat();
+            $fixture->bot->evaluateAndNotify();
+        }
+        [$text, $id] = $fixture->telegram->sent[$renewed ? 1 : 0];
+        self::assertStringStartsWith($renewed
+            ? 'GardenHub renewed watering request' : 'GardenHub dev watering proposal', $text);
+        if ('expired' === $decision) {
+            $fixture->expireProposal($id, 1800);
+            $fixture->heartbeat();
+            $fixture->bot->evaluateAndNotify();
+        } else {
+            $fixture->heartbeat();
+            self::assertSame($decision, $fixture->policy->decide($id,
+                'approved' === $decision ? 'approve' : 'reject'));
+        }
+        $fixture->harness->manager->clear();
+        [, $restarted] = $fixture->stack(ProposalFixture::SIM_TOPIC, $fixture->telegram);
+        $restarted->reconcileMessages();
+        $messageId = $fixture->column('message_id', $id);
+        $edits = array_values(array_filter($fixture->telegram->edits,
+            static fn (array $edit): bool => $edit[0] === (int) $messageId));
+        self::assertCount(1, $edits);
+        self::assertSame(strtok($text, "\n"), strtok($edits[0][1], "\n"));
+        self::assertStringContainsString('Decision: '.$decision, $edits[0][1]);
+        self::assertSame('final', $fixture->column('notification_status', $id));
+    }
+
+    public static function notificationDecisions(): iterable
+    {
+        foreach ([false, true] as $renewed) {
+            foreach (['expired', 'approved', 'rejected'] as $decision) {
+                yield [$renewed, $decision];
+            }
+        }
+    }
+
+    #[DataProvider('legacyDecisions')]
+    public function testUnknownLegacyNotificationRemovesOnlyButtonsAfterSuccessfulRetry(string $status): void
+    {
+        $fixture = $this->fixture;
+        $fixture->readings();
+        $fixture->bot->evaluateAndNotify();
+        $id = $fixture->telegram->sent[0][1];
+        $fixture->harness->connection->executeStatement(
+            'UPDATE watering_proposal SET renewed = NULL, status = ? WHERE id = ?', [$status, $id]);
+        $fixture->telegram->failRemoveButtons = true;
+        $fixture->bot->reconcileMessages();
+        self::assertSame('sent', $fixture->column('notification_status', $id));
+        self::assertSame([], $fixture->telegram->edits);
+        self::assertSame([], $fixture->telegram->removedButtons);
+        self::assertSame('ignored', $fixture->policy->decide($id, 'approve'));
+        self::assertSame(0, $fixture->runCount());
+        $fixture->telegram->failRemoveButtons = false;
+        $fixture->harness->manager->clear();
+        [, $restarted] = $fixture->stack(ProposalFixture::SIM_TOPIC, $fixture->telegram);
+        $restarted->reconcileMessages();
+        self::assertSame([(int) $fixture->column('message_id', $id)], $fixture->telegram->removedButtons);
+        self::assertSame([], $fixture->telegram->edits);
+        self::assertSame('final', $fixture->column('notification_status', $id));
+        $restarted->reconcileMessages();
+        self::assertCount(1, $fixture->telegram->removedButtons);
+    }
+
+    public static function legacyDecisions(): iterable
+    {
+        foreach (['expired', 'approved', 'rejected'] as $status) {
+            yield [$status];
+        }
+    }
+
     public function testExpiredProposalsRenewIndefinitelyAfterExpirationDelay(): void
     {
         $fixture = $this->fixture;

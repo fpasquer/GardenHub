@@ -76,6 +76,27 @@ final class MigrationUpgradeTest extends TestCase
         self::assertCount(0, $this->harness->factory->getMigrationStatusCalculator()->getNewMigrations());
     }
 
+    public function testProposalClassificationUpgradePreservesLegacyRowsAndAllowsKnownLabels(): void
+    {
+        $this->prepareWatering(true);
+        $this->idStep(true);
+        MigrationFixtures::integerProposals($this->harness->connection);
+        $before = MigrationFixtures::links($this->harness->connection);
+        $this->classificationStep(true);
+        $connection = $this->harness->connection;
+        $connection->close();
+        self::assertSame($before, MigrationFixtures::links($connection));
+        self::assertSame([null, null], $connection->fetchFirstColumn('SELECT renewed FROM watering_proposal ORDER BY id'));
+        $connection->executeStatement('UPDATE watering_proposal SET renewed = 1 WHERE duration_seconds = 201');
+        $connection->executeStatement('UPDATE watering_proposal SET renewed = 0 WHERE duration_seconds = 202');
+        self::assertSame([1, 0], array_map('intval',
+            $connection->fetchFirstColumn('SELECT renewed FROM watering_proposal ORDER BY id')));
+        $this->classificationStep(false);
+        $connection->close();
+        self::assertSame($before, MigrationFixtures::links($connection));
+        $this->classificationStep(true);
+    }
+
     public function testWateringIdsPreserveRunsAndLinksAcrossUpDownUp(): void
     {
         $this->prepareWatering(true);
@@ -155,6 +176,12 @@ final class MigrationUpgradeTest extends TestCase
     private function idStep(bool $up): void
     {
         $this->harness->step(self::IDS, $up);
+        $this->harness->reboot();
+    }
+
+    private function classificationStep(bool $up): void
+    {
+        $this->harness->step('Version20261012120000', $up);
         $this->harness->reboot();
     }
 

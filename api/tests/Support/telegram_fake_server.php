@@ -4,6 +4,17 @@
 // The scenario is selected via the chat_id form field already sent by StreamTelegramTransport::send().
 $scenario = $_POST['chat_id'] ?? 'ok';
 
+if ('gateway_markup' === $scenario) {
+    $valid = '/bottest-token/editMessageReplyMarkup' === $_SERVER['REQUEST_URI']
+        && '42' === ($_POST['message_id'] ?? null)
+        && !array_key_exists('text', $_POST)
+        && ['inline_keyboard' => []] === json_decode($_POST['reply_markup'] ?? '', true);
+    header('Content-Type: application/json');
+    echo json_encode(['ok' => $valid, 'result' => true]);
+
+    return;
+}
+
 header('Content-Type: application/json');
 
 if ('http_error' === $scenario) {

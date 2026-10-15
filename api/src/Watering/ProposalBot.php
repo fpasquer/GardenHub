@@ -28,7 +28,7 @@ final class ProposalBot
             }
             try {
                 $id = $this->telegram->send(
-                    $this->text($proposal, $this->policy->isRenewed($proposal)),
+                    $this->text($proposal),
                     $proposalId,
                 );
                 $this->policy->recordMessage($proposalId, $id);
@@ -77,7 +77,11 @@ final class ProposalBot
     {
         foreach ($this->policy->finalMessages() as $p) {
             try {
-                $this->telegram->edit((int) $p->getMessageId(), $this->finalText($p));
+                if (null === $this->policy->isRenewed($p)) {
+                    $this->telegram->removeButtons((int) $p->getMessageId());
+                } else {
+                    $this->telegram->edit((int) $p->getMessageId(), $this->finalText($p));
+                }
                 $this->policy->markMessageFinal((int) $p->getId());
             } catch (\Throwable) {
                 // Persisted decision stands. A later iteration retries the display update.
@@ -99,10 +103,10 @@ final class ProposalBot
         );
     }
 
-    private function text(WateringProposal $p, bool $renewed = false): string
+    private function text(WateringProposal $p): string
     {
         $lines = [
-            $renewed ? 'GardenHub renewed watering request' : 'GardenHub dev watering proposal',
+            $this->policy->isRenewed($p) ? 'GardenHub renewed watering request' : 'GardenHub dev watering proposal',
             sprintf('Device: %s', $p->getDevice()?->getName()),
             sprintf('Actuator: %s', $this->actuatorLabel($p->getActuatorTopic())),
         ];

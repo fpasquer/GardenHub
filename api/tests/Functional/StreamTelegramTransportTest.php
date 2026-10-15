@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Tests\Functional;
 
 use App\Monolog\Telegram\StreamTelegramTransport;
+use App\Watering\StreamTelegramGateway;
 use App\Tests\Support\LocalHttpServer;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
@@ -36,6 +37,21 @@ final class StreamTelegramTransportTest extends TestCase
         $transport = new StreamTelegramTransport($this->server->url());
         $transport->send('test-token', 'ok', 'hello');
         self::assertSame($baseline, $this->currentHandler());
+    }
+
+    public function testLegacyButtonRemovalPreservesTextAndUsesMarkupApi(): void
+    {
+        $gateway = new StreamTelegramGateway('test-token', 'gateway_markup', $this->server->url());
+        $gateway->removeButtons(42);
+        self::assertTrue(true);
+    }
+
+    #[DataProvider('failedResponses')]
+    public function testLegacyButtonRemovalPropagatesApiFailure(string $chatId): void
+    {
+        $gateway = new StreamTelegramGateway('test-token', $chatId, $this->server->url());
+        $this->expectException(RuntimeException::class);
+        $gateway->removeButtons(42);
     }
 
     #[DataProvider('failedResponses')]

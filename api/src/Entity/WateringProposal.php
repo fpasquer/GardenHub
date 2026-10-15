@@ -104,6 +104,21 @@ class WateringProposal
     #[Groups(['read:watering_proposal'])]
     private ?string $actuatorTopic = null;
 
+    #[ORM\Column(nullable: true)]
+    private ?bool $renewed = null;
+
+    public function isRenewed(): ?bool
+    {
+        return $this->renewed;
+    }
+
+    public function setRenewed(bool $renewed): static
+    {
+        $this->renewed = $renewed;
+
+        return $this;
+    }
+
     public static function isValidId(int $id): bool
     {
         return $id >= 1 && $id <= self::MAX_ID;

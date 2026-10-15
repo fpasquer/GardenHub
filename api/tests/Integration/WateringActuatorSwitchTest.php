@@ -126,11 +126,9 @@ final class WateringActuatorSwitchTest extends TestCase
         self::assertCount(1, $telegram->sent);
         self::assertSame(ProposalFixture::HW_TOPIC, $fixture->column('actuator_topic', $telegram->sent[0][1]));
         $bot->reconcileMessages();
-        self::assertCount(1, $telegram->edits);
-        self::assertSame(77, $telegram->edits[0][0]);
-        self::assertStringContainsString('Actuator: not recorded (legacy proposal)', $telegram->edits[0][1]);
-        self::assertStringNotContainsString(ProposalFixture::HW_TOPIC, $telegram->edits[0][1]);
-        self::assertStringNotContainsString(ProposalFixture::SIM_TOPIC, $telegram->edits[0][1]);
+        self::assertSame([], $telegram->edits);
+        self::assertSame([77], $telegram->removedButtons);
+        self::assertSame('final', $fixture->column('notification_status', $sent));
     }
 
     private function ageHardwarePrompt(): void

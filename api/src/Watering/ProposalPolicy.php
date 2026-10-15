@@ -170,7 +170,7 @@ final class ProposalPolicy
                 return null;
             }
         }
-        $proposal = $this->createProposal($device, $now, $readings, $attempt);
+        $proposal = $this->createProposal($device, $now, $readings, $attempt, $renewed);
         $state->setPromptCount($renewed ? 2 : 1)->setLastPromptAt($now);
 
         return $proposal;
@@ -197,21 +197,15 @@ final class ProposalPolicy
         return null !== $deadline && $now->getTimestamp() - $deadline->getTimestamp() >= $delay;
     }
 
-    public function isRenewed(WateringProposal $proposal): bool
+    public function isRenewed(WateringProposal $proposal): ?bool
     {
-        $state = $this->states->find([
-            'device' => $proposal->getDevice(),
-            'actuatorTopic' => $proposal->getActuatorTopic(),
-        ]);
-
-        return null !== $state && $state->getPromptCount() > 1
-            && $state->getLastPromptAt() == $proposal->getCreatedAt();
+        return $proposal->isRenewed();
     }
 
     /**
      * @param list<array{value: float, measuredAt: \DateTimeImmutable}> $readings
      */
-    private function createProposal(Device $device, \DateTimeImmutable $now, array $readings, ?\DateTimeImmutable $attempt): WateringProposal
+    private function createProposal(Device $device, \DateTimeImmutable $now, array $readings, ?\DateTimeImmutable $attempt, bool $renewed): WateringProposal
     {
         $snapshot = array_reverse(array_map(
             static fn (array $r): array => ['value' => (float) $r['value'], 'measured_at' => $r['measuredAt']->format('Y-m-d H:i:s')],
@@ -226,7 +220,8 @@ final class ProposalPolicy
             ->setReadingsJson($snapshot)
             ->setLastAttemptAt($attempt)
             ->setNotificationStatus(WateringNotificationStatus::New->value)
-            ->setActuatorTopic($this->actuatorTopic);
+            ->setActuatorTopic($this->actuatorTopic)
+            ->setRenewed($renewed);
         $this->proposals->add($proposal);
 
         return $proposal;

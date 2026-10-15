@@ -12,6 +12,8 @@ final class RecordingTelegramGateway implements InterfaceTelegramGateway
     public array $queue = [];
     public array $sent = [];
     public array $edits = [];
+    public array $removedButtons = [];
+    public bool $failRemoveButtons = false;
     public int $polls = 0;
     public bool $failSend = false;
 
@@ -39,5 +41,13 @@ final class RecordingTelegramGateway implements InterfaceTelegramGateway
     public function edit(int $messageId, string $text): void
     {
         $this->edits[] = [$messageId, $text];
+    }
+
+    public function removeButtons(int $messageId): void
+    {
+        if ($this->failRemoveButtons) {
+            throw new \RuntimeException('Telegram markup removal failed.');
+        }
+        $this->removedButtons[] = $messageId;
     }
 }

@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: test-build test-phpunit test-report test-groups test-coverage-probe test-coverage
+.PHONY: test-build test-phpunit test-report test-ci test-groups test-coverage-probe test-coverage
 test-build:
 	docker build --target test-runner -t gardenhub-tests:phpunit api
 	docker build --target production -t gardenhub-api:phpunit-production api
@@ -8,6 +8,9 @@ test-build:
 
 test-phpunit test-report:
 	GROUP='$(GROUP)' bash tests/phpunit.sh
+
+test-ci:
+	GROUP=ci bash tests/phpunit.sh
 
 test-groups:
 	bash tests/phpunit.sh --list-groups

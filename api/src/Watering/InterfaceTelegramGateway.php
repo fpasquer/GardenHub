@@ -10,4 +10,5 @@ interface InterfaceTelegramGateway
     public function updates(int $offset): array;
     public function acknowledge(string $callbackId): void;
     public function edit(int $messageId, string $text): void;
+    public function removeButtons(int $messageId): void;
 }
