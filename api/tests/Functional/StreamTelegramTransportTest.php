@@ -121,6 +121,83 @@ final class StreamTelegramTransportTest extends TestCase
         self::assertSame($baseline, $this->currentHandler());
     }
 
+    #[DataProvider('transportImplementations')]
+    public function testRepeatedRequestsUseCurrentResponseHeaders(
+        bool $interactive,
+    ): void {
+        $baseline = $this->currentHandler();
+        foreach (['ok', 'http_error', 'ok', 'not_ok', 'invalid_json', 'ok']
+            as $scenario) {
+            try {
+                $this->sendRequest(
+                    $interactive, $scenario, $this->server->url(),
+                );
+                self::assertSame('ok', $scenario);
+            } catch (RuntimeException $error) {
+                self::assertNotSame('ok', $scenario, $error->getMessage());
+                self::assertStringNotContainsString(
+                    'secret-token', $error->getMessage(),
+                );
+            }
+        }
+        self::assertSame($baseline, $this->currentHandler());
+    }
+
+    #[DataProvider('transportImplementations')]
+    public function testConnectionFailureAfterSuccessClearsHeaders(
+        bool $interactive,
+    ): void {
+        $baseline = $this->currentHandler();
+        $url = $this->server->url();
+        $this->sendRequest($interactive, 'ok', $url);
+        self::assertNotEmpty(http_get_last_response_headers());
+        $this->server->stop();
+        $spyCalls = 0;
+        set_error_handler(static function () use (&$spyCalls): bool {
+            ++$spyCalls;
+
+            return true;
+        });
+        try {
+            try {
+                $this->sendRequest($interactive, 'ok', $url);
+                self::fail('A refused connection must throw RuntimeException.');
+            } catch (RuntimeException $error) {
+                self::assertStringNotContainsString(
+                    'secret-token', $error->getMessage(),
+                );
+            }
+            self::assertNull(http_get_last_response_headers());
+            self::assertSame(0, $spyCalls);
+        } finally {
+            restore_error_handler();
+        }
+        self::assertSame($baseline, $this->currentHandler());
+    }
+
+    public static function transportImplementations(): array
+    {
+        return [
+            'logging transport' => [false],
+            'interactive gateway' => [true],
+        ];
+    }
+
+    private function sendRequest(
+        bool $interactive, string $chatId, string $url,
+    ): void {
+        if ($interactive) {
+            $gateway = new StreamTelegramGateway(
+                'secret-token', $chatId, $url,
+            );
+            $gateway->send('hello', 1);
+
+            return;
+        }
+        $transport = new StreamTelegramTransport($url);
+        $transport->send('secret-token', $chatId, 'hello');
+    }
+
     private function currentHandler(): mixed
     {
         $handler = set_error_handler(static fn (): bool => true);

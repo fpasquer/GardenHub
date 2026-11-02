@@ -73,8 +73,9 @@ final class StreamTelegramGateway implements InterfaceTelegramGateway
         ], 'ssl' => ['verify_peer' => true, 'verify_peer_name' => true]]);
         set_error_handler(static fn (): bool => true);
         try {
+            http_clear_last_response_headers();
             $body = @file_get_contents($url, false, $context);
-            $headers = $http_response_header ?? [];
+            $headers = http_get_last_response_headers() ?? [];
         } finally {
             restore_error_handler();
         }

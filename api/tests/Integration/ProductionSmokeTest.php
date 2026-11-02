@@ -19,6 +19,7 @@ final class ProductionSmokeTest extends TestCase
         self::assertSame(0, $started['status'], $started['stdout'].$started['stderr']);
         $this->assertProductionContainerIsolation();
         self::assertSame('ok', $this->request('/healthz', 200)['status'] ?? null);
+        $this->assertStaticAssets();
         $this->request('/api/devices', 401);
         $this->request('/api/devices', 401, 'invalid-smoke-key');
         $reader = $this->createKey('smoke-reader', true);
@@ -36,6 +37,10 @@ final class ProductionSmokeTest extends TestCase
 require 'vendor/autoload.php';
 $kernel = new App\Kernel($_SERVER['APP_ENV'], (bool) $_SERVER['APP_DEBUG']);
 echo json_encode([
+    'php' => PHP_VERSION,
+    'php85' => PHP_MAJOR_VERSION === 8 && PHP_MINOR_VERSION === 5,
+    'extensions' => array_map('extension_loaded',
+        ['intl', 'zip', 'pdo_mysql', 'Zend OPcache']),
     'environment' => $kernel->getEnvironment(), 'debug' => $kernel->isDebug(),
     'maker' => class_exists('Symfony\Bundle\MakerBundle\MakerBundle'),
     'fake' => class_exists('App\Tests\Monolog\FakeTelegramTransport'),
@@ -50,7 +55,13 @@ PHP;
         $result = $this->compose(['run', '--rm', '--no-deps', '-T', '-u', 'www-data',
             '-e', 'XDEBUG_MODE=debug', 'gardenhub-api', 'php', '-r', $code]);
         self::assertSame(0, $result['status'], $result['stderr']);
-        self::assertSame(['environment' => 'prod', 'debug' => false, 'maker' => false,
+        $composer = json_decode(
+            file_get_contents(Command::root().'/api/composer.json'),
+            true, 512, JSON_THROW_ON_ERROR,
+        );
+        self::assertSame(['php' => $composer['config']['platform']['php'],
+            'php85' => true, 'extensions' => [true, true, true, true],
+            'environment' => 'prod', 'debug' => false, 'maker' => false,
             'fake' => false, 'phpunit' => false, 'xdebug' => false, 'prepend' => '',
             'tests' => false, 'xml' => false, 'binary' => false,
             'xdebugBinaries' => [], 'devIni' => false],
@@ -78,6 +89,16 @@ PHP;
         self::assertSame([], json_decode($result['stdout'], true, 512, JSON_THROW_ON_ERROR));
     }
 
+    private function assertStaticAssets(): void
+    {
+        http_clear_last_response_headers();
+        $stylesheet = file_get_contents(
+            'http://nginx/bundles/apiplatform/swagger-ui/swagger-ui.css',
+        );
+        self::assertNotFalse($stylesheet);
+        self::assertStringContainsString('.swagger-ui', $stylesheet);
+    }
+
     private function createKey(string $name, bool $readonly): string
     {
         $command = ['exec', '-T', '-u', 'www-data', 'gardenhub-api', 'php',
@@ -102,10 +123,12 @@ PHP;
             'method' => null === $body ? 'GET' : 'POST', 'header' => implode("\r\n", $headers),
             'content' => null === $body ? '' : json_encode($body, JSON_THROW_ON_ERROR),
             'ignore_errors' => true, 'timeout' => 10, 'follow_location' => 0]]);
+        http_clear_last_response_headers();
         $response = file_get_contents('http://nginx'.$path, false, $context);
+        $responseHeaders = http_get_last_response_headers() ?? [];
         self::assertNotFalse($response, $path.' returned no response.');
         self::assertMatchesRegularExpression('/^HTTP\/\S+ '.$expected.'\b/',
-            $http_response_header[0] ?? '', $path);
+            $responseHeaders[0] ?? '', $path);
         return json_decode($response, true, 512, JSON_THROW_ON_ERROR);
     }
 

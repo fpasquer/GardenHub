@@ -27,9 +27,11 @@ final class GrafanaSubject
         $context = stream_context_create(['http' => ['method' => null === $body ? 'GET' : 'POST',
             'header' => implode("\r\n", $headers), 'content' => null === $body ? '' : json_encode($body, JSON_THROW_ON_ERROR),
             'timeout' => 10, 'ignore_errors' => true]]);
+        http_clear_last_response_headers();
         $response = file_get_contents('http://grafana:3000'.$path, false, $context);
+        $responseHeaders = http_get_last_response_headers() ?? [];
         Assert::assertNotFalse($response, $path);
-        Assert::assertMatchesRegularExpression('/^HTTP\/\S+ 200\b/', $http_response_header[0] ?? '', $path);
+        Assert::assertMatchesRegularExpression('/^HTTP\/\S+ 200\b/', $responseHeaders[0] ?? '', $path);
         return json_decode($response, true, 512, JSON_THROW_ON_ERROR);
     }
 

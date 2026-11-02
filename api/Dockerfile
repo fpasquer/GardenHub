@@ -1,12 +1,13 @@
 # GardenHub API — PHP-FPM image for Symfony / API Platform.
 # HTTP is served by the gardenhub-nginx container (FastCGI on port 9000).
-FROM php:8.4.26-fpm-alpine AS base
+FROM php:8.5.12-fpm-alpine AS base
 
 WORKDIR /app
 
 # PHP extensions required by Symfony, Doctrine (MySQL) and API Platform.
-RUN apk add --no-cache icu-dev libzip-dev \
-    && docker-php-ext-install intl zip pdo_mysql opcache
+RUN apk upgrade --no-cache \
+    && apk add --no-cache icu-dev libzip-dev \
+    && docker-php-ext-install intl zip pdo_mysql
 
 # Composer is only used at image build time; it is not needed on the host.
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
@@ -58,7 +59,7 @@ RUN composer dump-autoload --no-dev --optimize \
     && composer run-script post-install-cmd --no-interaction \
     && chown -R www-data:www-data var
 
-FROM nginx:1.30.5-alpine AS smoke-nginx
+FROM nginx:1.30.6-alpine-slim AS smoke-nginx
 COPY docker/nginx/default.conf /etc/nginx/conf.d/default.conf
 COPY --from=production-app /app/public /app/public
 

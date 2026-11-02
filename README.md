@@ -625,7 +625,7 @@ make test-phpunit GROUP=functional_gardenhub-watering-mqtt
 ### Implemented
 
 - Docker Compose based deployment.
-- PHP 8.4 / Symfony 7.4 LTS backend.
+- PHP 8.5 / Symfony 7.4 LTS backend.
 - API Platform 4.3+.
 - MySQL 8.4 persistent storage.
 - Doctrine ORM and Doctrine Migrations.
@@ -1583,9 +1583,24 @@ server.
 
 ### PHPUnit Migration Status
 
-PHPUnit 13.4.1 and Xdebug 3.5.3 are development-only. The native ARM64 runtime is
-PHP 8.4.26. Production installs use `--no-dev`, and production image copies exclude
+PHPUnit 13.4.4 and Xdebug 3.5.3 are development-only. The native ARM64 runtime is
+PHP 8.5.12. Production installs use `--no-dev`, and production image copies exclude
 test sources, PHPUnit configuration and development PHP configuration.
+
+Composer requires PHP 8.5.12 or newer and resolves dependencies against 8.5.12.
+The shared Docker base pins `php:8.5.12-fpm-alpine`; PHP 8.5 includes OPcache, so
+it must not be installed or loaded separately as `opcache.so`.
+After changing the runtime, rebuild the development, test and production images.
+All application consumers share the application image: recreate the API,
+workers, scheduler and enabled watering services through the existing gated
+deployment process. Editing the Dockerfile alone does not upgrade running
+containers.
+
+The runtime upgrade includes targeted Symfony 7.4 and PHPUnit security patches.
+PHP image builds refresh inherited Alpine packages, and production and packaged
+smoke use the same `nginx:1.30.6-alpine-slim` base. The slim variant retains the
+static-file/FastCGI features used here without unused curl and image-filter
+dependencies. Composer and production-image audits remain required release checks.
 
 The Telegram handler/HTTP/daily-summary, scheduler, Python release/image-audit,
 sensor identity/concurrency, Compose and Make deployment scenarios have migrated.

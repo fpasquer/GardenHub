@@ -29,7 +29,7 @@ x-application-environment: &application-environment
 
 services:
   gardenhub-nginx:
-    image: nginx:1.30.5-alpine
+    image: nginx:1.30.6-alpine-slim
     container_name: gardenhub-nginx
     restart: unless-stopped
     ports:
