@@ -86,6 +86,248 @@ The LoRaStack and GardenHub repositories remain logically independent, but in pr
 
 ---
 
+## Production watering and deployment
+
+The real `gardenhub-watering-monitor` and `gardenhub-watering-proposals`
+services are defined in `compose.yaml`. All PHP application services run code
+from the built `gardenhub-api` image in the shared base, default to `APP_ENV=prod`,
+and receive the same watering configuration. `compose-dev.yaml` explicitly
+selects `APP_ENV=dev`, adds source mounts and development host mappings, and
+contains the simulator and Adminer. Production must use the base file alone.
+The Make helpers require Docker Compose and Python 3 (standard library only).
+Production deployment also requires `flock` (util-linux) and outbound HTTPS
+access to GitHub's API for release approval.
+
+### CI release approval
+
+CI runs for pull requests targeting `master`, pushes to `master`, and manual
+dispatches. The stable `CI Ready` check requires application integration,
+deployment/release regression tests, full Grafana integration tests, Composer
+auditing, and packaged production-image smoke/audit checks. A skipped, cancelled,
+or failed required job never qualifies as release approval. Configure the
+repository's branch protection/ruleset to require `CI Ready`; this is a GitHub
+administrator action, not a setting managed by the checkout.
+
+Production and development use separate Docker targets. The base Compose file
+selects `production` (`--no-dev`, `APP_ENV=prod`, `APP_DEBUG=0`); the development
+override selects `development` with development dependencies and debug enabled.
+The smoke suite boots the production image without source mounts, migrates a
+disposable database, validates ORM mapping/schema, warms cache as `www-data`,
+and checks HTTP health plus read/write API authorization. Watering and Telegram
+are disabled there. Grafana CI uses an internal Docker network and preinstalled
+test tools so synthetic alert credentials cannot send notifications externally.
+
+Security policy: Composer vulnerability advisories block CI, including those in
+development dependencies; abandoned packages are reported separately. Image
+audits block fixable HIGH/CRITICAL vulnerabilities in PHP and nginx images.
+Unfixed findings and lower severities remain in downloadable CI reports for
+review. Missing reports or unavailable audit services fail the gate. Do not
+silence findings with permanent exceptions: remediation or an explicitly
+reviewed, time-limited policy change belongs in a separate change.
+
+Before normal deployment, configure the server shell/service environment:
+
+```bash
+export GARDENHUB_GITHUB_REPOSITORY=owner/repository
+# Private repositories also need GARDENHUB_CI_TOKEN provisioned securely.
+# Use a fine-grained token limited to this repository, with Actions read access.
+```
+
+Do not put the token in command arguments, tracked files, or terminal output.
+These variables are read by the host Python helper, not Compose: root dotenv
+files are not automatically exported into the host shell. Public repositories
+can use unauthenticated API access, subject to GitHub's lower rate limit.
+
+`make deploy-check` verifies the latest push workflow for the exact post-pull
+SHA, workflow `ci.yml`, and deployment branch. It re-reads the latest attempt
+and requires a successful `CI Ready` job and successful workflow jobs. Older
+successful runs, PR merge-ref checks, and manual runs do not substitute for a
+missing or failed master-push run. Missing/incomplete CI, API errors, inaccessible
+repositories, and rate limits refuse deployment before build or shutdown.
+Wait for the push run to finish and retry; no automatic bypass is provided.
+
+`make deploy` serializes normal deployments with a Git-local lock and rechecks
+the approved checkout and CI immediately before guarded shutdown. Other manual
+Git/Docker actions are not controlled by that lock. `make start`, development
+helpers, and the documented emergency rollback helpers remain available without
+GitHub approval; they are explicit operator paths, not enforced release paths.
+Existing watering shutdown guards remain mandatory.
+
+CI checks the source SHA and records the tested image IDs. Production still
+rebuilds locally: mutable base tags and different host architectures mean it is
+not guaranteed to deploy the identical CI image digest. Registry/digest-based
+artifact deployment is not implemented in this release flow.
+
+Focused local checks (disposable test stacks only):
+
+```bash
+make test-build
+make test-phpunit GROUP=functional_gardenhub-deployment
+make test-phpunit GROUP=unitest_gardenhub-release-gate
+docker build --target development -t gardenhub-api api
+docker build --target production -t gardenhub-api:release-validation api
+docker build --target smoke-nginx -t gardenhub-smoke-nginx:release-validation api
+sh tests/production-smoke/run.sh
+docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml build tests
+docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml up --abort-on-container-exit --exit-code-from tests
+docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml down -v
+```
+
+The full Grafana suite has bounded alert waits and a dedicated 50-minute CI
+timeout. Preserve full alert-transition coverage; the focused watering-history
+mode is not a replacement for the release suite. The smoke script always cleans
+up its stack. When running Grafana manually, clean up even after a failed run.
+
+Watering is disabled by default (`WATERING_ENABLED=false`), including when the
+setting is omitted. Symfony's native `%env(bool:WATERING_ENABLED)%` and the
+deployment helper use the same boolean behavior: `true`, `yes`, `on` and valid
+nonzero decimal numbers (including negative numbers and scientific notation)
+enable watering; `false`, `no`, `off`, zero, empty and unrecognized strings
+disable it. Spellings are case-insensitive; surrounding spaces, tabs, newlines,
+carriage returns and vertical tabs are ignored. Other whitespace is not stripped.
+Numeric syntax follows PHP's integer/float validation filters: hexadecimal,
+underscores, non-finite numbers and overflow/underflow to zero do not enable it.
+Enablement and profile selection are separate gates. Effective combinations are:
+
+| Files | Profiles | Watering services when enabled |
+| --- | --- | --- |
+| Base | none | none |
+| Base | `watering-hardware` | monitor |
+| Base | `watering-hardware,watering-proposals` | monitor and Telegram poller |
+| Base + dev | none | none; Adminer is development-only |
+| Base + dev | `watering-sim` | simulator and monitor |
+| Base + dev | `watering-sim,watering-proposals` | simulator, monitor and poller |
+| Base + dev | `watering-hardware` | monitor, no simulator |
+| Base + dev | `watering-hardware,watering-proposals` | monitor and poller, no simulator |
+
+Profiles are OR gates, not AND gates. The dev monitor's profile list explicitly
+replaces the base list. The proposal profile does not implicitly activate a
+monitor: the Make helpers refuse proposals without either monitor profile.
+Make skips watering services when disabled, even if their profiles are selected.
+Plain Compose still starts explicitly selected/profile-active services; their
+runtime guards then reject disabled or incomplete configuration before any
+MQTT/Telegram connection. Explicitly naming a service bypasses its profile, so
+prefer the guarded Make helpers. Do not select simulator and hardware modes
+together or use the simulator profile with a hardware topic.
+
+Configure production in the server's untracked root `.env` (or `.env.local`,
+which Make reads after `.env`). Set `APP_ENV=prod` explicitly if an older file
+still contains `dev`. In addition to the existing database/MQTT/Grafana variables:
+
+```dotenv
+APP_ENV=prod
+WATERING_ENABLED=true
+WATERING_MQTT_HOST=<broker-address-reachable-from-the-gardenhub-network>
+WATERING_MQTT_PORT=1883
+WATERING_MQTT_TOPIC=zigbee2mqtt/avocado-watering
+WATERING_MQTT_USERNAME=<production-watering-account>
+WATERING_MQTT_PASSWORD=<production-watering-password>
+TELEGRAM_BOT_TOKEN=<production-bot-token>
+WATERING_TELEGRAM_USER_ID=<authorized-user-id>
+WATERING_TELEGRAM_CHAT_ID=<authorized-private-chat-id>
+```
+
+The topic must be an explicit concrete base topic, not a wildcard or `/set`
+topic. Host, valid port, nonblank credentials and topic are required before
+reservation/publication. Broker authentication must also succeed. Production
+has no implicit simulator topic, development credential, or generic MQTT
+credential fallback. `WATERING_DEV_USERNAME`/`WATERING_DEV_PASSWORD` remain
+compatible only through development Compose mappings; neutral names take
+precedence. Outside Compose, explicitly provide the neutral names and topic.
+
+Default limits are `WATERING_MAX_SECONDS=65` per activation,
+`WATERING_DAILY_SECONDS=130` (rolling 24 hours),
+`WATERING_COOLDOWN_SECONDS=60`, `WATERING_PROPOSAL_DURATION_SECONDS=65`,
+`WATERING_PROPOSAL_THRESHOLD=15`, freshness/max-gap 35 minutes, validity
+30 minutes. Use the independently approved hardware calibration and safety
+limits; automatic proposals authorize two 65-second activations separated by
+a 30-minute OFF break in both development and production. Manual requests remain
+single activations within the shared limits. Interactive proposals require the token and both authorized
+IDs even if `TELEGRAM_ENABLED=false` (that flag controls logging, not proposals).
+
+### Cutover and startup
+
+Before production enablement, stop the Pi's hardware monitor **and** proposal
+poller, using the guarded shutdown below with both Compose files. Check for
+unresolved cycles and independently confirm that the physical pump is OFF.
+Separate databases do not provide a shared actuator lock: only one environment
+may command the real pump. Only one poller may consume updates for the same
+Telegram bot, including non-GardenHub pollers/webhooks. Use production MQTT
+credentials restricted to the concrete state and `/set` topics, then remove
+development write access to the hardware topic after cutover. Broker ACL changes
+and physical verification are operator actions, not part of GardenHub deployment.
+
+For a new database, first keep `WATERING_ENABLED=false` and run `make start` to
+build the image, start MySQL and apply migrations. After cutover and explicit
+configuration, enable watering and select profiles:
+
+```bash
+# Monitor only, base production Compose file.
+COMPOSE_PROFILES=watering-hardware make start
+# Monitor and interactive Telegram proposals.
+COMPOSE_PROFILES=watering-hardware,watering-proposals make start
+# Subsequent production deployment, clean master checkout required.
+COMPOSE_PROFILES=watering-hardware,watering-proposals make deploy
+# Development: no watering; explicitly choose simulator or hardware as needed.
+make dev
+make dev-sim
+COMPOSE_PROFILES=watering-proposals make dev-sim
+make dev-hardware
+COMPOSE_PROFILES=watering-proposals make dev-hardware
+```
+
+Development helpers explicitly force `APP_ENV=dev`. `make dev` no longer
+automatically activates the simulator. Simulator startup refuses a non-simulator
+topic before building/starting anything; the simulator itself also rejects the
+mismatch and remains hard-coded to its dev topic. Hardware startup requires an
+explicit hardware topic and never starts the simulator. Make reads both env
+files automatically; direct Compose commands must pass `.env.local` explicitly
+when it exists. Persist `COMPOSE_PROFILES` in the root env file or pass the same
+profile selection on every startup/deployment; enabling a flag alone does not
+activate a monitor.
+
+### Deployment and shutdown
+
+`make start` and `make deploy` build first, guard stops, migrate before starting
+application containers, and recreate selected services from the image. Deployment
+retains the existing always-deployed scheduler policy. Enabled/profile-active
+watering services participate in recreation and health checks; disabled/inactive
+ones are not required. Previously running watering services are still stopped
+when deactivated. A required service must be running, not restarting, and healthy;
+missing, exiting, dead or unhealthy services fail deployment. Monitor health
+requires a fresh database heartbeat established only after SUBACK, not just a
+running process. Poller health checks its anchored PHP process, not the checking
+shell. Health checks never publish or poll Telegram.
+
+The read-only `gardenhub:watering:check` refuses any unresolved `active_run_id`,
+including pending/running and uncertain/timed-out cycles. It does not expire,
+clear, acknowledge or change a run. `deploy-stop` checks before disruption,
+quiesces HTTP/API and poller request sources while leaving the monitor alive,
+then checks again immediately before stopping the monitor. A refusal at the
+second check leaves request sources stopped but the monitor running; defer
+deployment and inspect the cycle. Migration failure leaves the application tier
+stopped. Do not issue concurrent manual CLI requests or publish directly during
+deployment/shutdown; the helpers cannot control another environment or external
+publisher. A missing schema is allowed only for disabled first-time bootstrap
+with no existing monitor/poller containers; other database failures fail closed.
+
+For an idle, guarded application-tier shutdown (MySQL and Grafana remain running):
+
+```bash
+# Production; keep the same profile selection used at startup.
+COMPOSE_PROFILES=watering-hardware,watering-proposals make deploy-stop
+# Pi/development: include development configuration, then stop the fake device.
+make deploy-stop COMPOSE_FILES='-f compose.yaml -f compose-dev.yaml'
+docker compose --env-file .env -f compose.yaml -f compose-dev.yaml stop gardenhub-watering-sim
+```
+
+An uncertain/timed-out cycle must first be independently verified OFF and manually
+reviewed with `gardenhub:watering:acknowledge-stop --confirm-actuator-off` in its
+own environment. Never clear a reservation to force deployment. Do not use
+unguarded `docker compose down`, monitor recreation or direct monitor stop during
+an active cycle. Read-only inspection is available through
+`docker compose exec -T gardenhub-api php bin/console gardenhub:watering:check`.
+
 ## Watering simulator on the Pi (development only)
 
 The opt-in `gardenhub-watering-sim` service in `compose-dev.yaml` emulates the
@@ -108,8 +350,8 @@ Set these values in GardenHub's untracked root `.env` on the Pi:
 WATERING_SIM_USERNAME=watering_sim
 WATERING_SIM_PASSWORD=<simulator-password-from-broker>
 WATERING_ENABLED=true
-WATERING_DEV_USERNAME=watering_dev
-WATERING_DEV_PASSWORD=<separate-watering_dev-password-from-broker>
+WATERING_MQTT_USERNAME=watering_dev
+WATERING_MQTT_PASSWORD=<separate-watering_dev-password-from-broker>
 ```
 
 `MQTT_HOST` and `MQTT_PORT` are shared with the existing dev worker. Start only
@@ -150,12 +392,12 @@ with `false` and `100`. No real Zigbee2MQTT process is required on the Pi.
 
 ### Manual watering through GardenHub
 
-This is intentionally **development only**. The application command publishes
+The application command publishes
 to `WATERING_MQTT_TOPIC/set`, requires `WATERING_ENABLED=true` and
-`APP_ENV=dev`, and uses the MQTT identity configured in
-`WATERING_DEV_USERNAME`/`WATERING_DEV_PASSWORD`. The simulator defaults to the
-dev topic and the `watering_dev` account. The production Compose file does
-not provide watering credentials or start the monitor. The optional proposal
+`APP_ENV=dev` or `prod`, and uses the MQTT identity configured in
+`WATERING_MQTT_USERNAME`/`WATERING_MQTT_PASSWORD`. Development Compose defaults
+to the simulator topic; production requires explicit configuration and profiles.
+The optional proposal
 poller below never starts a cycle without an authorized Telegram approval.
 
 After updating the Pi checkout, run the new migration, then start the opt-in
@@ -187,7 +429,8 @@ docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
 ```
 
 The monitor should observe ON followed by OFF and record `completed`. A second
-request during the cycle is rejected; completed runs have a 60-second cooldown.
+request during the cycle is rejected; requests have a 60-second cooldown from
+the most recent command claim.
 Requests also fail when the monitor is absent or its heartbeat is stale; the
 heartbeat only starts once the monitor's state subscription is confirmed by
 the broker (SUBACK), not merely once its MQTT loop is running, and it is
@@ -203,7 +446,7 @@ docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
   exec gardenhub-api php bin/console gardenhub:watering:acknowledge-stop --confirm-actuator-off
 ```
 
-This manual override is dev-only and preserves the cooldown and daily budget.
+This manual override requires enabled watering and preserves the cooldown and daily budget.
 It requires an independent check that the actuator is OFF; the command itself
 does not stop or verify the pump.
 
@@ -212,7 +455,7 @@ does not stop or verify the pump.
 The optional `gardenhub-watering-proposals` service runs one outbound-only
 Telegram long poller. It has no published port or webhook. Start it only with
 the selected actuator and monitor, after applying the migration. It requires
-`APP_ENV=dev`, `WATERING_ENABLED=true`, the dev bot token, and both
+`APP_ENV=dev` or `prod`, `WATERING_ENABLED=true`, that environment's bot token, and both
 `WATERING_TELEGRAM_USER_ID` and `WATERING_TELEGRAM_CHAT_ID` set to the exact
 numeric IDs of the intended user and private chat. Set these in the untracked
 root `.env.local`; keep one `getUpdates` poller for this bot, including outside
@@ -237,15 +480,81 @@ readings are no more than 35 minutes apart, and no watering run was requested
 in the preceding 24 hours. These limits allow the sensor's normal 20 minute
 reporting interval. A run in `uncertain` or `timed_out` state still counts as an
 attempt. No previous run satisfies the 24 hour check. The proposal expires
-after 30 minutes and offers a three second cycle by default for the simulator.
-For hardware, set the duration to the measured calibration and keep it within
-`WATERING_MAX_SECONDS`; an invalid combination now prevents the poller from
+after 30 minutes and offers one cycle of **65 seconds ON, 30 minutes OFF,
+then 65 seconds ON**, including for the simulator.
+`WATERING_PROPOSAL_DURATION_SECONDS` must be 65, and each stage must fit
+`WATERING_MAX_SECONDS`; an invalid combination prevents the poller from
 starting. Configure the
 threshold, freshness, gap, validity, and duration with
 `WATERING_PROPOSAL_THRESHOLD`,
 `WATERING_PROPOSAL_FRESHNESS_MINUTES`, `WATERING_PROPOSAL_MAX_GAP_MINUTES`,
 `WATERING_PROPOSAL_VALIDITY_MINUTES`, and `WATERING_PROPOSAL_DURATION_SECONDS`.
+`WATERING_PROPOSAL_RETRY_SECONDS` controls the delay **after expiration** before
+a renewed approval request becomes eligible (positive integer, default `1800`).
 The default values are in [api/.env](api/.env).
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `WATERING_PROPOSAL_VALIDITY_MINUTES` | Telegram approval validity | 30 minutes |
+| `WATERING_PROPOSAL_RETRY_SECONDS` | Delay after expiration before renewal | 1800 seconds |
+| `WATERING_PROPOSAL_DURATION_SECONDS` | Runtime of each of the two automatic stages | 65 seconds |
+| `WATERING_MAX_SECONDS` | Maximum duration of a single activation | 65 seconds |
+| `WATERING_DAILY_SECONDS` | Rolling budget, including undispatched reservations | 130 seconds |
+
+### Two-stage automatic cycle and recovery
+
+One Approve callback authorizes the entire 130-second cycle. Stage one must
+report ON and then OFF before its deadline; the 1,800-second break starts at
+that confirmed OFF. Duplicate OFF reports do not reset the break. The monitor
+uses persisted due timestamps rather than a blocking sleep, and the active
+cycle gate stays reserved throughout the break. Manual requests, another
+automatic cycle, and guarded deployment are refused until completion or safe
+recovery. Stage two also requires observed ON before its final OFF can complete
+the cycle.
+
+Before stage two, the monitor sends the existing OFF command as a safe state
+confirmation request. It requires a fresh, non-retained OFF report with explicit
+`alarm_1=false` and a healthy battery before sending another ON. A pump that
+publishes `battery_low` is judged on that flag, which must be `false`. The
+ThirdReality Smart Watering Kit never publishes it, so its `battery` percentage
+is used instead: it must be a number from 0 to 100 and above 20
+(`ActuatorSafety::LOW_BATTERY_PERCENT`); 20 or less counts as low battery. The
+probe clears earlier live evidence, including reports received in the same
+second. Confirmation must arrive before the 10-second deadline and be no more
+than 5 seconds old when stage two is claimed. A heartbeat alone or an old
+retained report is insufficient. If the pump does not report `alarm_1` and a
+valid battery indicator in response, continuation fails closed rather than
+assuming safety. Verify this behavior with the outlet in a measured vessel
+before plant use.
+
+Monitor downtime defers continuation. Reconnection clears prior readiness and
+safety evidence, requests a new OFF confirmation when due, and may resume the
+undispatched stage even if it is late. There is no extra lateness cutoff. The
+original approval and dry-soil eligibility are not re-evaluated for stage two;
+the actuator topic, enablement, monitor readiness, safety, per-stage duration,
+and rolling budget still apply. A changed actuator never receives a continuation
+or safety OFF command belonging to the original cycle.
+
+The complete 130 seconds are reserved before stage one. The remaining 65-second
+reservation does not disappear when downtime extends beyond 24 hours. Each
+dispatched stage then counts at its own command-claim timestamp, without also
+charging the aggregate cycle. Each dispatched stage also refreshes the cooldown,
+including continuation after prolonged downtime. If changed limits prevent
+continuation after safe OFF confirmation, the second stage is cancelled and only its undispatched
+reservation is released.
+
+An alarm, unexpected ON during the break, missing confirmation after the
+10-second probe deadline, or uncertain ON delivery blocks the cycle for manual
+review. OFF safety retries remain enabled for the original configured actuator.
+After independently confirming the original pump is OFF, the existing
+acknowledgement command releases the gate and cancels the undispatched stage.
+It never retries an uncertain ON or restarts the remaining stage.
+
+The proposal message describes both stages before approval and is edited to
+show progress, the break deadline, completion, cancellation, or blocking.
+`gardenhub:watering:status` shows the cycle and individual stage timestamps.
+The existing proposal retry interval still governs renewal after an *unapproved
+proposal expires*; it is unrelated to the internal cycle break.
 
 Each proposal stores the `WATERING_MQTT_TOPIC` it was created for and its
 Telegram text is rendered from that stored topic. If the configured topic later
@@ -260,22 +569,55 @@ every existing proposal and its prompt counters, because buttons already sent
 to Telegram carry the old UUID. Those buttons do nothing afterwards; a still-dry
 sensor is prompted again. Watering runs are kept.
 
-One initial prompt and at most one reminder 24 hours later are allowed during
-the same dry episode for each actuator topic, including after rejection or
-expiry, so an invalidated simulator proposal does not consume the physical
-pump's prompts. A wet reading resets
-the episode and invalidates any pending proposal. A newer watering attempt
-also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
+Expired proposals renew indefinitely while watering remains eligible, with no
+two-prompt limit. Each renewal is a new proposal with its own expiration and
+Approve / Reject callbacks; the Telegram message identifies it as renewed.
+An expiration at 12:30 with a retry interval of 1800 seconds becomes eligible
+at 13:00, not 30 minutes after the original notification. The existing poller
+checks eligibility on its next pass; no new scheduler or container is needed.
+The deadline comes from the persisted expiration, so restarting does not reset
+the delay, and downtime produces one fresh request rather than a catch-up backlog.
+
+Renewal reuses the watering safety checks, including active or blocked cycles,
+monitor freshness, cooldown, full-cycle daily budget, and actuator availability. Temporary
+failures defer eligibility without changing the expired proposal or its retry
+deadline; subsequent polling passes check again. Approval or explicit rejection ends that renewal chain. A new,
+independent request may start after 24 hours from the watering attempt or rejection
+decision respectively, if eligibility and safety checks pass. Failed or uncertain
+execution and invalidated proposals are not automatically renewed. A changed
+actuator cannot revive an older expired chain when switching back.
+
+A wet reading resets the episode and invalidates any pending proposal. A newer
+watering attempt also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
 proposal expiry, and the 24 hour rule under the watering reservation lock;
 `WateringManager` retains its enabled, monitor heartbeat, cooldown, active
 cycle, duration, and daily budget checks. Rejected, unauthorized, replayed,
 expired, and unapproved proposals never run the configured actuator. If an approval is
 interrupted or command delivery is uncertain, it stays blocked for manual
-review; pressing the button again never retries the cycle. Check the proposal
+review; pressing the button again never retries the cycle. When the initial ON
+delivery is uncertain, the terminal uncertain proposal and its reserved run link
+are persisted. Acknowledging the stopped run does not automatically renew that
+dry episode. Check the proposal
 and watering run tables before any manual recovery. A failed Telegram
-send may have succeeded remotely, so that episode is not sent again. A proposal
+send may have succeeded remotely, so that same proposal is not sent again;
+after expiration it can still qualify for a fresh renewed request. A proposal
 committed before the notification claim is sent on the next poll; a failed
 message edit is retried on the next polling pass.
+
+To deploy this behavior, rebuild and recreate application services through the
+existing deployment workflow with the watering profiles enabled. Optionally set
+`WATERING_PROPOSAL_RETRY_SECONDS=1800` in the untracked root environment file;
+Compose supplies the default otherwise. Apply the new two-stage migration
+through the existing guarded deployment workflow. It preserves historical runs
+and decisions, invalidates pending single-stage proposals, and clears their
+device-and-actuator episode counters so a fresh two-stage proposal can be approved.
+Legacy NULL-topic proposals match only the empty-topic counter; other actuators'
+decisions and counters remain intact. Previously sent buttons cannot silently
+authorize the expanded cycle. Update old explicit
+duration and safety-limit overrides; incompatible settings fail visibly.
+Already-expired proposals, including those previously blocked by the two-prompt
+limit, may produce one eligible renewed request after deployment. Production
+daemons must retain `APP_ENV=prod`.
 
 ### Real Zigbee2MQTT pump on the Pi (opt-in development test)
 
@@ -289,36 +631,33 @@ reuse the simulator account for hardware.
 In GardenHub's untracked root `.env` on the Pi, select the hardware topic and
 the dedicated account. The calibration below is based on a measured 500 ml in
 67 seconds; verify it again with the installed tubing and a measured vessel
-before using the plant. The default limits in `api/.env` and `compose-dev.yaml`
-remain simulator-safe and must be explicitly overridden for this test:
+before using the plant. Calibration remains 67 seconds = 500 ml; it is not a
+duration setting for automatic proposals. Automatic cycles use the same two
+65-second stages in every environment and reserve 130 seconds:
 
 ```dotenv
 WATERING_ENABLED=true
 WATERING_MQTT_TOPIC=zigbee2mqtt/avocado-watering
-WATERING_DEV_USERNAME=watering_hw_dev
-WATERING_DEV_PASSWORD=<separate-hardware-account-password>
-WATERING_MAX_SECONDS=67
-WATERING_DAILY_SECONDS=134
+WATERING_MQTT_USERNAME=watering_hw_dev
+WATERING_MQTT_PASSWORD=<separate-hardware-account-password>
+WATERING_MAX_SECONDS=65
+WATERING_DAILY_SECONDS=130
 WATERING_COOLDOWN_SECONDS=1800
-WATERING_PROPOSAL_DURATION_SECONDS=67
+WATERING_PROPOSAL_DURATION_SECONDS=65
 ```
 
 Stop the simulator if it is running. Recreate the API, monitor, and proposal
 containers so all three receive the new topic, credentials, and limits. Start
-only the hardware and proposal profiles; `make dev` enables the simulator
-profile and should not be used for this hardware run. The commands include the
+only the hardware and proposal profiles with `make dev-hardware`; `make dev`
+does not activate watering. The commands include the
 untracked `.env.local` that holds the Telegram user and chat IDs described
 above.
 
 ```bash
 cd /opt/GardenHub
-docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  stop gardenhub-watering-sim gardenhub-watering-monitor gardenhub-watering-proposals
-docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  up -d --no-deps --force-recreate gardenhub-api
-docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  --profile watering-hardware --profile watering-proposals up -d --no-deps --force-recreate \
-  gardenhub-watering-monitor gardenhub-watering-proposals
+make deploy-stop COMPOSE_FILES='-f compose.yaml -f compose-dev.yaml'
+docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml stop gardenhub-watering-sim
+COMPOSE_PROFILES=watering-proposals make dev-hardware
 docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
   logs -f gardenhub-watering-monitor
 ```
@@ -328,7 +667,7 @@ Run it only with the outlet in a measured vessel:
 
 ```bash
 docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  exec gardenhub-api php bin/console gardenhub:watering:request 67
+  exec gardenhub-api php bin/console gardenhub:watering:request 65
 docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
   exec gardenhub-api php bin/console gardenhub:watering:status
 ```
@@ -344,8 +683,11 @@ physical pump is OFF before `gardenhub:watering:acknowledge-stop
 Run its isolated integration suite with:
 
 ```bash
-docker compose -f tests/watering-control/compose.yaml run --rm tests
-docker compose -f tests/watering-control/compose.yaml down -v
+make test-phpunit GROUP=functional_gardenhub-compose-configuration
+make test-phpunit GROUP=functional_gardenhub-deployment
+make test-phpunit GROUP=functional_gardenhub-watering-control
+make test-phpunit GROUP=functional_gardenhub-watering-proposals
+make test-phpunit GROUP=functional_gardenhub-watering-mqtt
 ```
 
 ## Current Status
@@ -353,7 +695,7 @@ docker compose -f tests/watering-control/compose.yaml down -v
 ### Implemented
 
 - Docker Compose based deployment.
-- PHP 8.4 / Symfony 7.4 LTS backend.
+- PHP 8.5 / Symfony 7.4 LTS backend.
 - API Platform 4.3+.
 - MySQL 8.4 persistent storage.
 - Doctrine ORM and Doctrine Migrations.
@@ -530,7 +872,7 @@ How it works:
 The migration makes `deduplication_id`/`type` mandatory and adds the unique
 index. Queued `ChirpStackUplink` messages serialized by the old code lack
 `deduplicationId` and would crash the new handler, so they must be drained by
-the **old** code first. Because `api/src` is bind-mounted into the containers,
+the **old** code first. In development, `api/src` is bind-mounted into the containers,
 pulling new code before draining would change the code the drain consumer runs
 — so code is pulled only after the queues are empty and the drain consumer is
 stopped.
@@ -540,7 +882,8 @@ writer services are — so the two mysql commands below use `docker compose exec
 against that already-running container; never `exec` into a stopped service.
 Every other CLI step runs in a **one-off container**
 (`docker compose run --rm --no-deps`), which starts its own throwaway container
-using the *currently checked-out* code. `--no-deps` explicitly prevents Compose
+using the built image (or the current source mounts in development). Build the
+appropriate image before each production one-off step. `--no-deps` explicitly prevents Compose
 from starting that command's dependencies (e.g. `gardenhub-mysql`) as a side
 effect — it is not an optional precaution — so the writer services stay
 stopped for the whole procedure.
@@ -653,8 +996,9 @@ and MQTT services on a separate Compose network, without production data or
 credentials:
 
 ```bash
-docker compose -f tests/mqtt-lifecycle/compose.yaml run --rm tests
-docker compose -f tests/mqtt-lifecycle/compose.yaml down -v
+make test-phpunit GROUP=functional_gardenhub-mqtt-worker
+make test-phpunit GROUP=functional_gardenhub-mqtt-delivery
+make test-phpunit GROUP=functional_gardenhub-migration-upgrade
 ```
 
 Build the API image first if it is not available. Tests cover repeated uplinks,
@@ -774,7 +1118,42 @@ docker compose logs --tail=100 gardenhub-grafana
 its already-injected environment, so it will not pick up either kind of
 change.
 
-### Testing Grafana alerts
+### Watering history
+
+Open **Dashboards → GardenHub → GardenHub — Watering History** for the separate
+report, alongside **GardenHub — Garden Overview**. Its direct path is
+`/d/gardenhub-watering-history`. The overview's existing watering table remains
+available too.
+
+The **Run outcomes** chart above the table shows stacked daily counts for
+completed, timed-out, uncertain, reviewed, pending, running, break, and cancelled cycles. Counts use
+each run's current status and include runs without a valid watering interval.
+Daily buckets use UTC calendar days; timestamp labels use the dashboard timezone.
+The chart uses the same time-range filter as the table, which stays at the bottom.
+
+The report includes one row per `watering_run`, newest first,
+within the dashboard time range. The range uses `started_at`, falling back to
+`requested_at` for runs that never started; timestamps use the dashboard timezone.
+For automatic cycles, actual duration sums the two confirmed physical-stage
+intervals, never the 30-minute break. For legacy/manual runs, it remains the
+recorded end minus start, not `requested_seconds`. Stage status and the second
+stage's due time appear alongside the logical cycle.
+Estimated volume uses the pump calibration **67 seconds = 500 ml**, rounded to
+one decimal place: 67 seconds → 500.0 ml, 10 seconds → 74.6 ml, and 3 seconds → 22.4 ml.
+
+Only `completed` automatic cycles with two completed, valid stage intervals,
+or legacy/manual runs with both timestamps present and a nonnegative interval,
+have duration and volume values. Other runs remain visible with empty calculated
+cells. In particular, `reviewed.finished_at` records an operator acknowledgement,
+not the actual watering end. Calibration is unchanged: a cycle with two
+65-second confirmed intervals reports 130 seconds and approximately 970.1 ml,
+even though its elapsed cycle time includes the 30-minute break.
+
+Dashboard files are checked by the provisioner every 30 seconds. To explicitly
+refresh Grafana after updating the file, run `make deploy-grafana`; this only
+recreates Grafana, without restarting MySQL or operating the pump.
+
+### Testing Grafana dashboards and alerts
 
 `tests/grafana-db/` runs the pinned Grafana image against this repo's actual,
 unmodified provisioning files and a disposable MySQL database, seeding
@@ -790,6 +1169,22 @@ asserts that the Telegram contact point's `chatid` decodes as a string:
 
 ```bash
 docker compose -f tests/grafana-db/compose.yaml up --abort-on-container-exit --exit-code-from tests
+docker compose -f tests/grafana-db/compose.yaml down -v
+```
+
+The suite also executes the actual provisioned Watering history query through
+Grafana against a disposable `watering_run` fixture matching the current schema.
+It verifies the separate dashboard is provisioned in the GardenHub folder and
+matches the overview's watering table. It checks calibration, zero/negative durations, missing timestamps, status guards,
+timestamp types, empty history, ordering, and inclusive time-range boundaries.
+It also verifies stacked outcomes counts across multiple days and that the
+watering table remains below the chart.
+The fixture's schema changes apply only to this isolated test database.
+For a focused check without waiting for the alert scenarios:
+
+```bash
+docker compose -f tests/grafana-db/compose.yaml up -d --wait gardenhub-mysql grafana
+docker compose -f tests/grafana-db/compose.yaml run --rm -e WATERING_HISTORY_ONLY=1 tests
 docker compose -f tests/grafana-db/compose.yaml down -v
 ```
 
@@ -1249,14 +1644,123 @@ docker compose exec gardenhub-api php bin/console gardenhub:telegram:test
 
 This reports whether a record was *dispatched*, never *delivered*: delivery failures are swallowed by design (see below), so check the target Telegram chat to confirm receipt.
 
-Run the automated test scripts (dev stack only, requires the `compose-dev.yaml` bind mount):
+Run the PHPUnit groups (isolated development runner; no live Telegram access):
 
 ```bash
-docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/telegram_handler_test.php
-docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/stream_telegram_transport_test.php
+make test-build
+make test-phpunit GROUP=unitest_gardenhub-telegram-handler
+make test-phpunit GROUP=functional_gardenhub-telegram-logging
+make test-phpunit GROUP=functional_gardenhub-telegram-http
 ```
 
-The second script exercises `StreamTelegramTransport` itself (HTTP errors, invalid JSON, `ok:false`, connection failures, and repeated calls) against a local fake server — no real Telegram access involved.
+The HTTP group exercises `StreamTelegramTransport` itself (HTTP errors, invalid
+JSON, `ok:false`, connection failures, and repeated calls) against a loopback
+server.
+
+### PHPUnit Migration Status
+
+PHPUnit 13.4.4 and Xdebug 3.5.3 are development-only. The native ARM64 runtime is
+PHP 8.5.12. Production installs use `--no-dev`, and production image copies exclude
+test sources, PHPUnit configuration and development PHP configuration.
+
+Composer requires PHP 8.5.12 or newer and resolves dependencies against 8.5.12.
+The shared Docker base pins `php:8.5.12-fpm-alpine`; PHP 8.5 includes OPcache, so
+it must not be installed or loaded separately as `opcache.so`.
+After changing the runtime, rebuild the development, test and production images.
+All application consumers share the application image: recreate the API,
+workers, scheduler and enabled watering services through the existing gated
+deployment process. Editing the Dockerfile alone does not upgrade running
+containers.
+
+The runtime upgrade includes targeted Symfony 7.4 and PHPUnit security patches.
+PHP image builds refresh inherited Alpine packages, and production and packaged
+smoke use the same `nginx:1.30.6-alpine-slim` base. The slim variant retains the
+static-file/FastCGI features used here without unused curl and image-filter
+dependencies. Composer and production-image audits remain required release checks.
+
+The Telegram handler/HTTP/daily-summary, scheduler, Python release/image-audit,
+sensor identity/concurrency, Compose and Make deployment scenarios have migrated.
+MQTT worker callback/reset/recovery, outage alerts, pre-SUBACK delivery and
+persistent-session resumption have also migrated, preserving real broker and
+fresh-process interactions.
+Application, Grafana and production-smoke suites run through PHPUnit with
+isolated service runners. The main CI job runs core suites once under Xdebug;
+Grafana and packaged production smoke run only in their dedicated required jobs.
+Composer and production-image audits remain required by `CI Ready`.
+
+```bash
+make test-build                 # Separate gardenhub-tests:phpunit image
+make test-phpunit               # Complete suite
+make test-groups                # List exact independently runnable groups
+make test-report               # TestDox, timings and JUnit XML
+make test-ci                   # Core suites, excluding Grafana and packaged smoke
+make test-phpunit GROUP=unitest_gardenhub-image-audit
+make test-coverage-probe        # Focused CLI/HTTP/FPM collection proof
+make test-coverage             # Native aggregate api/src coverage, 80% required
+```
+
+Reports are written to `.test-reports/phpunit/<group>/junit.xml` and
+`testdox.txt` (`all` for an unfiltered run). No host PHP, active application
+stack, Docker socket mount or real credentials are required. The summary and
+scheduler-delivery and sensor identity/concurrency groups start their own isolated MySQL service sequentially;
+they require 384 MiB available memory, use a small buffer pool and disk-backed
+disposable volume, and remove their stack on exit. Their reports live in
+`.test-reports/phpunit/telegram-summary/` and `scheduler-delivery/`, respectively.
+
+Normal runs are sequential, use a 160 MiB PHP limit, bounded subprocess output
+and Xdebug off. The launcher refuses runs below 256 MiB available host memory
+and never stops unrelated services. The current Pi kernel cannot enforce Docker
+memory caps, so this check is a headroom guard, not an aggregate memory guarantee.
+Existing swap usage and live services must be considered before heavier suites.
+The full database/Grafana suite still needs measured 2 GB validation.
+
+Native aggregate coverage is opt-in locally and required in CI. The collection
+proof tests (CLI, loopback HTTP and real FPM) are included in core/full runs.
+Application subprocess collection uses a development-only prepend/runtime and
+`GARDENHUB_COVERAGE_DIR`, never production INI. Forced-kill processes cannot
+flush shutdown coverage. `make test-coverage` collects the same core suites as
+`make test-ci`, without repeating Grafana or packaged production smoke.
+
+CI enables `GARDENHUB_COVERAGE=1` during `make test-ci`, then runs
+`bash tests/phpunit-coverage.sh --merge-only` with the same report root.
+Enforcement requires every expected suite to succeed, a completed collection
+manifest, successful JUnit reports and native coverage fragments. Failed tests,
+incomplete collection and coverage below 80% all fail the required CI job.
+All `api/src` files, including uncovered files, remain in the denominator.
+Clover XML, HTML and text reports are emitted before threshold enforcement in
+`.test-reports/coverage/<run>/` and uploaded even on a below-threshold failure.
+
+New proposals persist their initial/renewed notification classification. Legacy
+proposals with an unknown classification retain their Telegram text; terminal
+reconciliation removes buttons through `editMessageReplyMarkup` and completes
+only after Telegram succeeds. API failures retry without changing the durable
+decision; expired callbacks remain rejected by the backend.
+
+The replaced-runner preservation ledger is:
+
+| Former Runner | PHPUnit Replacement | Preserved Scenarios |
+| --- | --- | --- |
+| `api/tests/telegram_handler_test.php` | Handler unit and logging functional groups | All seven handler cases plus enabled container/channel isolation |
+| `api/tests/stream_telegram_transport_test.php` | Telegram HTTP functional group | All six success/error/connection/error-handler cases |
+| `tests/release-ci/test_release_checks.py` | Release-gate, image-audit and release-order groups | All eight release methods and variants, two audit methods and variants, real Make refusal ordering |
+| `tests/watering-control/compose-deployment.py` | Compose-selection, Compose-configuration and deployment groups | All thirteen methods; 523 boolean fixtures; both selection modes; all 52 health fixtures and shutdown/startup guards |
+| `tests/scheduler-cron/scheduler-cron.php` | Scheduler-wiring and scheduler-delivery groups | All six scenarios: exact registration, six DST dates, three startup instants, real generated delivery, failure propagation, disabled transport |
+| `tests/telegram-summary/telegram-daily-summary.php` | Telegram-summary group | All eleven scenarios: min/max, grouping, uplink counts, half-open boundaries, empty output, escaping, failure, disabled, custom/default hours, six invalid hours |
+| `tests/sensor-identity/sensor-identity.php` | Sensor-identity group | All six identity phases, twelve invalid payloads, three exact fieldsets, nested/read-only exposure and stored measurement count |
+| `tests/sensor-identity/concurrency.php` | Sensor-concurrency group | All three real races, InnoDB exception-chain proof, performance_schema connection-ID proof, independent writer continuity, unchanged identity and measurement counts |
+| `tests/mqtt-lifecycle/worker-lifecycle.php` | MQTT-worker and MQTT-outage groups | All five child modes, original-manager/debug resets, accepted payload counts, provisioning IDs, flush/reset stops, real connection retries, outage threshold/recovery and fresh-instance state |
+| `tests/mqtt-lifecycle/pre-suback-delivery.php` | MQTT-pre-suback group | Forced pre-SUBACK A, post-SUBACK B and final D delivered once; unrelated C excluded after D proves packet processing |
+| `tests/mqtt-lifecycle/session-resume.php` | MQTT-session-resume group | Real migration, persistent acknowledged subscription, five offline QoS1 markers, fresh worker async enqueue, duplicate tolerance and SIGKILL |
+| `tests/mqtt-lifecycle/delivery-guarantees.php` | MQTT-delivery group | All ten phases: routing, malformed input, persistence, recovery, four-attempt exhaustion and terminal alert, inspection, validation, replay, UUID boundary and eight-event continuous-consumer collision |
+| `tests/mqtt-lifecycle/identity-race.php` | MQTT-identity-race group | Persistent independently relabeled identity fails four attempts/three retries with exact causes; restored identity succeeds after one retry; queue and measurement invariants |
+| `tests/mqtt-lifecycle/migration-upgrade.php` | Migration-upgrade group | All six scenarios: real legacy chain and snapshots/backfill, uniqueness acceptances/refusals, full fresh chain/no pending versions, watering IDs and links/indexes/FKs, empty up/down/up, orphan/interrupted-column guards |
+| `tests/watering-control/orm-mapping.php` | Entity-contracts and watering-orm groups | Nine entity metadata contracts, five invalid entities, enum/alias strings, integer JSON, stale/fresh CAS, foreign keys, referrer removal, nine callback bounds and unknown action |
+| `tests/watering-control/watering-control.php` | Watering-control group | Five invalid payloads, six request guards, exact ON/deadline, duplicate/restart/cooldown, failed publish, timeout/manual review, two alarms, rolling budget, two overdue states, blocked-row isolation and active/latest tie |
+| `tests/watering-control/production.php` | Watering-configuration and watering-production groups | Ten configuration refusals; disabled/incomplete/enabled production DI, real publication, four read-only unresolved statuses, reviewed idle, missing/stale/fresh heartbeats and one-shot fake Telegram poll |
+| `tests/watering-control/proposals.php` | Watering-proposals and watering-actuator-switch groups | Complete dry-episode/notification/authorization/reminder/recovery/replay history, duration limits, daily boundary, two independent approval children, stale/gap/publish-failure/offset checks; all four stored-topic switch and legacy scenarios |
+| `tests/watering-control/watering-mqtt-acknowledgements.php` | Watering-mqtt group | All nine real MQTT/DB scenarios, non-retained QoS1 wire fields, PUBACK timeout, missing/rejected SUBACK, disconnect/reconnect heartbeats, trigger-error precedence, ignored later callbacks and dangling FK |
+| `tests/production-smoke/run.sh` assertions | Production-smoke group | Immutable no-dev subject, www-data platform/migrations/schema/cache, real nginx/FPM health and all seven permission requests; physical PHPUnit/Xdebug/test exclusions |
+| `tests/grafana-db/run.sh` | Grafana history, alerting and provisioning groups | All real provisioned SQL/config/21-row history/outcome cases, three alert flows and nine timed moisture stages, per-instance health/recovery/eviction and string chat ID |
 
 ## Daily summary
 
@@ -1299,11 +1803,9 @@ it and how to opt in.
 Run the isolated test suites (own disposable MySQL container, never the dev database):
 
 ```bash
-docker compose -f tests/telegram-summary/compose.yaml run --rm tests
-docker compose -f tests/telegram-summary/compose.yaml down -v
-
-docker compose -f tests/scheduler-cron/compose.yaml run --rm tests
-docker compose -f tests/scheduler-cron/compose.yaml down -v
+make test-phpunit GROUP=functional_gardenhub-telegram-summary
+make test-phpunit GROUP=functional_gardenhub-scheduler-wiring
+make test-phpunit GROUP=functional_gardenhub-scheduler-delivery
 ```
 
 ## `gardenhub-scheduler`
@@ -1337,8 +1839,8 @@ docker compose --profile scheduler up -d gardenhub-scheduler
 docker compose logs -f gardenhub-scheduler
 ```
 
-Production deployment (`make deploy` already includes `gardenhub-scheduler`
-in `DEPLOY_SERVICES`, so this is normally automatic; documented here for
+Production deployment (`make deploy` retains `gardenhub-scheduler`
+in its application selection, so this is normally automatic; documented here for
 reference/manual use):
 
 ```bash

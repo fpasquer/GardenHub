@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - master
   pull_request:
     branches:
       - master
@@ -24,109 +27,172 @@ jobs:
           # CI-only placeholder required by root compose.yaml interpolation;
           # no root-stack container is started, so no port is actually bound.
           BIND_ADDRESS: 127.0.0.1
-        run: docker compose build gardenhub-api
+        run: docker build --target development -t gardenhub-api api
 
-      - name: Run MQTT lifecycle tests
-        id: mqtt_tests
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/mqtt-lifecycle/compose.yaml run --rm tests
+      - name: Build PHPUnit runner
+        run: make test-build
 
-      - name: Clean up MQTT lifecycle stack
-        if: always()
-        run: docker compose -f tests/mqtt-lifecycle/compose.yaml down -v
-
-      - name: Run sensor identity tests
-        id: sensor_tests
-        if: always()
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/sensor-identity/compose.yaml run --rm tests
-
-      - name: Clean up sensor identity stack
-        if: always()
-        run: docker compose -f tests/sensor-identity/compose.yaml down -v
-
-      - name: Run Telegram unit tests
-        id: telegram_unit_tests
-        if: always()
+      - name: Run migrated PHPUnit tests
+        id: phpunit_tests
         continue-on-error: true
         env:
-          # Same CI-only placeholder as the build step; --no-deps means
-          # gardenhub-mysql/nginx are never started, so no port is bound.
-          BIND_ADDRESS: 127.0.0.1
-        run: |
-          set -Eeuo pipefail
-          docker compose -f compose.yaml -f compose-dev.yaml run --rm --no-deps gardenhub-api php tests/telegram_handler_test.php
-          docker compose -f compose.yaml -f compose-dev.yaml run --rm --no-deps gardenhub-api php tests/stream_telegram_transport_test.php
+          GARDENHUB_COVERAGE: '1'
+          GARDENHUB_REPORT_ROOT: .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: make test-ci
 
-      - name: Run Telegram daily-summary tests
-        id: telegram_summary_tests
-        if: always()
+      - name: Enforce native PHPUnit coverage
+        id: coverage
+        if: ${{ !cancelled() && steps.phpunit_tests.outcome == 'success' }}
         continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/telegram-summary/compose.yaml run --rm tests
+        env:
+          GARDENHUB_REPORT_ROOT: .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash tests/phpunit-coverage.sh --merge-only
 
-      - name: Clean up Telegram daily-summary stack
+      - name: Upload PHPUnit reports
         if: always()
-        run: docker compose -f tests/telegram-summary/compose.yaml down -v
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phpunit-results
+          include-hidden-files: true
+          path: |
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/**/junit.xml
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/**/testdox.txt
+          if-no-files-found: error
 
-      - name: Run scheduler-cron tests
-        id: scheduler_tests
+      - name: Upload native coverage reports
         if: always()
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/scheduler-cron/compose.yaml run --rm tests
-
-      - name: Clean up scheduler-cron stack
-        if: always()
-        run: docker compose -f tests/scheduler-cron/compose.yaml down -v
-
-      - name: Run watering control tests
-        id: watering_tests
-        if: always()
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          docker compose -f tests/watering-control/compose.yaml run --rm tests
-
-      - name: Clean up watering control stack
-        if: always()
-        run: docker compose -f tests/watering-control/compose.yaml down -v
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phpunit-coverage
+          include-hidden-files: true
+          path: |
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/clover.xml
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/html/
+            .test-reports/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/summary.txt
+          if-no-files-found: warn
 
       - name: Fail if any test suite failed
         if: always()
         run: |
-          if [ "${{ steps.mqtt_tests.outcome }}" != "success" ]; then
-            echo "MQTT lifecycle tests failed"
+          if [ "${{ steps.phpunit_tests.outcome }}" != "success" ] || [ "${{ steps.coverage.outcome }}" != "success" ]; then
+            echo "PHPUnit tests or native coverage enforcement failed"
             exit 1
           fi
 
-          if [ "${{ steps.sensor_tests.outcome }}" != "success" ]; then
-            echo "Sensor identity tests failed"
-            exit 1
-          fi
+  grafana:
+    name: Grafana integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Build offline test tooling
+        run: docker build --target test-runner -t gardenhub-tests:phpunit api
+      - name: Run full Grafana suite
+        run: bash tests/phpunit-grafana.sh functional_gardenhub-grafana
+      - name: Upload Grafana PHPUnit results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: grafana-phpunit
+          path: .test-reports/phpunit/grafana/
+          if-no-files-found: error
+      - name: Show failure diagnostics
+        if: failure()
+        run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml logs --no-color --tail=100
+      - name: Clean up Grafana stack
+        if: always()
+        run: docker compose -f tests/grafana-db/compose.yaml -f tests/grafana-db/compose-ci.yaml down -v --remove-orphans
 
-          if [ "${{ steps.telegram_unit_tests.outcome }}" != "success" ]; then
-            echo "Telegram unit tests failed"
-            exit 1
-          fi
+  composer-audit:
+    name: Composer dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Audit locked dependencies
+        run: |
+          mkdir -p .ci-reports
+          docker run --rm -v "$PWD/api:/app:ro" -w /app composer:2 \
+            audit --locked --format=json --abandoned=report > .ci-reports/composer.json
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: composer-audit
+          path: .ci-reports/composer.json
+          if-no-files-found: error
 
-          if [ "${{ steps.telegram_summary_tests.outcome }}" != "success" ]; then
-            echo "Telegram daily-summary tests failed"
-            exit 1
-          fi
+  production:
+    name: Production image smoke and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PRODUCTION_IMAGE: gardenhub-api:${{ github.sha }}
+      SMOKE_NGINX_IMAGE: gardenhub-smoke-nginx:${{ github.sha }}
+      TRIVY_IMAGE: aquasec/trivy@sha256:086971aaf400beebd94e8300fd8ea623774419597169156cec56eec5b00dfb1e
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Build production images
+        run: |
+          docker build --target production -t "$PRODUCTION_IMAGE" api
+          docker build --target smoke-nginx -t "$SMOKE_NGINX_IMAGE" api
+      - name: Run packaged production smoke tests
+        run: |
+          docker build --target test-runner -t gardenhub-tests:phpunit api
+          sh tests/production-smoke/run.sh
+      - name: Upload packaged smoke results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: production-smoke-phpunit
+          path: .test-reports/phpunit/production-smoke/
+          if-no-files-found: error
+      - name: Scan production images
+        if: ${{ !cancelled() && success() }}
+        run: |
+          mkdir -p .ci-reports
+          docker image inspect "$PRODUCTION_IMAGE" "$SMOKE_NGINX_IMAGE" > .ci-reports/images.json
+          for component in api nginx; do
+            image="$PRODUCTION_IMAGE"
+            if [[ "$component" == nginx ]]; then image="$SMOKE_NGINX_IMAGE"; fi
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock:ro \
+              -v "$PWD/.ci-reports:/reports" -v trivy-cache:/root/.cache/trivy \
+              "$TRIVY_IMAGE" image --scanners vuln --format json \
+              --output "/reports/$component.json" "$image"
+          done
+          python3 scripts/check-image-audit.py .ci-reports/api.json .ci-reports/nginx.json
+      - name: Upload production audit reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: production-image-audit
+          include-hidden-files: true
+          path: .ci-reports/
+          if-no-files-found: error
+      - name: Clean up production smoke stack
+        if: always()
+        run: docker compose -f tests/production-smoke/compose.yaml down -v --remove-orphans
 
-          if [ "${{ steps.scheduler_tests.outcome }}" != "success" ]; then
-            echo "Scheduler-cron tests failed"
-            exit 1
-          fi
-
-          if [ "${{ steps.watering_tests.outcome }}" != "success" ]; then
-            echo "Watering control tests failed"
-            exit 1
-          fi
+  ready:
+    name: CI Ready
+    needs: [tests, grafana, composer-audit, production]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every release check
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          results = json.loads(os.environ['RESULTS'])
+          failed = [name for name, job in results.items() if job['result'] != 'success']
+          if failed:
+              raise SystemExit('Release checks did not succeed: ' + ', '.join(failed))
+          print('All required release checks passed.')
+          PY

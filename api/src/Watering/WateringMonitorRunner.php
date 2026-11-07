@@ -12,32 +12,33 @@ use Psr\Log\LoggerInterface;
 /** Owns one MQTT connection attempt: connect, subscribe, confirm SUBACK, then run the heartbeat loop. */
 final class WateringMonitorRunner
 {
+    private const HEARTBEAT_INTERVAL_SECONDS = 1;
+    private const STOP_RETRY_INTERVAL_SECONDS = 5;
+    private const DEFAULT_SUBACK_TIMEOUT_SECONDS = 10.0;
+
     public function __construct(
         private readonly WateringManager $watering,
-        private readonly WateringPublisher $publisher,
+        private readonly InterfaceWateringPublisher $publisher,
         private readonly LoggerInterface $logger,
-        private readonly string $host,
-        private readonly int $port,
-        private readonly string $username,
-        private readonly string $password,
-        private readonly float $subackTimeoutSeconds = 10.0,
-        private readonly string $topic = MqttWateringPublisher::DEFAULT_TOPIC,
+        private readonly WateringConfiguration $configuration,
+        private readonly float $subackTimeoutSeconds = self::DEFAULT_SUBACK_TIMEOUT_SECONDS,
     ) {
     }
 
     public function isConfigured(): bool
     {
-        return '' !== $this->host && '' !== $this->username && '' !== $this->password && '' !== trim($this->topic);
+        return $this->configuration->isConfigured();
     }
 
     /** $stopRequested is polled each heartbeat iteration; production passes a closure that never stops. */
     public function runConnectionAttempt(\Closure $stopRequested): void
     {
+        $this->configuration->assertAvailable();
         // Unguarded: a failure here must abort the attempt before connecting.
         $this->watering->invalidateHeartbeat();
 
         $repository = new MemoryRepository();
-        $client = new MqttClient($this->host, $this->port, 'gardenhub-watering-monitor', repository: $repository);
+        $client = new MqttClient($this->configuration->host, $this->configuration->port, 'gardenhub-watering-monitor', repository: $repository);
         $callbackFailure = null;
         $throwCallbackFailure = static function () use (&$callbackFailure): void {
             if ($callbackFailure !== null) {
@@ -45,13 +46,13 @@ final class WateringMonitorRunner
             }
         };
         try {
-            $client->connect((new ConnectionSettings())->setUsername($this->username)->setPassword($this->password)->setKeepAliveInterval(30), true);
-            $client->subscribe($this->topic, function (string $topic, string $message) use (&$callbackFailure): void {
+            $client->connect((new ConnectionSettings())->setUsername($this->configuration->username)->setPassword($this->configuration->password)->setKeepAliveInterval(30), true);
+            $client->subscribe($this->configuration->topic, function (string $topic, string $message, bool $retained) use (&$callbackFailure): void {
                 if ($callbackFailure !== null) {
                     return;
                 }
                 try {
-                    $this->handleMessage($message);
+                    $this->handleMessage($message, $retained);
                 } catch (\Throwable $e) {
                     // php-mqtt/client catches callback exceptions, so carry the
                     // first one out of loopOnce() explicitly.
@@ -59,7 +60,7 @@ final class WateringMonitorRunner
                 }
             }, MqttClient::QOS_AT_LEAST_ONCE);
             SubscriptionReadyGate::await($client, $repository, $this->subackTimeoutSeconds, $throwCallbackFailure);
-            $this->logger->info('Monitoring '.$this->topic);
+            $this->logger->info('Monitoring '.$this->configuration->topic);
             $this->runHeartbeatLoop($client, $stopRequested, $throwCallbackFailure);
         } finally {
             try {
@@ -76,18 +77,18 @@ final class WateringMonitorRunner
         }
     }
 
-    private function handleMessage(string $message): void
+    private function handleMessage(string $message, bool $retained): void
     {
         try {
-            $stop = $this->watering->observe($message);
+            $stop = $this->watering->observe($message, $retained);
             if ($stop) {
-                $this->publisher->publish(['state' => 'OFF']);
+                $this->publisher->publish(['state' => ActuatorState::Off->value]);
             }
         } catch (\Throwable $e) {
             $this->logger->error('Watering state processing failed; trying OFF.', ['error' => $e->getMessage()]);
             // Never silently discard an ON when persistence fails.
             try {
-                $this->publisher->publish(['state' => 'OFF']);
+                $this->publisher->publish(['state' => ActuatorState::Off->value]);
             } catch (\Throwable) {
                 // Keep the processing failure as the reason to reconnect.
             }
@@ -103,16 +104,17 @@ final class WateringMonitorRunner
         while (!$stopRequested()) {
             $client->loopOnce($started, true);
             $throwCallbackFailure();
-            if (microtime(true) - $lastHeartbeat >= 1) {
+            if (microtime(true) - $lastHeartbeat >= self::HEARTBEAT_INTERVAL_SECONDS) {
                 $this->watering->heartbeat();
                 $lastHeartbeat = microtime(true);
             }
             if ($this->watering->expire()) {
                 $this->logger->error('Watering deadline exceeded; cycle blocked and OFF requested.');
             }
-            if ($this->watering->requiresStop() && microtime(true) - $lastStopAttempt >= 5) {
+            $this->watering->advanceCycle();
+            if ($this->watering->requiresStop() && microtime(true) - $lastStopAttempt >= self::STOP_RETRY_INTERVAL_SECONDS) {
                 $lastStopAttempt = microtime(true);
-                $this->publisher->publish(['state' => 'OFF']);
+                $this->publisher->publish(['state' => ActuatorState::Off->value]);
             }
         }
     }

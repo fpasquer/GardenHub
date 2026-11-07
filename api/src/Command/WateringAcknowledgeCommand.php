@@ -11,7 +11,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'gardenhub:watering:acknowledge-stop', description: 'Manually review a blocked development watering cycle')]
+#[AsCommand(name: 'gardenhub:watering:acknowledge-stop', description: 'Manually review a blocked watering cycle')]
 final class WateringAcknowledgeCommand extends Command
 {
     public function __construct(private readonly WateringManager $watering)

@@ -1,0 +1,70 @@
+name: gardenhub-production-smoke
+
+x-environment: &environment
+  APP_ENV: prod
+  APP_DEBUG: "0"
+  APP_SECRET: production-smoke-only
+  DATABASE_URL: 'mysql://root@mysql:3306/production_smoke?serverVersion=8.4&charset=utf8mb4'
+  WATERING_ENABLED: "false"
+  TELEGRAM_ENABLED: "false"
+
+services:
+  mysql:
+    image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=32M", "--innodb-log-buffer-size=4M", "--max-connections=10", "--table-open-cache=64", "--table-definition-cache=400", "--temptable-max-ram=16M"]
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: production_smoke
+    volumes:
+      - database:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=TCP", "--silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  gardenhub-api:
+    image: ${PRODUCTION_IMAGE:-gardenhub-api:phpunit-production}
+    environment: *environment
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+  nginx:
+    image: ${SMOKE_NGINX_IMAGE:-gardenhub-smoke-nginx:phpunit-production}
+    depends_on:
+      gardenhub-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+  tests:
+    image: gardenhub-tests:phpunit
+    entrypoint: ["timeout", "-s", "TERM", "-k", "10", "480", "php", "vendor/bin/phpunit"]
+    command: ["--do-not-record-test-run-history", "--testdox", "--display-all-issues", "--group", "functional_gardenhub-production-smoke", "--log-junit", "/reports/junit.xml", "--testdox-text", "/reports/testdox.txt", "tests/Integration/ProductionSmokeTest.php"]
+    environment:
+      XDEBUG_MODE: 'off'
+      GARDENHUB_ROOT: ${PWD:?Workspace path required}
+      PRODUCTION_IMAGE: ${PRODUCTION_IMAGE:-gardenhub-api:phpunit-production}
+      SMOKE_NGINX_IMAGE: ${SMOKE_NGINX_IMAGE:-gardenhub-smoke-nginx:phpunit-production}
+    volumes:
+      - ${PWD}:${PWD}:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ../../api/tests:/app/tests:ro
+      - ../../api/phpunit.xml.dist:/app/phpunit.xml.dist:ro
+      - ../../.test-reports/phpunit/production-smoke:/reports
+
+networks:
+  default:
+    internal: true
+
+volumes:
+  database:

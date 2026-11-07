@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace App\Entity;
 
 use App\Repository\WateringRunRepository;
+use App\Watering\WateringRunStatus;
+use Doctrine\Common\Collections\ArrayCollection;
+use Doctrine\Common\Collections\Collection;
 use Doctrine\ORM\Mapping as ORM;
 use Symfony\Component\Serializer\Attribute\Groups;
 use Symfony\Component\Validator\Constraints as Assert;
@@ -15,15 +18,18 @@ use Symfony\Component\Validator\Constraints as Assert;
 #[ORM\Index(name: 'idx_watering_requested', columns: ['requested_at'])]
 class WateringRun
 {
-    public const STATUS_PENDING = 'pending';
-    public const STATUS_RUNNING = 'running';
-    public const STATUS_COMPLETED = 'completed';
-    public const STATUS_UNCERTAIN = 'uncertain';
-    public const STATUS_TIMED_OUT = 'timed_out';
-    public const STATUS_REVIEWED = 'reviewed';
+    public const STATUS_PENDING = WateringRunStatus::Pending->value;
+    public const STATUS_RUNNING = WateringRunStatus::Running->value;
+    public const STATUS_COMPLETED = WateringRunStatus::Completed->value;
+    public const STATUS_UNCERTAIN = WateringRunStatus::Uncertain->value;
+    public const STATUS_TIMED_OUT = WateringRunStatus::TimedOut->value;
+    public const STATUS_REVIEWED = WateringRunStatus::Reviewed->value;
+    public const STATUS_BREAK = WateringRunStatus::Break->value;
+    public const STATUS_CANCELLED = WateringRunStatus::Cancelled->value;
+    public const ERROR_MAX_LENGTH = 255;
 
     /** Cycles that can still time out or become uncertain. */
-    public const OPEN_STATUSES = [self::STATUS_PENDING, self::STATUS_RUNNING];
+    public const OPEN_STATUSES = [self::STATUS_PENDING, self::STATUS_RUNNING, self::STATUS_BREAK];
 
     /** Cycles whose actuator state is unknown until reviewed. */
     public const BLOCKED_STATUSES = [self::STATUS_TIMED_OUT, self::STATUS_UNCERTAIN];
@@ -35,13 +41,13 @@ class WateringRun
     private ?int $id = null;
 
     #[ORM\Column]
-    #[Assert\Positive(groups: ['validation:watering_run'])]
+    #[Assert\Positive(groups: ['validate:watering_run'])]
     #[Groups(['read:watering_run'])]
     private ?int $requestedSeconds = null;
 
     #[ORM\Column(length: 20)]
-    #[Assert\NotBlank(groups: ['validation:watering_run'])]
-    #[Assert\Length(max: 20, groups: ['validation:watering_run'])]
+    #[Assert\NotBlank(groups: ['validate:watering_run'])]
+    #[Assert\Length(max: 20, groups: ['validate:watering_run'])]
     #[Groups(['read:watering_run'])]
     private ?string $status = null;
 
@@ -66,14 +72,110 @@ class WateringRun
     private ?\DateTimeImmutable $lastStateAt = null;
 
     #[ORM\Column(length: 10, nullable: true)]
-    #[Assert\Length(max: 10, groups: ['validation:watering_run'])]
+    #[Assert\Length(max: 10, groups: ['validate:watering_run'])]
     #[Groups(['read:watering_run'])]
     private ?string $lastState = null;
+
+    #[ORM\Column(length: self::ERROR_MAX_LENGTH, nullable: true)]
+    #[Assert\Length(max: self::ERROR_MAX_LENGTH, groups: ['validate:watering_run'])]
+    #[Groups(['read:watering_run'])]
+    private ?string $error = null;
+
+    /** @var Collection<int, WateringStage> */
+    #[ORM\OneToMany(mappedBy: 'run', targetEntity: WateringStage::class, cascade: ['persist'])]
+    #[ORM\OrderBy(['position' => 'ASC'])]
+    #[Groups(['read:watering_run'])]
+    private Collection $stages;
 
     #[ORM\Column(length: 255, nullable: true)]
     #[Assert\Length(max: 255, groups: ['validation:watering_run'])]
     #[Groups(['read:watering_run'])]
-    private ?string $error = null;
+    private ?string $actuatorTopic = null;
+
+    #[ORM\Column(nullable: true)]
+    #[Groups(['read:watering_run'])]
+    private ?\DateTimeImmutable $secondStageDueAt = null;
+
+    #[ORM\Column(nullable: true)]
+    private ?\DateTimeImmutable $safetyProbeAt = null;
+
+    public function __construct()
+    {
+        $this->stages = new ArrayCollection();
+    }
+
+    /** @return Collection<int, WateringStage> */
+    public function getStages(): Collection
+    {
+        return $this->stages;
+    }
+
+    /** @param Collection<int, WateringStage> $stages */
+    public function setStages(Collection $stages): static
+    {
+        $this->stages = new ArrayCollection();
+        foreach ($stages as $stage) {
+            $this->addStage($stage);
+        }
+
+        return $this;
+    }
+
+    public function addStage(WateringStage $stage): static
+    {
+        $stage->setRun($this);
+        $this->stages->add($stage);
+
+        return $this;
+    }
+
+    public function getCurrentStage(): ?WateringStage
+    {
+        $current = null;
+        foreach ($this->stages as $stage) {
+            if (null !== $stage->getRequestedAt()) {
+                $current = $stage;
+            }
+        }
+
+        return $current;
+    }
+
+    public function getActuatorTopic(): ?string
+    {
+        return $this->actuatorTopic;
+    }
+
+    public function setActuatorTopic(?string $topic): static
+    {
+        $this->actuatorTopic = $topic;
+
+        return $this;
+    }
+
+    public function getSecondStageDueAt(): ?\DateTimeImmutable
+    {
+        return $this->secondStageDueAt;
+    }
+
+    public function setSecondStageDueAt(?\DateTimeImmutable $at): static
+    {
+        $this->secondStageDueAt = $at;
+
+        return $this;
+    }
+
+    public function getSafetyProbeAt(): ?\DateTimeImmutable
+    {
+        return $this->safetyProbeAt;
+    }
+
+    public function setSafetyProbeAt(?\DateTimeImmutable $at): static
+    {
+        $this->safetyProbeAt = $at;
+
+        return $this;
+    }
 
     public function getId(): ?int
     {
@@ -201,6 +303,7 @@ class WateringRun
     /** Only a still-open cycle can be overdue. */
     public function isOverdue(\DateTimeImmutable $now): bool
     {
-        return $this->isOpen() && $this->deadlineAt <= $now;
+        return in_array($this->status, [self::STATUS_PENDING, self::STATUS_RUNNING], true)
+            && $this->deadlineAt <= $now;
     }
 }

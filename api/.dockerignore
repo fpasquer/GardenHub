@@ -4,4 +4,12 @@
 .git/
 var/
 vendor/
-docker/
+docker/*
+!docker/nginx/
+docker/nginx/*
+!docker/nginx/default.conf
+!docker/php/
+docker/php/*
+!docker/php/development.ini
+.phpunit.cache/
+.test-reports/

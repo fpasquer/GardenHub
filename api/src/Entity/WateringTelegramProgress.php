@@ -23,7 +23,7 @@ class WateringTelegramProgress
     private int $id = self::SINGLETON_ID;
 
     #[ORM\Column(type: Types::BIGINT, options: ['default' => 0])]
-    #[Assert\PositiveOrZero(groups: ['validation:watering_telegram_progress'])]
+    #[Assert\PositiveOrZero(groups: ['validate:watering_telegram_progress'])]
     #[Groups(['read:watering_telegram_progress'])]
     private int $nextUpdateId = 0;
 

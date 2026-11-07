@@ -11,7 +11,7 @@ use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'gardenhub:watering:request', description: 'Request a manual development watering cycle')]
+#[AsCommand(name: 'gardenhub:watering:request', description: 'Request a manual watering cycle')]
 final class WateringRequestCommand extends Command
 {
     public function __construct(private readonly WateringManager $watering)

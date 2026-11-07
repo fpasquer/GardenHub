@@ -1,0 +1,12 @@
+services:
+  grafana:
+    environment:
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+  tests:
+    build:
+      context: .
+    image: gardenhub-grafana-tests:ci
+
+networks:
+  default:
+    internal: true

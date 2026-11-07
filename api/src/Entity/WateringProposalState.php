@@ -22,12 +22,12 @@ class WateringProposalState
     /** An empty topic marks a counter created before the topic was recorded. */
     #[ORM\Id]
     #[ORM\Column(length: 255, options: ['default' => ''])]
-    #[Assert\Length(max: 255, groups: ['validation:watering_proposal_state'])]
+    #[Assert\Length(max: 255, groups: ['validate:watering_proposal_state'])]
     #[Groups(['read:watering_proposal_state'])]
     private string $actuatorTopic = '';
 
     #[ORM\Column(options: ['default' => 0])]
-    #[Assert\PositiveOrZero(groups: ['validation:watering_proposal_state'])]
+    #[Assert\PositiveOrZero(groups: ['validate:watering_proposal_state'])]
     #[Groups(['read:watering_proposal_state'])]
     private int $promptCount = 0;
 
