@@ -29,6 +29,12 @@ final class WateringStatusCommand extends Command
         foreach ($this->describe($run) as $key => $value) {
             $output->writeln(sprintf('%s: %s', $key, $value ?? '(none)'));
         }
+        foreach ($run->getStages() as $stage) {
+            $output->writeln(sprintf('stage_%d: %s; requested_seconds=%d; started_at=%s; finished_at=%s',
+                $stage->getPosition(), $stage->getStatus(), $stage->getRequestedSeconds(),
+                $this->format($stage->getStartedAt()) ?? '(none)',
+                $this->format($stage->getFinishedAt()) ?? '(none)'));
+        }
         return Command::SUCCESS;
     }
 
@@ -46,6 +52,8 @@ final class WateringStatusCommand extends Command
             'last_state_at' => $this->format($run->getLastStateAt()),
             'last_state' => $run->getLastState(),
             'error' => $run->getError(),
+            'second_stage_due_at' => $this->format($run->getSecondStageDueAt()),
+            'actuator_topic' => $run->getActuatorTopic(),
         ];
     }
 

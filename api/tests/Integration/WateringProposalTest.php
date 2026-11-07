@@ -33,10 +33,89 @@ final class WateringProposalTest extends TestCase
     {
         \newTestPolicy($this->fixture->harness->manager,
             \newTestManager($this->fixture->harness->manager, $this->fixture->publisher,
-                true, 'dev', 67, 134, 1800), ProposalFixture::SIM_TOPIC, 67);
+                true, 'dev', 65, 130, 1800), ProposalFixture::SIM_TOPIC, 65);
         $this->expectException(\LogicException::class);
         \newTestPolicy($this->fixture->harness->manager, $this->fixture->watering,
             ProposalFixture::SIM_TOPIC, 67);
+    }
+
+    public function testPublicationFailurePersistsUncertaintyAndRunLink(): void
+    {
+        $fixture = $this->fixture;
+        $fixture->readings();
+        $fixture->bot->evaluateAndNotify();
+        $id = $fixture->telegram->sent[0][1];
+        $fixture->publisher->fail = true;
+        self::assertSame('uncertain', $fixture->policy->decide($id, 'approve'));
+        self::assertSame('uncertain', $fixture->column('status', $id));
+        self::assertSame('Execution outcome uncertain; manual review required',
+            $fixture->column('failure', $id));
+        $run = (int) $fixture->column('run_id', $id);
+        self::assertGreaterThan(0, $run);
+        $db = $fixture->harness->connection;
+        self::assertSame('uncertain', $db->fetchOne(
+            'SELECT status FROM watering_run WHERE id = ?', [$run],
+        ));
+        $fixture->bot->reconcileMessages();
+        self::assertStringContainsString('Decision: uncertain', $fixture->telegram->edits[0][1]);
+        self::assertSame('sent', $fixture->column('notification_status', $id));
+        $fixture->publisher->fail = false;
+        self::assertSame('ignored', $fixture->policy->decide($id, 'approve'));
+        $fixture->watering->acknowledgeStopped();
+        $fixture->bot->reconcileMessages();
+        self::assertSame('final', $fixture->column('notification_status', $id));
+        $db->executeStatement(
+            'UPDATE watering_run SET requested_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 25 HOUR) WHERE id = ?',
+            [$run],
+        );
+        $db->executeStatement(
+            'UPDATE watering_stage SET requested_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 25 HOUR) WHERE run_id = ? AND requested_at IS NOT NULL',
+            [$run],
+        );
+        $db->executeStatement(
+            'UPDATE watering_control SET last_request_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 25 HOUR), monitor_seen_at = UTC_TIMESTAMP() WHERE id = 1',
+        );
+        self::assertNull($fixture->policy->evaluate());
+        $fixture->bot->evaluateAndNotify();
+        self::assertCount(1, $fixture->telegram->sent);
+        self::assertCount(1, $fixture->publisher->calls);
+        self::assertSame($run, (int) $fixture->column('run_id', $id));
+    }
+
+    public function testApprovedMessageTracksBreakAndCompletionWithoutAnotherApproval(): void
+    {
+        $fixture = $this->fixture;
+        $fixture->readings();
+        $fixture->bot->evaluateAndNotify();
+        [$text, $id] = $fixture->telegram->sent[0];
+        self::assertStringContainsString('65 seconds ON, 30-minute OFF break, 65 seconds ON (130 seconds watering total)', $text);
+        self::assertSame('approved', $fixture->policy->decide($id, 'approve'));
+        $fixture->bot->reconcileMessages();
+        self::assertSame('sent', $fixture->column('notification_status', $id));
+        $fixture->watering->observe('{"state":"ON"}');
+        $fixture->watering->observe('{"state":"OFF"}');
+        $fixture->bot->reconcileMessages();
+        self::assertStringContainsString('Cycle: break', $fixture->telegram->edits[1][1]);
+        self::assertStringContainsString('Second stage due:', $fixture->telegram->edits[1][1]);
+        $fixture->bot->reconcileMessages();
+        self::assertCount(2, $fixture->telegram->edits);
+        $fixture->expireProposal($id, 1800);
+        $fixture->insert(90, 0);
+        $fixture->harness->connection->executeStatement("UPDATE watering_run SET second_stage_due_at = UTC_TIMESTAMP() WHERE status = 'break'");
+        $fixture->watering->heartbeat();
+        $fixture->watering->advanceCycle();
+        $fixture->watering->observe('{"state":"OFF","alarm_1":false,"battery_low":false}');
+        $fixture->watering->advanceCycle();
+        $fixture->watering->observe('{"state":"ON"}');
+        $fixture->watering->observe('{"state":"OFF"}');
+        $fixture->telegram->failEdit = true;
+        $fixture->bot->reconcileMessages();
+        self::assertSame('sent', $fixture->column('notification_status', $id));
+        $fixture->telegram->failEdit = false;
+        $fixture->bot->reconcileMessages();
+        self::assertSame('final', $fixture->column('notification_status', $id));
+        self::assertStringContainsString('Cycle: completed', $fixture->telegram->edits[2][1]);
+        self::assertCount(3, $fixture->publisher->calls);
     }
 
     #[DataProvider('notificationDecisions')]
@@ -71,7 +150,8 @@ final class WateringProposalTest extends TestCase
         self::assertCount(1, $edits);
         self::assertSame(strtok($text, "\n"), strtok($edits[0][1], "\n"));
         self::assertStringContainsString('Decision: '.$decision, $edits[0][1]);
-        self::assertSame('final', $fixture->column('notification_status', $id));
+        self::assertSame('approved' === $decision ? 'sent' : 'final',
+            $fixture->column('notification_status', $id));
     }
 
     public static function notificationDecisions(): iterable
@@ -265,19 +345,19 @@ final class WateringProposalTest extends TestCase
         $fixture->heartbeat();
         $fixture->bot->process(ProposalFixture::callback(102, $renewal));
         self::assertSame('approved', $fixture->column('status', $renewal));
-        $fixture->watering->observe('{"state":"ON"}');
-        $fixture->watering->observe('{"state":"OFF"}');
+        $fixture->completeCycle();
         self::assertSame('completed', $fixture->watering->latest()?->getStatus());
         $fixture->expireProposal($renewal, 1800);
         $fixture->bot->evaluateAndNotify();
         self::assertCount(2, $fixture->telegram->sent);
         $fixture->harness->connection->executeStatement('UPDATE watering_run SET requested_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 25 HOUR)');
+        $fixture->harness->connection->executeStatement('UPDATE watering_stage SET requested_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 25 HOUR)');
         $fixture->harness->connection->executeStatement('UPDATE watering_control SET last_request_at = NULL WHERE id = 1');
         $fixture->heartbeat();
         $fixture->bot->evaluateAndNotify();
         self::assertCount(3, $fixture->telegram->sent);
         self::assertStringNotContainsString('renewed', $fixture->telegram->sent[2][0]);
-        self::assertCount(1, $fixture->publisher->calls);
+        self::assertCount(3, $fixture->publisher->calls);
     }
 
     public function testRestartAfterLongDowntimeCreatesOneCurrentRenewal(): void

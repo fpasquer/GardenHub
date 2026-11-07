@@ -17,6 +17,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
+use Symfony\Component\Clock\MockClock;
 
 #[Group('functional_gardenhub-watering-mqtt')]
 final class WateringMqttTest extends TestCase
@@ -53,11 +54,71 @@ final class WateringMqttTest extends TestCase
                 $subscriber->loopOnce(microtime(true), true);
                 usleep(50000);
             }
+
             self::assertNotEmpty($received);
             self::assertSame(['watering_times' => 3, 'state' => 'ON'], json_decode($received[0], true, 512, JSON_THROW_ON_ERROR));
         } finally {
             $subscriber->disconnect();
         }
+    }
+
+    public function testMonitorDispatchesDueStageOnlyAfterLiveSafeOffConfirmation(): void
+    {
+        $clock = new MockClock(\App\Watering\UtcClock::now());
+        $manager = \newTestManager($this->harness->manager, $this->publisher, clock: $clock);
+        $manager->heartbeat();
+        $id = $manager->requestCycle(MqttWateringPublisher::TOPIC,
+            static function (\DateTimeImmutable $now, \App\Entity\WateringRun $run): void {});
+        $client = $this->client('two-stage-state-double');
+        $phase = 0;
+        $deadline = microtime(true) + 15;
+        $runner = new WateringMonitorRunner($manager, $this->publisher,
+            new NullLogger(), $this->configuration('mqtt', 1883));
+        try {
+            $client->publish(MqttWateringPublisher::TOPIC,
+                '{"state":"OFF","alarm_1":false,"battery_low":false}', 0, true);
+            $runner->runConnectionAttempt(function () use ($client, $manager, $clock, &$phase, $deadline): bool {
+                if (microtime(true) > $deadline) {
+                    throw new \RuntimeException('Two-stage MQTT test exceeded its bound.');
+                }
+
+                return $this->driveCycle($client, $manager, $clock, $phase);
+            });
+            self::assertSame('completed', \freshRun($this->harness->manager, $id)->getStatus());
+            self::assertSame([['watering_times' => 65, 'state' => 'ON'],
+                ['state' => 'OFF'], ['watering_times' => 65, 'state' => 'ON']], $this->publisher->calls);
+            self::assertNull($this->heartbeat());
+        } finally {
+            $client->publish(MqttWateringPublisher::TOPIC, '', 0, true);
+            $client->disconnect();
+        }
+    }
+
+    private function driveCycle(MqttClient $client, \App\Watering\WateringManager $manager, MockClock $clock, int &$phase): bool
+    {
+        $run = $manager->latest();
+        $state = $run->getStatus();
+        $payload = null;
+        if (0 === $phase || (4 === $phase && 'pending' === $state)) {
+            $payload = '{"state":"ON"}';
+            ++$phase;
+        } elseif ((1 === $phase || 5 === $phase) && 'running' === $state) {
+            $clock->sleep(65);
+            $payload = '{"state":"OFF","alarm_1":false,"battery_low":false}';
+            ++$phase;
+        } elseif (2 === $phase && 'break' === $state) {
+            $clock->sleep(1800);
+            ++$phase;
+        } elseif (3 === $phase && count($this->publisher->calls) >= 2) {
+            $payload = '{"state":"OFF","alarm_1":false,"battery_low":false}';
+            ++$phase;
+        }
+        $manager->heartbeat();
+        if (null !== $payload) {
+            $client->publish(MqttWateringPublisher::TOPIC, $payload, 0, false);
+        }
+
+        return 6 === $phase && 'completed' === $state;
     }
 
     public function testWithheldPubackTimesOutAndPublicationIsNonRetainedQosOne(): void

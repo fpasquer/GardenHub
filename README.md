@@ -235,13 +235,14 @@ credential fallback. `WATERING_DEV_USERNAME`/`WATERING_DEV_PASSWORD` remain
 compatible only through development Compose mappings; neutral names take
 precedence. Outside Compose, explicitly provide the neutral names and topic.
 
-Limits remain configurable and unchanged: `WATERING_MAX_SECONDS=30`,
-`WATERING_DAILY_SECONDS=120` (rolling 24 hours),
-`WATERING_COOLDOWN_SECONDS=60`, `WATERING_PROPOSAL_DURATION_SECONDS=3`,
+Default limits are `WATERING_MAX_SECONDS=65` per activation,
+`WATERING_DAILY_SECONDS=130` (rolling 24 hours),
+`WATERING_COOLDOWN_SECONDS=60`, `WATERING_PROPOSAL_DURATION_SECONDS=65`,
 `WATERING_PROPOSAL_THRESHOLD=15`, freshness/max-gap 35 minutes, validity
 30 minutes. Use the independently approved hardware calibration and safety
-limits; switching to production does not increase limits or change duration
-to 67 seconds. Interactive proposals require the token and both authorized
+limits; automatic proposals authorize two 65-second activations separated by
+a 30-minute OFF break in both development and production. Manual requests remain
+single activations within the shared limits. Interactive proposals require the token and both authorized
 IDs even if `TELEGRAM_ENABLED=false` (that flag controls logging, not proposals).
 
 ### Cutover and startup
@@ -428,7 +429,8 @@ docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
 ```
 
 The monitor should observe ON followed by OFF and record `completed`. A second
-request during the cycle is rejected; completed runs have a 60-second cooldown.
+request during the cycle is rejected; requests have a 60-second cooldown from
+the most recent command claim.
 Requests also fail when the monitor is absent or its heartbeat is stale; the
 heartbeat only starts once the monitor's state subscription is confirmed by
 the broker (SUBACK), not merely once its MQTT loop is running, and it is
@@ -478,9 +480,10 @@ readings are no more than 35 minutes apart, and no watering run was requested
 in the preceding 24 hours. These limits allow the sensor's normal 20 minute
 reporting interval. A run in `uncertain` or `timed_out` state still counts as an
 attempt. No previous run satisfies the 24 hour check. The proposal expires
-after 30 minutes and offers a three second cycle by default for the simulator.
-For hardware, set the duration to the measured calibration and keep it within
-`WATERING_MAX_SECONDS`; an invalid combination now prevents the poller from
+after 30 minutes and offers one cycle of **65 seconds ON, 30 minutes OFF,
+then 65 seconds ON**, including for the simulator.
+`WATERING_PROPOSAL_DURATION_SECONDS` must be 65, and each stage must fit
+`WATERING_MAX_SECONDS`; an invalid combination prevents the poller from
 starting. Configure the
 threshold, freshness, gap, validity, and duration with
 `WATERING_PROPOSAL_THRESHOLD`,
@@ -494,7 +497,64 @@ The default values are in [api/.env](api/.env).
 | --- | --- | --- |
 | `WATERING_PROPOSAL_VALIDITY_MINUTES` | Telegram approval validity | 30 minutes |
 | `WATERING_PROPOSAL_RETRY_SECONDS` | Delay after expiration before renewal | 1800 seconds |
-| `WATERING_PROPOSAL_DURATION_SECONDS` | Requested pump runtime | 3 seconds |
+| `WATERING_PROPOSAL_DURATION_SECONDS` | Runtime of each of the two automatic stages | 65 seconds |
+| `WATERING_MAX_SECONDS` | Maximum duration of a single activation | 65 seconds |
+| `WATERING_DAILY_SECONDS` | Rolling budget, including undispatched reservations | 130 seconds |
+
+### Two-stage automatic cycle and recovery
+
+One Approve callback authorizes the entire 130-second cycle. Stage one must
+report ON and then OFF before its deadline; the 1,800-second break starts at
+that confirmed OFF. Duplicate OFF reports do not reset the break. The monitor
+uses persisted due timestamps rather than a blocking sleep, and the active
+cycle gate stays reserved throughout the break. Manual requests, another
+automatic cycle, and guarded deployment are refused until completion or safe
+recovery. Stage two also requires observed ON before its final OFF can complete
+the cycle.
+
+Before stage two, the monitor sends the existing OFF command as a safe state
+confirmation request. It requires a fresh, non-retained OFF report with explicit
+`alarm_1=false` and a healthy battery before sending another ON. A pump that
+publishes `battery_low` is judged on that flag, which must be `false`. The
+ThirdReality Smart Watering Kit never publishes it, so its `battery` percentage
+is used instead: it must be a number from 0 to 100 and above 20
+(`ActuatorSafety::LOW_BATTERY_PERCENT`); 20 or less counts as low battery. The
+probe clears earlier live evidence, including reports received in the same
+second. Confirmation must arrive before the 10-second deadline and be no more
+than 5 seconds old when stage two is claimed. A heartbeat alone or an old
+retained report is insufficient. If the pump does not report `alarm_1` and a
+valid battery indicator in response, continuation fails closed rather than
+assuming safety. Verify this behavior with the outlet in a measured vessel
+before plant use.
+
+Monitor downtime defers continuation. Reconnection clears prior readiness and
+safety evidence, requests a new OFF confirmation when due, and may resume the
+undispatched stage even if it is late. There is no extra lateness cutoff. The
+original approval and dry-soil eligibility are not re-evaluated for stage two;
+the actuator topic, enablement, monitor readiness, safety, per-stage duration,
+and rolling budget still apply. A changed actuator never receives a continuation
+or safety OFF command belonging to the original cycle.
+
+The complete 130 seconds are reserved before stage one. The remaining 65-second
+reservation does not disappear when downtime extends beyond 24 hours. Each
+dispatched stage then counts at its own command-claim timestamp, without also
+charging the aggregate cycle. Each dispatched stage also refreshes the cooldown,
+including continuation after prolonged downtime. If changed limits prevent
+continuation after safe OFF confirmation, the second stage is cancelled and only its undispatched
+reservation is released.
+
+An alarm, unexpected ON during the break, missing confirmation after the
+10-second probe deadline, or uncertain ON delivery blocks the cycle for manual
+review. OFF safety retries remain enabled for the original configured actuator.
+After independently confirming the original pump is OFF, the existing
+acknowledgement command releases the gate and cancels the undispatched stage.
+It never retries an uncertain ON or restarts the remaining stage.
+
+The proposal message describes both stages before approval and is edited to
+show progress, the break deadline, completion, cancellation, or blocking.
+`gardenhub:watering:status` shows the cycle and individual stage timestamps.
+The existing proposal retry interval still governs renewal after an *unapproved
+proposal expires*; it is unrelated to the internal cycle break.
 
 Each proposal stores the `WATERING_MQTT_TOPIC` it was created for and its
 Telegram text is rendered from that stored topic. If the configured topic later
@@ -519,10 +579,9 @@ The deadline comes from the persisted expiration, so restarting does not reset
 the delay, and downtime produces one fresh request rather than a catch-up backlog.
 
 Renewal reuses the watering safety checks, including active or blocked cycles,
-monitor freshness, cooldown, daily budget, and actuator availability. Temporary
+monitor freshness, cooldown, full-cycle daily budget, and actuator availability. Temporary
 failures defer eligibility without changing the expired proposal or its retry
-deadline; subsequent polling passes check again. Pump duration and safety limits
-are unchanged. Approval or explicit rejection ends that renewal chain. A new,
+deadline; subsequent polling passes check again. Approval or explicit rejection ends that renewal chain. A new,
 independent request may start after 24 hours from the watering attempt or rejection
 decision respectively, if eligibility and safety checks pass. Failed or uncertain
 execution and invalidated proposals are not automatically renewed. A changed
@@ -535,7 +594,10 @@ proposal expiry, and the 24 hour rule under the watering reservation lock;
 cycle, duration, and daily budget checks. Rejected, unauthorized, replayed,
 expired, and unapproved proposals never run the configured actuator. If an approval is
 interrupted or command delivery is uncertain, it stays blocked for manual
-review; pressing the button again never retries the cycle. Check the proposal
+review; pressing the button again never retries the cycle. When the initial ON
+delivery is uncertain, the terminal uncertain proposal and its reserved run link
+are persisted. Acknowledging the stopped run does not automatically renew that
+dry episode. Check the proposal
 and watering run tables before any manual recovery. A failed Telegram
 send may have succeeded remotely, so that same proposal is not sent again;
 after expiration it can still qualify for a fresh renewed request. A proposal
@@ -545,7 +607,14 @@ message edit is retried on the next polling pass.
 To deploy this behavior, rebuild and recreate application services through the
 existing deployment workflow with the watering profiles enabled. Optionally set
 `WATERING_PROPOSAL_RETRY_SECONDS=1800` in the untracked root environment file;
-Compose supplies the default otherwise. No database migration is required.
+Compose supplies the default otherwise. Apply the new two-stage migration
+through the existing guarded deployment workflow. It preserves historical runs
+and decisions, invalidates pending single-stage proposals, and clears their
+device-and-actuator episode counters so a fresh two-stage proposal can be approved.
+Legacy NULL-topic proposals match only the empty-topic counter; other actuators'
+decisions and counters remain intact. Previously sent buttons cannot silently
+authorize the expanded cycle. Update old explicit
+duration and safety-limit overrides; incompatible settings fail visibly.
 Already-expired proposals, including those previously blocked by the two-prompt
 limit, may produce one eligible renewed request after deployment. Production
 daemons must retain `APP_ENV=prod`.
@@ -562,18 +631,19 @@ reuse the simulator account for hardware.
 In GardenHub's untracked root `.env` on the Pi, select the hardware topic and
 the dedicated account. The calibration below is based on a measured 500 ml in
 67 seconds; verify it again with the installed tubing and a measured vessel
-before using the plant. The default limits in `api/.env` and `compose-dev.yaml`
-remain simulator-safe and must be explicitly overridden for this test:
+before using the plant. Calibration remains 67 seconds = 500 ml; it is not a
+duration setting for automatic proposals. Automatic cycles use the same two
+65-second stages in every environment and reserve 130 seconds:
 
 ```dotenv
 WATERING_ENABLED=true
 WATERING_MQTT_TOPIC=zigbee2mqtt/avocado-watering
 WATERING_MQTT_USERNAME=watering_hw_dev
 WATERING_MQTT_PASSWORD=<separate-hardware-account-password>
-WATERING_MAX_SECONDS=67
-WATERING_DAILY_SECONDS=134
+WATERING_MAX_SECONDS=65
+WATERING_DAILY_SECONDS=130
 WATERING_COOLDOWN_SECONDS=1800
-WATERING_PROPOSAL_DURATION_SECONDS=67
+WATERING_PROPOSAL_DURATION_SECONDS=65
 ```
 
 Stop the simulator if it is running. Recreate the API, monitor, and proposal
@@ -597,7 +667,7 @@ Run it only with the outlet in a measured vessel:
 
 ```bash
 docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  exec gardenhub-api php bin/console gardenhub:watering:request 67
+  exec gardenhub-api php bin/console gardenhub:watering:request 65
 docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
   exec gardenhub-api php bin/console gardenhub:watering:status
 ```
@@ -1056,7 +1126,7 @@ report, alongside **GardenHub — Garden Overview**. Its direct path is
 available too.
 
 The **Run outcomes** chart above the table shows stacked daily counts for
-completed, timed-out, uncertain, reviewed, pending, and running runs. Counts use
+completed, timed-out, uncertain, reviewed, pending, running, break, and cancelled cycles. Counts use
 each run's current status and include runs without a valid watering interval.
 Daily buckets use UTC calendar days; timestamp labels use the dashboard timezone.
 The chart uses the same time-range filter as the table, which stays at the bottom.
@@ -1064,14 +1134,20 @@ The chart uses the same time-range filter as the table, which stays at the botto
 The report includes one row per `watering_run`, newest first,
 within the dashboard time range. The range uses `started_at`, falling back to
 `requested_at` for runs that never started; timestamps use the dashboard timezone.
-Actual duration is the recorded end minus start, not `requested_seconds`.
+For automatic cycles, actual duration sums the two confirmed physical-stage
+intervals, never the 30-minute break. For legacy/manual runs, it remains the
+recorded end minus start, not `requested_seconds`. Stage status and the second
+stage's due time appear alongside the logical cycle.
 Estimated volume uses the pump calibration **67 seconds = 500 ml**, rounded to
 one decimal place: 67 seconds → 500.0 ml, 10 seconds → 74.6 ml, and 3 seconds → 22.4 ml.
 
-Only `completed` runs with both timestamps present and a nonnegative interval
+Only `completed` automatic cycles with two completed, valid stage intervals,
+or legacy/manual runs with both timestamps present and a nonnegative interval,
 have duration and volume values. Other runs remain visible with empty calculated
 cells. In particular, `reviewed.finished_at` records an operator acknowledgement,
-not the actual watering end. No device joins or production schema changes are used.
+not the actual watering end. Calibration is unchanged: a cycle with two
+65-second confirmed intervals reports 130 seconds and approximately 970.1 ml,
+even though its elapsed cycle time includes the 30-minute break.
 
 Dashboard files are checked by the provisioner every 30 seconds. To explicitly
 refresh Grafana after updating the file, run `make deploy-grafana`; this only

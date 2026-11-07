@@ -40,12 +40,12 @@ final class WateringProductionTest extends TestCase
             'WATERING_DEV_PASSWORD' => 'must-not-fallback', 'WATERING_MQTT_HOST' => 'mqtt',
             'WATERING_MQTT_PORT' => '1883', 'TELEGRAM_ENABLED' => 'false',
             'TELEGRAM_BOT_TOKEN' => 'synthetic', 'WATERING_TELEGRAM_USER_ID' => '123',
-            'WATERING_TELEGRAM_CHAT_ID' => '456', 'WATERING_MAX_SECONDS' => '30',
-            'WATERING_DAILY_SECONDS' => '120', 'WATERING_COOLDOWN_SECONDS' => '60',
+            'WATERING_TELEGRAM_CHAT_ID' => '456', 'WATERING_MAX_SECONDS' => '65',
+            'WATERING_DAILY_SECONDS' => '130', 'WATERING_COOLDOWN_SECONDS' => '60',
             'WATERING_PROPOSAL_THRESHOLD' => '15', 'WATERING_PROPOSAL_FRESHNESS_MINUTES' => '35',
             'WATERING_PROPOSAL_MAX_GAP_MINUTES' => '35',
             'WATERING_PROPOSAL_RETRY_SECONDS' => '1800',
-            'WATERING_PROPOSAL_VALIDITY_MINUTES' => '30', 'WATERING_PROPOSAL_DURATION_SECONDS' => '3'];
+            'WATERING_PROPOSAL_VALIDITY_MINUTES' => '30', 'WATERING_PROPOSAL_DURATION_SECONDS' => '65'];
         $this->environment = new ProcessEnvironment(array_keys($values));
         $this->configure($values);
     }

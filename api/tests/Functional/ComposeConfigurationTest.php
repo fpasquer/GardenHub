@@ -104,8 +104,8 @@ final class ComposeConfigurationTest extends TestCase
             'gardenhub-watering-proposals',
         ], $this->select($model)));
         $environment = $model['services']['gardenhub-api']['environment'];
-        foreach (['MAX_SECONDS' => '30', 'DAILY_SECONDS' => '120',
-            'COOLDOWN_SECONDS' => '60', 'PROPOSAL_DURATION_SECONDS' => '3'] as $suffix => $expected) {
+        foreach (['MAX_SECONDS' => '65', 'DAILY_SECONDS' => '130',
+            'COOLDOWN_SECONDS' => '60', 'PROPOSAL_DURATION_SECONDS' => '65'] as $suffix => $expected) {
             self::assertSame($expected, $environment['WATERING_'.$suffix]);
         }
     }

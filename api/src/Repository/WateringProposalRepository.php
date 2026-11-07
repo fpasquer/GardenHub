@@ -111,9 +111,10 @@ class WateringProposalRepository extends ServiceEntityRepository
     public function finalMessages(): array
     {
         return $this->createQueryBuilder('p')
-            ->addSelect('d', 'r')
+            ->addSelect('d', 'r', 's')
             ->join('p.device', 'd')
             ->leftJoin('p.run', 'r')
+            ->leftJoin('r.stages', 's')
             ->where('p.messageId IS NOT NULL')
             ->andWhere('p.notificationStatus = :sent')
             ->andWhere('p.status NOT IN (:open)')
@@ -168,19 +169,32 @@ class WateringProposalRepository extends ServiceEntityRepository
             ->execute();
     }
 
-    /** Ends an approved execution; only an 'executing' proposal can be finished. */
+    public function recordRenderedMessage(int $id, string $text): void
+    {
+        $this->createQueryBuilder('p')->update()
+            ->set('p.renderedText', ':text')
+            ->where('p.id = :id')
+            ->setParameter('text', $text)->setParameter('id', $id)
+            ->getQuery()->execute();
+    }
+
+    /** Finishes a claim; uncertain delivery can invalidate a committed approval. */
     public function finishExecution(int $id, string $status, ?string $failure, ?int $runId): int
     {
+        $from = [WateringProposal::STATUS_EXECUTING];
+        if (WateringProposal::STATUS_UNCERTAIN === $status) {
+            $from[] = WateringProposal::STATUS_APPROVED;
+        }
         $builder = $this->createQueryBuilder('p')
             ->update()
             ->set('p.status', ':status')
             ->set('p.failure', ':failure')
             ->where('p.id = :id')
-            ->andWhere('p.status = :executing')
+            ->andWhere('p.status IN (:from)')
             ->setParameter('status', $status)
             ->setParameter('failure', $failure)
             ->setParameter('id', $id)
-            ->setParameter('executing', WateringProposal::STATUS_EXECUTING);
+            ->setParameter('from', $from);
         if (null !== $runId) {
             $builder->set('p.run', ':run')
                 ->setParameter('run', $this->getEntityManager()->getReference(WateringRun::class, $runId));

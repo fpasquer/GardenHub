@@ -92,8 +92,8 @@ final class GrafanaHistoryTest extends TestCase
     private function assertHistoryRows(array $frame): void
     {
         self::assertSame(['Run ID', 'Status', 'Started at', 'Ended at',
-            'Actual duration (seconds)', 'Estimated volume (ml)'], array_column($frame['schema']['fields'], 'name'));
-        self::assertSame(['number', 'string', 'time', 'time', 'number', 'number'], array_column($frame['schema']['fields'], 'type'));
+            'Actual duration (seconds)', 'Estimated volume (ml)', 'Stages', 'Second stage due at'], array_column($frame['schema']['fields'], 'name'));
+        self::assertSame(['number', 'string', 'time', 'time', 'number', 'number', 'string', 'time'], array_column($frame['schema']['fields'], 'type'));
         self::assertSame([20, 19, 14, 13, 12, 11, 10, 9, 8, 21, 7, 6, 5, 4, 3, 2, 1, 18], $frame['data']['values'][0]);
         $rows = $this->subject->rows($frame);
         usort($rows, static fn (array $first, array $second): int => $first[0] <=> $second[0]);
@@ -131,13 +131,45 @@ final class GrafanaHistoryTest extends TestCase
         self::assertSame('table', $chart['targets'][0]['format']);
         $this->assertRunOnlySql($chart);
         $frame = $this->subject->frame($chart, 1767225600000, 1767229200000);
-        self::assertSame(['Day', 'Completed', 'Timed out', 'Uncertain', 'Reviewed', 'Pending', 'Running'], array_column($frame['schema']['fields'], 'name'));
-        self::assertSame(['time', 'number', 'number', 'number', 'number', 'number', 'number'], array_column($frame['schema']['fields'], 'type'));
-        self::assertSame([[1767225600000, 11, 1, 1, 1, 3, 1]], $this->subject->rows($frame));
-        self::assertSame([[1767225600000, 2, 0, 0, 0, 0, 0]], $this->subject->rows($this->subject->frame($chart, 1767225720000, 1767225780000)));
+        self::assertSame(['Day', 'Completed', 'Timed out', 'Uncertain', 'Reviewed', 'Pending', 'Running', 'Break', 'Cancelled'], array_column($frame['schema']['fields'], 'name'));
+        self::assertSame(['time', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number'], array_column($frame['schema']['fields'], 'type'));
+        self::assertSame([[1767225600000, 11, 1, 1, 1, 3, 1, 0, 0]], $this->subject->rows($frame));
+        self::assertSame([[1767225600000, 2, 0, 0, 0, 0, 0, 0, 0]], $this->subject->rows($this->subject->frame($chart, 1767225720000, 1767225780000)));
         self::assertSame([], $this->subject->rows($this->subject->frame($chart, 1767139200000, 1767142800000)));
         $this->subject->database->exec('INSERT INTO watering_run (id, requested_seconds, status, requested_at, deadline_at, started_at, finished_at) SELECT id + 100, requested_seconds, status, DATE_ADD(requested_at, INTERVAL 1 DAY), DATE_ADD(deadline_at, INTERVAL 1 DAY), DATE_ADD(started_at, INTERVAL 1 DAY), DATE_ADD(finished_at, INTERVAL 1 DAY) FROM watering_run WHERE id IN (1,9,10,11,12,19)');
-        self::assertSame([[1767225600000, 11, 1, 1, 1, 4, 1], [1767312000000, 1, 1, 1, 1, 1, 1]],
+        self::assertSame([[1767225600000, 11, 1, 1, 1, 4, 1, 0, 0], [1767312000000, 1, 1, 1, 1, 1, 1, 0, 0]],
             $this->subject->rows($this->subject->frame($chart, 1767225600000, 1767315600000)));
+    }
+
+    public function testTwoStageCycleExcludesBreakAndRejectsInvalidIntervals(): void
+    {
+        $dashboard = $this->subject->dashboard('gardenhub-watering-history');
+        $table = $this->panel($dashboard, 'Watering history');
+        $db = $this->subject->database;
+        $db->exec('DELETE FROM watering_run');
+        $db->exec("INSERT INTO watering_run
+            (id, requested_seconds, status, requested_at, deadline_at, started_at, finished_at, actuator_topic, second_stage_due_at)
+            VALUES (300, 130, 'completed', '2026-01-01 00:00:00', '2026-01-01 00:32:20',
+            '2026-01-01 00:00:00', '2026-01-01 00:32:10', 'test/pump', '2026-01-01 00:31:05')");
+        $db->exec("INSERT INTO watering_stage (run_id, position, requested_seconds, status, started_at, finished_at)
+            VALUES (300, 1, 65, 'completed', '2026-01-01 00:00:00', '2026-01-01 00:01:05'),
+                   (300, 2, 65, 'completed', '2026-01-01 00:31:05', '2026-01-01 00:32:10')");
+        $row = $this->subject->rows($this->subject->frame($table, 1767225600000, 1767229200000))[0];
+        self::assertSame(130, $row[4]);
+        self::assertEquals(970.1, $row[5]);
+        self::assertSame('1: completed, 2: completed', $row[6]);
+        $db->exec("UPDATE watering_stage SET finished_at = NULL WHERE position = 2");
+        self::assertNull($this->subject->rows($this->subject->frame($table, 1767225600000, 1767229200000))[0][4]);
+        foreach (['break', 'cancelled', 'uncertain', 'reviewed'] as $status) {
+            $db->exec("UPDATE watering_run SET status = '$status' WHERE id = 300");
+            self::assertNull($this->subject->rows($this->subject->frame($table, 1767225600000, 1767229200000))[0][4]);
+        }
+        $chart = $this->panel($dashboard, 'Run outcomes');
+        $db->exec("UPDATE watering_run SET status = 'break' WHERE id = 300");
+        self::assertSame([[1767225600000, 0, 0, 0, 0, 0, 0, 1, 0]],
+            $this->subject->rows($this->subject->frame($chart, 1767225600000, 1767229200000)));
+        $db->exec("UPDATE watering_run SET status = 'cancelled' WHERE id = 300");
+        self::assertSame([[1767225600000, 0, 0, 0, 0, 0, 0, 0, 1]],
+            $this->subject->rows($this->subject->frame($chart, 1767225600000, 1767229200000)));
     }
 }

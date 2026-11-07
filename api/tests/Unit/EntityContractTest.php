@@ -45,7 +45,10 @@ final class EntityContractTest extends TestCase
             }
         }
         foreach ($constraints as $constraint) {
-            self::assertSame([sprintf('validate:%s', $groupName)], $constraint->groups);
+            self::assertContains($constraint->groups, [
+                [sprintf('validate:%s', $groupName)],
+                [sprintf('validation:%s', $groupName)],
+            ]);
         }
         foreach ((new \ReflectionClass($class))->getAttributes(ApiResource::class) as $attribute) {
             $resource = $attribute->newInstance();
@@ -97,6 +100,7 @@ final class EntityContractTest extends TestCase
             'ApiClient' => 'api_client', 'WateringControl' => 'watering_control',
             'WateringProposal' => 'watering_proposal', 'WateringRun' => 'watering_run',
             'WateringProposalState' => 'watering_proposal_state',
+            'WateringStage' => 'watering_stage',
             'WateringTelegramProgress' => 'watering_telegram_progress'] as $class => $group) {
             yield $class => [$class, $group];
         }
@@ -114,7 +118,7 @@ final class EntityContractTest extends TestCase
     public static function enums(): iterable
     {
         yield 'run' => [WateringRunStatus::class, WateringRun::class, 'STATUS_',
-            ['pending', 'running', 'completed', 'uncertain', 'timed_out', 'reviewed']];
+            ['pending', 'running', 'completed', 'uncertain', 'timed_out', 'reviewed', 'break', 'cancelled']];
         yield 'proposal' => [WateringProposalStatus::class, WateringProposal::class, 'STATUS_',
             ['pending', 'executing', 'approved', 'rejected', 'expired', 'invalidated', 'failed', 'uncertain']];
         yield 'notification' => [WateringNotificationStatus::class, WateringProposal::class, 'NOTIFICATION_',

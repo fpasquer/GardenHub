@@ -16,6 +16,7 @@ final class RecordingTelegramGateway implements InterfaceTelegramGateway
     public bool $failRemoveButtons = false;
     public int $polls = 0;
     public bool $failSend = false;
+    public bool $failEdit = false;
 
     public function send(string $text, int $proposalId): int
     {
@@ -40,6 +41,9 @@ final class RecordingTelegramGateway implements InterfaceTelegramGateway
 
     public function edit(int $messageId, string $text): void
     {
+        if ($this->failEdit) {
+            throw new \RuntimeException('Telegram message edit failed.');
+        }
         $this->edits[] = [$messageId, $text];
     }
 

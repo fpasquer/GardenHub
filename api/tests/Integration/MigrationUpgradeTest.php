@@ -6,7 +6,9 @@ namespace App\Tests\Integration;
 
 use App\Tests\Support\MigrationFixtures;
 use App\Tests\Support\MigrationHarness;
+use App\Tests\Support\ProposalFixture;
 use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Uid\Uuid;
@@ -72,8 +74,107 @@ final class MigrationUpgradeTest extends TestCase
             $definition = $this->harness->connection->fetchAssociative(sprintf("SHOW COLUMNS FROM measurement LIKE '%s'", $column));
             self::assertSame('NO', $definition['Null']);
         }
+
         $this->harness->migrate();
         self::assertCount(0, $this->harness->factory->getMigrationStatusCalculator()->getNewMigrations());
+    }
+
+    public function testFreshInstallMatchesDoctrineMapping(): void
+    {
+        $this->harness->migrate();
+        self::assertStringContainsString(
+            'Nothing to update',
+            $this->harness->schemaDiff(),
+        );
+    }
+
+    public function testCycleUpgradeInvalidatesOnlyPendingApprovalTerms(): void
+    {
+        $this->harness->migrate('Version20261012120000');
+        $db = $this->harness->connection;
+        $now = gmdate('Y-m-d H:i:s');
+        $db->insert('device', ['name' => 'cycle-upgrade', 'created_at' => $now]);
+        $device = (int) $db->lastInsertId();
+        $db->insert('watering_run', ['requested_seconds' => 3, 'status' => 'completed',
+            'requested_at' => $now, 'deadline_at' => $now]);
+        $run = (int) $db->lastInsertId();
+        foreach (['pending', 'approved'] as $status) {
+            $db->insert('watering_proposal', ['device_id' => $device,
+                'status' => $status, 'created_at' => $now, 'expires_at' => $now,
+                'duration_seconds' => 3, 'readings_json' => '[]',
+                'notification_status' => 'sent', 'message_id' => 10,
+                'run_id' => 'approved' === $status ? $run : null,
+                'actuator_topic' => 'test/pump']);
+        }
+        $db->insert('watering_proposal_state', ['device_id' => $device,
+            'actuator_topic' => 'test/pump', 'prompt_count' => 1]);
+        $this->harness->step('Version20261102180000');
+        self::assertSame(['invalidated', 'approved'],
+            $db->fetchFirstColumn('SELECT status FROM watering_proposal ORDER BY id'));
+        self::assertSame([1, 1], array_map('intval',
+            $db->fetchFirstColumn('SELECT stage_count FROM watering_proposal ORDER BY id')));
+        self::assertSame($run, (int) $db->fetchOne("SELECT run_id FROM watering_proposal WHERE status = 'approved'"));
+        self::assertSame(0, (int) $db->fetchOne('SELECT COUNT(*) FROM watering_proposal_state'));
+        $this->harness->reboot();
+        $this->harness->step('Version20261102180000', false);
+        $this->harness->reboot();
+        $this->harness->step('Version20261102180000');
+        $this->harness->reboot();
+        $db = $this->harness->connection;
+        $db->insert('watering_stage', ['run_id' => $run, 'position' => 1,
+            'requested_seconds' => 65, 'status' => 'scheduled']);
+        [$status, $text] = $this->harness->step('Version20261102180000', false, false);
+        self::assertNotSame(0, $status);
+        self::assertStringContainsString('Cannot discard recorded two-stage watering history', $text);
+    }
+
+    #[DataProvider('invalidatedActuatorTopics')]
+    public function testCycleUpgradeKeepsUnrelatedActuatorEpisodeCounters(
+        ?string $topic, string $counterTopic,
+    ): void {
+        $this->harness->migrate('Version20261012120000');
+        $db = $this->harness->connection;
+        $now = gmdate('Y-m-d H:i:s');
+        $db->insert('device', ['name' => 'cycle-upgrade', 'created_at' => $now]);
+        $device = (int) $db->lastInsertId();
+        foreach ([['pending', $topic], ['rejected', ProposalFixture::HW_TOPIC]] as [$status, $actuator]) {
+            $db->insert('watering_proposal', ['device_id' => $device,
+                'status' => $status, 'created_at' => $now, 'expires_at' => $now,
+                'duration_seconds' => 3, 'readings_json' => '[]',
+                'decided_at' => 'rejected' === $status ? $now : null,
+                'notification_status' => 'sent', 'actuator_topic' => $actuator]);
+        }
+        $states = [
+            ProposalFixture::SIM_TOPIC => 1,
+            ProposalFixture::HW_TOPIC => 2,
+            '' => 3,
+        ];
+        foreach ($states as $actuator => $count) {
+            $db->insert('watering_proposal_state', ['device_id' => $device,
+                'actuator_topic' => $actuator, 'prompt_count' => $count,
+                'last_prompt_at' => $now]);
+        }
+        $this->harness->step('Version20261102180000');
+        self::assertSame(['invalidated', 'rejected'], $db->fetchFirstColumn(
+            'SELECT status FROM watering_proposal ORDER BY id',
+        ));
+        self::assertSame($now, $db->fetchOne(
+            "SELECT decided_at FROM watering_proposal WHERE status = 'rejected'",
+        ));
+        unset($states[$counterTopic]);
+        ksort($states);
+        self::assertSame($states, array_map('intval', $db->fetchAllKeyValue(
+            'SELECT actuator_topic, prompt_count FROM watering_proposal_state ORDER BY actuator_topic',
+        )));
+        self::assertSame([$now, $now], $db->fetchFirstColumn(
+            'SELECT last_prompt_at FROM watering_proposal_state ORDER BY actuator_topic',
+        ));
+    }
+
+    public static function invalidatedActuatorTopics(): iterable
+    {
+        yield 'simulator' => [ProposalFixture::SIM_TOPIC, ProposalFixture::SIM_TOPIC];
+        yield 'legacy NULL topic' => [null, ''];
     }
 
     public function testProposalClassificationUpgradePreservesLegacyRowsAndAllowsKnownLabels(): void

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Watering;
 
 use App\Entity\WateringProposal;
+use App\Entity\WateringRun;
 use App\Repository\WateringTelegramProgressRepository;
 
 final class ProposalBot
@@ -80,7 +81,15 @@ final class ProposalBot
                 if (null === $this->policy->isRenewed($p)) {
                     $this->telegram->removeButtons((int) $p->getMessageId());
                 } else {
-                    $this->telegram->edit((int) $p->getMessageId(), $this->finalText($p));
+                    $text = $this->finalText($p);
+                    if ($p->getRenderedText() !== $text) {
+                        $this->telegram->edit((int) $p->getMessageId(), $text);
+                        $this->policy->recordRenderedMessage((int) $p->getId(), $text);
+                    }
+                }
+                if (null !== $p->getRun() && ($p->getRun()->isOpen()
+                    || $p->getRun()->isBlocked())) {
+                    continue;
                 }
                 $this->policy->markMessageFinal((int) $p->getId());
             } catch (\Throwable) {
@@ -95,12 +104,34 @@ final class ProposalBot
         $failure = $p->getFailure();
 
         return sprintf(
-            "%s\nDecision: %s%s%s",
+            "%s\nDecision: %s%s%s%s",
             $this->text($p),
             $p->getStatus(),
             $runId ? sprintf(' (run %d)', $runId) : '',
             $failure ? sprintf(' — %s', $failure) : '',
+            $this->cycleText($p->getRun()),
         );
+    }
+
+    private function cycleText(?WateringRun $run): string
+    {
+        if (null === $run) {
+            return '';
+        }
+        $lines = [sprintf('Cycle: %s', $run->getStatus())];
+        foreach ($run->getStages() as $stage) {
+            $lines[] = sprintf('Stage %d: %s (%d seconds)',
+                $stage->getPosition(), $stage->getStatus(), $stage->getRequestedSeconds());
+        }
+        if (WateringRun::STATUS_BREAK === $run->getStatus()) {
+            $lines[] = sprintf('Second stage due: %s UTC',
+                $run->getSecondStageDueAt()?->format('Y-m-d H:i:s'));
+        }
+        if (null !== $run->getError()) {
+            $lines[] = sprintf('Cycle error: %s', $run->getError());
+        }
+
+        return "\n".implode("\n", $lines);
     }
 
     private function text(WateringProposal $p): string
@@ -115,7 +146,11 @@ final class ProposalBot
         }
         $attempt = $p->getLastAttemptAt();
         $lines[] = sprintf('Last watering attempt: %s', $attempt ? $attempt->format('Y-m-d H:i:s').' UTC' : 'none');
-        $lines[] = sprintf('Proposed watering duration: %d seconds', $p->getDurationSeconds());
+        $lines[] = 2 === $p->getStageCount()
+            ? sprintf('Proposed cycle: %d seconds ON, %d-minute OFF break, %d seconds ON (%d seconds watering total)',
+                $p->getDurationSeconds(), $p->getBreakSeconds() / 60,
+                $p->getDurationSeconds(), $p->getDurationSeconds() * $p->getStageCount())
+            : sprintf('Proposed watering duration: %d seconds', $p->getDurationSeconds());
         $lines[] = sprintf('Expires: %s UTC', $p->getExpiresAt()?->format('Y-m-d H:i:s'));
 
         return implode("\n", $lines);

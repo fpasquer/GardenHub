@@ -47,12 +47,12 @@ final class WateringMonitorRunner
         };
         try {
             $client->connect((new ConnectionSettings())->setUsername($this->configuration->username)->setPassword($this->configuration->password)->setKeepAliveInterval(30), true);
-            $client->subscribe($this->configuration->topic, function (string $topic, string $message) use (&$callbackFailure): void {
+            $client->subscribe($this->configuration->topic, function (string $topic, string $message, bool $retained) use (&$callbackFailure): void {
                 if ($callbackFailure !== null) {
                     return;
                 }
                 try {
-                    $this->handleMessage($message);
+                    $this->handleMessage($message, $retained);
                 } catch (\Throwable $e) {
                     // php-mqtt/client catches callback exceptions, so carry the
                     // first one out of loopOnce() explicitly.
@@ -77,10 +77,10 @@ final class WateringMonitorRunner
         }
     }
 
-    private function handleMessage(string $message): void
+    private function handleMessage(string $message, bool $retained): void
     {
         try {
-            $stop = $this->watering->observe($message);
+            $stop = $this->watering->observe($message, $retained);
             if ($stop) {
                 $this->publisher->publish(['state' => ActuatorState::Off->value]);
             }
@@ -111,6 +111,7 @@ final class WateringMonitorRunner
             if ($this->watering->expire()) {
                 $this->logger->error('Watering deadline exceeded; cycle blocked and OFF requested.');
             }
+            $this->watering->advanceCycle();
             if ($this->watering->requiresStop() && microtime(true) - $lastStopAttempt >= self::STOP_RETRY_INTERVAL_SECONDS) {
                 $lastStopAttempt = microtime(true);
                 $this->publisher->publish(['state' => ActuatorState::Off->value]);

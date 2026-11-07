@@ -74,7 +74,8 @@ final class ProposalFixture
     public function stack(string $topic, RecordingTelegramGateway $gateway, int|string $retrySeconds = 1800): array
     {
         $manager = $this->harness->manager;
-        $policy = \newTestPolicy($manager, \newTestManager($manager, $this->publisher), $topic, 3, $retrySeconds);
+        $watering = \newTestManager($manager, $this->publisher, topic: $topic);
+        $policy = \newTestPolicy($manager, $watering, $topic, 65, $retrySeconds);
         return [$policy, \newTestBot($manager, $policy, $gateway)];
     }
 
@@ -105,11 +106,28 @@ final class ProposalFixture
     public function nextEpisode(): void
     {
         $db = $this->harness->connection;
-        $db->executeStatement('UPDATE watering_run SET requested_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 25 HOUR)');
+        $db->executeStatement("UPDATE watering_run SET requested_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 25 HOUR), status = 'reviewed'");
+        $db->executeStatement("UPDATE watering_stage SET requested_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 25 HOUR), status = 'reviewed' WHERE requested_at IS NOT NULL");
+        $db->executeStatement("UPDATE watering_stage SET status = 'cancelled' WHERE requested_at IS NULL");
         $db->executeStatement('UPDATE watering_control SET active_run_id = NULL, last_request_at = NULL, monitor_seen_at = UTC_TIMESTAMP() WHERE id = 1');
         $this->insert(18, 0);
         $this->policy->evaluate();
         $this->readings();
+    }
+
+    public function completeCycle(): void
+    {
+        $this->watering->observe('{"state":"ON"}');
+        $this->watering->observe('{"state":"OFF","alarm_1":false,"battery_low":false}');
+        $this->harness->connection->executeStatement(
+            "UPDATE watering_run SET second_stage_due_at = UTC_TIMESTAMP() WHERE status = 'break'",
+        );
+        $this->watering->heartbeat();
+        $this->watering->advanceCycle();
+        $this->watering->observe('{"state":"OFF","alarm_1":false,"battery_low":false}');
+        $this->watering->advanceCycle();
+        $this->watering->observe('{"state":"ON"}');
+        $this->watering->observe('{"state":"OFF"}');
     }
 
     public static function callback(int $updateId, int $proposalId, int $user = 123,

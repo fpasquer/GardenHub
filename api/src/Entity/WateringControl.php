@@ -32,6 +32,36 @@ class WateringControl
     #[Groups(['read:watering_control'])]
     private ?\DateTimeImmutable $monitorSeenAt = null;
 
+    #[ORM\Column(nullable: true)]
+    private ?\DateTimeImmutable $actuatorSeenAt = null;
+
+    #[ORM\Column(nullable: true)]
+    private ?bool $actuatorSafe = null;
+
+    public function getActuatorSeenAt(): ?\DateTimeImmutable
+    {
+        return $this->actuatorSeenAt;
+    }
+
+    public function setActuatorSeenAt(?\DateTimeImmutable $at): static
+    {
+        $this->actuatorSeenAt = $at;
+
+        return $this;
+    }
+
+    public function isActuatorSafe(): ?bool
+    {
+        return $this->actuatorSafe;
+    }
+
+    public function setActuatorSafe(?bool $safe): static
+    {
+        $this->actuatorSafe = $safe;
+
+        return $this;
+    }
+
     public function getId(): int
     {
         return $this->id;

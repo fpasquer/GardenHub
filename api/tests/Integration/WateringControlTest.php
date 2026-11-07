@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Tests\Integration;
 
 use App\Entity\WateringRun;
+use App\Tests\Support\AssertsRejection;
 use App\Tests\Support\RecordingWateringPublisher;
 use App\Tests\Support\WateringHarness;
 use App\Watering\WateringManager;
@@ -15,6 +16,8 @@ use PHPUnit\Framework\TestCase;
 #[Group('functional_gardenhub-watering-control')]
 final class WateringControlTest extends TestCase
 {
+    use AssertsRejection;
+
     private WateringHarness $harness;
     private RecordingWateringPublisher $publisher;
     private WateringManager $watering;
@@ -39,19 +42,26 @@ final class WateringControlTest extends TestCase
     }
 
     #[DataProvider('requestGuards')]
-    public function testRequestGuards(string $guard): void
-    {
+    public function testRequestGuards(
+        string $guard,
+        string $class,
+        string $message,
+    ): void {
         $manager = $this->watering;
         $duration = 3;
         if ('zero' === $guard || 'too long' === $guard) {
-            $duration = 'zero' === $guard ? 0 : 31;
+            $duration = 'zero' === $guard ? 0 : 66;
         } elseif ('environment' === $guard || 'disabled' === $guard) {
             $manager = \newTestManager($this->harness->manager, $this->publisher,
                 'disabled' !== $guard, 'environment' === $guard ? 'test' : 'dev');
         } elseif ('stale heartbeat' === $guard) {
             $this->harness->connection->executeStatement('UPDATE watering_control SET monitor_seen_at = DATE_SUB(NOW(), INTERVAL 10 SECOND) WHERE id = 1');
         }
-        $this->reject(fn () => $manager->request($duration));
+        self::assertRejected(
+            $class,
+            $message,
+            fn () => $manager->request($duration),
+        );
         self::assertSame([], $this->publisher->calls);
     }
 
@@ -59,39 +69,65 @@ final class WateringControlTest extends TestCase
     {
         $this->watering = \newTestManager($this->harness->manager, $this->publisher, true, 'prod');
         $this->watering->heartbeat();
-        $id = $this->watering->request(3);
+        $id = $this->watering->request(3, static function (\DateTimeImmutable $now): void {
+            self::assertCount(1, func_get_args());
+        });
         $reserved = $this->storedRun($id);
         self::assertSame(13, $reserved->getDeadlineAt()->getTimestamp() - $reserved->getRequestedAt()->getTimestamp());
         self::assertSame([['watering_times' => 3, 'state' => 'ON']], $this->publisher->calls);
-        $this->reject(fn () => $this->watering->request(3));
+        self::assertRejected(
+            \DomainException::class,
+            'active or requires review',
+            fn () => $this->watering->request(3),
+        );
         self::assertFalse($this->watering->observe('{"state":"OFF"}'));
         self::assertSame('pending', $this->storedRun($id)->getStatus());
         self::assertFalse($this->watering->observe('{"state":"ON","alarm_1":false,"battery_low":false}'));
         self::assertSame('running', $this->storedRun($id)->getStatus());
         $restarted = \newTestManager($this->harness->manager, $this->publisher);
-        $this->reject(fn () => $restarted->request(3));
+        self::assertRejected(
+            \DomainException::class,
+            'active or requires review',
+            fn () => $restarted->request(3),
+        );
         $restarted->observe('{"state":"OFF"}');
         self::assertSame('completed', $this->storedRun($id)->getStatus());
-        $this->reject(fn () => $restarted->request(3));
+        self::assertRejected(
+            \DomainException::class,
+            'cooldown has not elapsed',
+            fn () => $restarted->request(3),
+        );
     }
 
     public function testFailedPublishRetainsReservationAndTimeoutRequiresManualReview(): void
     {
         $this->watering->heartbeat();
         $this->publisher->fail = true;
-        $this->reject(fn () => $this->watering->request(3));
+        self::assertRejected(
+            \RuntimeException::class,
+            'Command delivery uncertain',
+            fn () => $this->watering->request(3),
+        );
         $id = $this->activeId();
         self::assertNotNull($id);
         self::assertSame('uncertain', $this->storedRun($id)->getStatus());
         self::assertTrue($this->watering->requiresStop());
-        $this->reject(fn () => $this->watering->request(3));
+        self::assertRejected(
+            \DomainException::class,
+            'active or requires review',
+            fn () => $this->watering->request(3),
+        );
         $this->harness->connection->executeStatement("UPDATE watering_run SET status = 'pending', deadline_at = DATE_SUB(NOW(), INTERVAL 1 SECOND) WHERE id = ?", [$id]);
         $restarted = \newTestManager($this->harness->manager, $this->publisher);
         self::assertTrue($restarted->expire());
         self::assertSame('timed_out', $this->storedRun($id)->getStatus());
         $restarted->observe('{"state":"OFF"}');
         self::assertTrue($restarted->requiresStop());
-        $this->reject(fn () => $restarted->request(3));
+        self::assertRejected(
+            \DomainException::class,
+            'active or requires review',
+            fn () => $restarted->request(3),
+        );
         $restarted->acknowledgeStopped();
         self::assertSame('reviewed', $this->storedRun($id)->getStatus());
         self::assertFalse($restarted->requiresStop());
@@ -109,8 +145,12 @@ final class WateringControlTest extends TestCase
     public function testRollingDailyBudgetRejectsExcess(): void
     {
         $this->watering->heartbeat();
-        $this->harness->connection->executeStatement("INSERT INTO watering_run (id, requested_seconds, status, requested_at, deadline_at) VALUES (1, 119, 'completed', NOW(), NOW())");
-        $this->reject(fn () => $this->watering->request(2));
+        $this->harness->connection->executeStatement("INSERT INTO watering_run (id, requested_seconds, status, requested_at, deadline_at) VALUES (1, 129, 'completed', NOW(), NOW())");
+        self::assertRejected(
+            \DomainException::class,
+            'Rolling 24-hour',
+            fn () => $this->watering->request(2),
+        );
     }
 
     #[DataProvider('overdueStates')]
@@ -166,16 +206,6 @@ final class WateringControlTest extends TestCase
         return \freshControl($this->harness->manager)->getActiveRun()?->getId();
     }
 
-    private function reject(callable $callback): void
-    {
-        try {
-            $callback();
-            self::fail('Expected watering request rejection.');
-        } catch (\LogicException|\RuntimeException $exception) {
-            self::assertInstanceOf(\Throwable::class, $exception);
-        }
-    }
-
     public static function invalidStates(): iterable
     {
         foreach (['invalid-json', '{}', '{"state":"UNKNOWN"}', '{"state":true}', '{"state":1}'] as $payload) {
@@ -185,9 +215,15 @@ final class WateringControlTest extends TestCase
 
     public static function requestGuards(): iterable
     {
-        foreach (['zero', 'too long', 'environment', 'disabled', 'missing heartbeat', 'stale heartbeat'] as $guard) {
-            yield $guard => [$guard];
-        }
+        $duration = [\DomainException::class, 'Duration must be between'];
+        $enablement = [\LogicException::class, 'requires explicit enablement'];
+        $monitor = [\DomainException::class, 'monitor is not reporting'];
+        yield 'zero' => ['zero', ...$duration];
+        yield 'too long' => ['too long', ...$duration];
+        yield 'environment' => ['environment', ...$enablement];
+        yield 'disabled' => ['disabled', ...$enablement];
+        yield 'missing heartbeat' => ['missing heartbeat', ...$monitor];
+        yield 'stale heartbeat' => ['stale heartbeat', ...$monitor];
     }
 
     public static function alarms(): iterable

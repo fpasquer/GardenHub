@@ -50,8 +50,9 @@ case "$GARDENHUB_TEST_GROUP" in
         export GARDENHUB_TEST_FILE=tests/Integration/WateringOrmTest.php
         export GARDENHUB_TEST_REPORT=watering-orm;;
     functional_gardenhub-watering-control)
+        export GARDENHUB_TEST_TIMEOUT=600
         export GARDENHUB_TEST_DATABASE=watering_control_test
-        export GARDENHUB_TEST_FILE=tests/Integration/WateringControlTest.php
+        export GARDENHUB_TEST_FILE=tests/Integration
         export GARDENHUB_TEST_REPORT=watering-control;;
     functional_gardenhub-watering-production)
         export GARDENHUB_TEST_DATABASE=watering_control_test

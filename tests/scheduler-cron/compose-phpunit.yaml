@@ -64,6 +64,7 @@ services:
       - ../..:/workspace:ro
       - ../../api/src:/app/src:ro
       - ../../api/config:/app/config:ro
+      - ../../api/migrations:/app/migrations:ro
       - ../../api/tests:/app/tests:ro
       - ../../api/phpunit.xml.dist:/app/phpunit.xml.dist:ro
       - ../../${GARDENHUB_REPORT_ROOT:-.test-reports/phpunit}/${GARDENHUB_TEST_REPORT:-scheduler-delivery}:/reports

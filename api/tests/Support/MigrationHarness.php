@@ -71,6 +71,15 @@ final class MigrationHarness
         $this->run($input);
     }
 
+    /** The SQL that would bring the database in line with the ORM mapping. */
+    public function schemaDiff(): string
+    {
+        return $this->run([
+            'command' => 'doctrine:schema:update',
+            '--dump-sql' => true,
+        ])[1];
+    }
+
     public function shutdown(): void
     {
         $this->kernel->shutdown();

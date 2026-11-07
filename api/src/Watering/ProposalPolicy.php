@@ -7,6 +7,7 @@ namespace App\Watering;
 use App\Entity\Device;
 use App\Entity\WateringProposal;
 use App\Entity\WateringProposalState;
+use App\Entity\WateringRun;
 use App\Repository\DeviceRepository;
 use App\Repository\MeasurementRepository;
 use App\Repository\WateringProposalRepository;
@@ -45,7 +46,7 @@ final class ProposalPolicy
             throw new \LogicException('Watering proposal retry must be a positive integer number of seconds.');
         }
         $this->retrySeconds = $retry;
-        if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || $durationSeconds < 1 || $durationSeconds > $watering->maxSeconds()) {
+        if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || WateringManager::STAGE_SECONDS !== $durationSeconds || $durationSeconds > $watering->maxSeconds()) {
             throw new \LogicException('Invalid watering proposal configuration.');
         }
     }
@@ -119,6 +120,11 @@ final class ProposalPolicy
         if (WateringProposal::isValidId($id)) {
             $this->proposals->markFinal($id);
         }
+    }
+
+    public function recordRenderedMessage(int $id, string $text): void
+    {
+        $this->proposals->recordRenderedMessage($id, $text);
     }
 
     private function evaluateLocked(): ?WateringProposal
@@ -217,6 +223,8 @@ final class ProposalPolicy
             ->setCreatedAt($now)
             ->setExpiresAt($now->modify(sprintf('+%d minutes', $this->validityMinutes)))
             ->setDurationSeconds($this->durationSeconds)
+            ->setStageCount(WateringManager::STAGE_COUNT)
+            ->setBreakSeconds(WateringManager::BREAK_SECONDS)
             ->setReadingsJson($snapshot)
             ->setLastAttemptAt($attempt)
             ->setNotificationStatus(WateringNotificationStatus::New->value)
@@ -246,6 +254,14 @@ final class ProposalPolicy
 
             return ProposalDecisionResult::Invalidated->value;
         }
+        if (WateringManager::STAGE_COUNT !== $p->getStageCount()
+            || WateringManager::STAGE_SECONDS !== $p->getDurationSeconds()
+            || WateringManager::BREAK_SECONDS !== $p->getBreakSeconds()) {
+            $p->setStatus(WateringProposalStatus::Invalidated->value)
+                ->setFailure('Watering cycle terms changed; a new approval is required');
+
+            return ProposalDecisionResult::Invalidated->value;
+        }
         if (self::ACTION_REJECT === $action) {
             $p->setStatus(WateringProposalStatus::Rejected->value);
 
@@ -260,8 +276,16 @@ final class ProposalPolicy
     private function execute(int $id): string
     {
         try {
-            $duration = (int) $this->proposals->fresh($id)?->getDurationSeconds();
-            $runId = $this->watering->request($duration, fn (\DateTimeImmutable $now) => $this->assertStillValid($id, $now));
+            $runId = $this->watering->requestCycle(
+                $this->actuatorTopic,
+                function (\DateTimeImmutable $now, WateringRun $run) use ($id): void {
+                    $this->assertStillValid($id, $now);
+                    $proposal = $this->proposals->fresh($id)
+                        ?? throw new \LogicException('Claimed proposal disappeared.');
+                    $proposal->setRun($run)
+                        ->setStatus(WateringProposalStatus::Approved->value);
+                },
+            );
             $this->proposals->finishExecution($id, WateringProposalStatus::Approved->value, null, $runId);
 
             return ProposalDecisionResult::Approved->value;
