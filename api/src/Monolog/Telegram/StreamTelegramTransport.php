@@ -67,10 +67,10 @@ class StreamTelegramTransport implements InterfaceTelegramTransport
         set_error_handler(static fn (): bool => true);
 
         try {
+            http_clear_last_response_headers();
             $response = @file_get_contents($url, false, $context);
 
-            // $http_response_header is populated in this scope by the call above.
-            return [$response, $http_response_header ?? []];
+            return [$response, http_get_last_response_headers() ?? []];
         } finally {
             restore_error_handler();
         }

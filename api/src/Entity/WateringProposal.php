@@ -104,6 +104,68 @@ class WateringProposal
     #[Groups(['read:watering_proposal'])]
     private ?string $actuatorTopic = null;
 
+    #[ORM\Column(nullable: true)]
+    private ?bool $renewed = null;
+
+    #[ORM\Column(options: ['default' => 1])]
+    #[Groups(['read:watering_proposal'])]
+    private int $stageCount = 1;
+
+    #[ORM\Column(options: ['default' => 0])]
+    #[Groups(['read:watering_proposal'])]
+    private int $breakSeconds = 0;
+
+    #[ORM\Column(type: Types::TEXT, nullable: true)]
+    private ?string $renderedText = null;
+
+    public function getStageCount(): int
+    {
+        return $this->stageCount;
+    }
+
+    public function setStageCount(int $count): static
+    {
+        $this->stageCount = $count;
+
+        return $this;
+    }
+
+    public function getBreakSeconds(): int
+    {
+        return $this->breakSeconds;
+    }
+
+    public function setBreakSeconds(int $seconds): static
+    {
+        $this->breakSeconds = $seconds;
+
+        return $this;
+    }
+
+    public function getRenderedText(): ?string
+    {
+        return $this->renderedText;
+    }
+
+    public function setRenderedText(?string $text): static
+    {
+        $this->renderedText = $text;
+
+        return $this;
+    }
+
+    public function isRenewed(): ?bool
+    {
+        return $this->renewed;
+    }
+
+    public function setRenewed(bool $renewed): static
+    {
+        $this->renewed = $renewed;
+
+        return $this;
+    }
+
     public static function isValidId(int $id): bool
     {
         return $id >= 1 && $id <= self::MAX_ID;

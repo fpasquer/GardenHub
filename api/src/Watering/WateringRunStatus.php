@@ -12,4 +12,6 @@ enum WateringRunStatus: string
     case Uncertain = 'uncertain';
     case TimedOut = 'timed_out';
     case Reviewed = 'reviewed';
+    case Break = 'break';
+    case Cancelled = 'cancelled';
 }

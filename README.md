@@ -161,8 +161,9 @@ artifact deployment is not implemented in this release flow.
 Focused local checks (disposable test stacks only):
 
 ```bash
-python3 tests/watering-control/compose-deployment.py
-python3 -B -m unittest discover -s tests/release-ci -v
+make test-build
+make test-phpunit GROUP=functional_gardenhub-deployment
+make test-phpunit GROUP=unitest_gardenhub-release-gate
 docker build --target development -t gardenhub-api api
 docker build --target production -t gardenhub-api:release-validation api
 docker build --target smoke-nginx -t gardenhub-smoke-nginx:release-validation api
@@ -234,13 +235,14 @@ credential fallback. `WATERING_DEV_USERNAME`/`WATERING_DEV_PASSWORD` remain
 compatible only through development Compose mappings; neutral names take
 precedence. Outside Compose, explicitly provide the neutral names and topic.
 
-Limits remain configurable and unchanged: `WATERING_MAX_SECONDS=30`,
-`WATERING_DAILY_SECONDS=120` (rolling 24 hours),
-`WATERING_COOLDOWN_SECONDS=60`, `WATERING_PROPOSAL_DURATION_SECONDS=3`,
+Default limits are `WATERING_MAX_SECONDS=65` per activation,
+`WATERING_DAILY_SECONDS=130` (rolling 24 hours),
+`WATERING_COOLDOWN_SECONDS=60`, `WATERING_PROPOSAL_DURATION_SECONDS=65`,
 `WATERING_PROPOSAL_THRESHOLD=15`, freshness/max-gap 35 minutes, validity
 30 minutes. Use the independently approved hardware calibration and safety
-limits; switching to production does not increase limits or change duration
-to 67 seconds. Interactive proposals require the token and both authorized
+limits; automatic proposals authorize two 65-second activations separated by
+a 30-minute OFF break in both development and production. Manual requests remain
+single activations within the shared limits. Interactive proposals require the token and both authorized
 IDs even if `TELEGRAM_ENABLED=false` (that flag controls logging, not proposals).
 
 ### Cutover and startup
@@ -427,7 +429,8 @@ docker compose --env-file .env -f compose.yaml -f compose-dev.yaml \
 ```
 
 The monitor should observe ON followed by OFF and record `completed`. A second
-request during the cycle is rejected; completed runs have a 60-second cooldown.
+request during the cycle is rejected; requests have a 60-second cooldown from
+the most recent command claim.
 Requests also fail when the monitor is absent or its heartbeat is stale; the
 heartbeat only starts once the monitor's state subscription is confirmed by
 the broker (SUBACK), not merely once its MQTT loop is running, and it is
@@ -477,15 +480,81 @@ readings are no more than 35 minutes apart, and no watering run was requested
 in the preceding 24 hours. These limits allow the sensor's normal 20 minute
 reporting interval. A run in `uncertain` or `timed_out` state still counts as an
 attempt. No previous run satisfies the 24 hour check. The proposal expires
-after 30 minutes and offers a three second cycle by default for the simulator.
-For hardware, set the duration to the measured calibration and keep it within
-`WATERING_MAX_SECONDS`; an invalid combination now prevents the poller from
+after 30 minutes and offers one cycle of **65 seconds ON, 30 minutes OFF,
+then 65 seconds ON**, including for the simulator.
+`WATERING_PROPOSAL_DURATION_SECONDS` must be 65, and each stage must fit
+`WATERING_MAX_SECONDS`; an invalid combination prevents the poller from
 starting. Configure the
 threshold, freshness, gap, validity, and duration with
 `WATERING_PROPOSAL_THRESHOLD`,
 `WATERING_PROPOSAL_FRESHNESS_MINUTES`, `WATERING_PROPOSAL_MAX_GAP_MINUTES`,
 `WATERING_PROPOSAL_VALIDITY_MINUTES`, and `WATERING_PROPOSAL_DURATION_SECONDS`.
+`WATERING_PROPOSAL_RETRY_SECONDS` controls the delay **after expiration** before
+a renewed approval request becomes eligible (positive integer, default `1800`).
 The default values are in [api/.env](api/.env).
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `WATERING_PROPOSAL_VALIDITY_MINUTES` | Telegram approval validity | 30 minutes |
+| `WATERING_PROPOSAL_RETRY_SECONDS` | Delay after expiration before renewal | 1800 seconds |
+| `WATERING_PROPOSAL_DURATION_SECONDS` | Runtime of each of the two automatic stages | 65 seconds |
+| `WATERING_MAX_SECONDS` | Maximum duration of a single activation | 65 seconds |
+| `WATERING_DAILY_SECONDS` | Rolling budget, including undispatched reservations | 130 seconds |
+
+### Two-stage automatic cycle and recovery
+
+One Approve callback authorizes the entire 130-second cycle. Stage one must
+report ON and then OFF before its deadline; the 1,800-second break starts at
+that confirmed OFF. Duplicate OFF reports do not reset the break. The monitor
+uses persisted due timestamps rather than a blocking sleep, and the active
+cycle gate stays reserved throughout the break. Manual requests, another
+automatic cycle, and guarded deployment are refused until completion or safe
+recovery. Stage two also requires observed ON before its final OFF can complete
+the cycle.
+
+Before stage two, the monitor sends the existing OFF command as a safe state
+confirmation request. It requires a fresh, non-retained OFF report with explicit
+`alarm_1=false` and a healthy battery before sending another ON. A pump that
+publishes `battery_low` is judged on that flag, which must be `false`. The
+ThirdReality Smart Watering Kit never publishes it, so its `battery` percentage
+is used instead: it must be a number from 0 to 100 and above 20
+(`ActuatorSafety::LOW_BATTERY_PERCENT`); 20 or less counts as low battery. The
+probe clears earlier live evidence, including reports received in the same
+second. Confirmation must arrive before the 10-second deadline and be no more
+than 5 seconds old when stage two is claimed. A heartbeat alone or an old
+retained report is insufficient. If the pump does not report `alarm_1` and a
+valid battery indicator in response, continuation fails closed rather than
+assuming safety. Verify this behavior with the outlet in a measured vessel
+before plant use.
+
+Monitor downtime defers continuation. Reconnection clears prior readiness and
+safety evidence, requests a new OFF confirmation when due, and may resume the
+undispatched stage even if it is late. There is no extra lateness cutoff. The
+original approval and dry-soil eligibility are not re-evaluated for stage two;
+the actuator topic, enablement, monitor readiness, safety, per-stage duration,
+and rolling budget still apply. A changed actuator never receives a continuation
+or safety OFF command belonging to the original cycle.
+
+The complete 130 seconds are reserved before stage one. The remaining 65-second
+reservation does not disappear when downtime extends beyond 24 hours. Each
+dispatched stage then counts at its own command-claim timestamp, without also
+charging the aggregate cycle. Each dispatched stage also refreshes the cooldown,
+including continuation after prolonged downtime. If changed limits prevent
+continuation after safe OFF confirmation, the second stage is cancelled and only its undispatched
+reservation is released.
+
+An alarm, unexpected ON during the break, missing confirmation after the
+10-second probe deadline, or uncertain ON delivery blocks the cycle for manual
+review. OFF safety retries remain enabled for the original configured actuator.
+After independently confirming the original pump is OFF, the existing
+acknowledgement command releases the gate and cancels the undispatched stage.
+It never retries an uncertain ON or restarts the remaining stage.
+
+The proposal message describes both stages before approval and is edited to
+show progress, the break deadline, completion, cancellation, or blocking.
+`gardenhub:watering:status` shows the cycle and individual stage timestamps.
+The existing proposal retry interval still governs renewal after an *unapproved
+proposal expires*; it is unrelated to the internal cycle break.
 
 Each proposal stores the `WATERING_MQTT_TOPIC` it was created for and its
 Telegram text is rendered from that stored topic. If the configured topic later
@@ -500,22 +569,55 @@ every existing proposal and its prompt counters, because buttons already sent
 to Telegram carry the old UUID. Those buttons do nothing afterwards; a still-dry
 sensor is prompted again. Watering runs are kept.
 
-One initial prompt and at most one reminder 24 hours later are allowed during
-the same dry episode for each actuator topic, including after rejection or
-expiry, so an invalidated simulator proposal does not consume the physical
-pump's prompts. A wet reading resets
-the episode and invalidates any pending proposal. A newer watering attempt
-also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
+Expired proposals renew indefinitely while watering remains eligible, with no
+two-prompt limit. Each renewal is a new proposal with its own expiration and
+Approve / Reject callbacks; the Telegram message identifies it as renewed.
+An expiration at 12:30 with a retry interval of 1800 seconds becomes eligible
+at 13:00, not 30 minutes after the original notification. The existing poller
+checks eligibility on its next pass; no new scheduler or container is needed.
+The deadline comes from the persisted expiration, so restarting does not reset
+the delay, and downtime produces one fresh request rather than a catch-up backlog.
+
+Renewal reuses the watering safety checks, including active or blocked cycles,
+monitor freshness, cooldown, full-cycle daily budget, and actuator availability. Temporary
+failures defer eligibility without changing the expired proposal or its retry
+deadline; subsequent polling passes check again. Approval or explicit rejection ends that renewal chain. A new,
+independent request may start after 24 hours from the watering attempt or rejection
+decision respectively, if eligibility and safety checks pass. Failed or uncertain
+execution and invalidated proposals are not automatically renewed. A changed
+actuator cannot revive an older expired chain when switching back.
+
+A wet reading resets the episode and invalidates any pending proposal. A newer
+watering attempt also invalidates it. Approval rechecks sensor freshness, gaps, threshold,
 proposal expiry, and the 24 hour rule under the watering reservation lock;
 `WateringManager` retains its enabled, monitor heartbeat, cooldown, active
 cycle, duration, and daily budget checks. Rejected, unauthorized, replayed,
 expired, and unapproved proposals never run the configured actuator. If an approval is
 interrupted or command delivery is uncertain, it stays blocked for manual
-review; pressing the button again never retries the cycle. Check the proposal
+review; pressing the button again never retries the cycle. When the initial ON
+delivery is uncertain, the terminal uncertain proposal and its reserved run link
+are persisted. Acknowledging the stopped run does not automatically renew that
+dry episode. Check the proposal
 and watering run tables before any manual recovery. A failed Telegram
-send may have succeeded remotely, so that episode is not sent again. A proposal
+send may have succeeded remotely, so that same proposal is not sent again;
+after expiration it can still qualify for a fresh renewed request. A proposal
 committed before the notification claim is sent on the next poll; a failed
 message edit is retried on the next polling pass.
+
+To deploy this behavior, rebuild and recreate application services through the
+existing deployment workflow with the watering profiles enabled. Optionally set
+`WATERING_PROPOSAL_RETRY_SECONDS=1800` in the untracked root environment file;
+Compose supplies the default otherwise. Apply the new two-stage migration
+through the existing guarded deployment workflow. It preserves historical runs
+and decisions, invalidates pending single-stage proposals, and clears their
+device-and-actuator episode counters so a fresh two-stage proposal can be approved.
+Legacy NULL-topic proposals match only the empty-topic counter; other actuators'
+decisions and counters remain intact. Previously sent buttons cannot silently
+authorize the expanded cycle. Update old explicit
+duration and safety-limit overrides; incompatible settings fail visibly.
+Already-expired proposals, including those previously blocked by the two-prompt
+limit, may produce one eligible renewed request after deployment. Production
+daemons must retain `APP_ENV=prod`.
 
 ### Real Zigbee2MQTT pump on the Pi (opt-in development test)
 
@@ -529,18 +631,19 @@ reuse the simulator account for hardware.
 In GardenHub's untracked root `.env` on the Pi, select the hardware topic and
 the dedicated account. The calibration below is based on a measured 500 ml in
 67 seconds; verify it again with the installed tubing and a measured vessel
-before using the plant. The default limits in `api/.env` and `compose-dev.yaml`
-remain simulator-safe and must be explicitly overridden for this test:
+before using the plant. Calibration remains 67 seconds = 500 ml; it is not a
+duration setting for automatic proposals. Automatic cycles use the same two
+65-second stages in every environment and reserve 130 seconds:
 
 ```dotenv
 WATERING_ENABLED=true
 WATERING_MQTT_TOPIC=zigbee2mqtt/avocado-watering
 WATERING_MQTT_USERNAME=watering_hw_dev
 WATERING_MQTT_PASSWORD=<separate-hardware-account-password>
-WATERING_MAX_SECONDS=67
-WATERING_DAILY_SECONDS=134
+WATERING_MAX_SECONDS=65
+WATERING_DAILY_SECONDS=130
 WATERING_COOLDOWN_SECONDS=1800
-WATERING_PROPOSAL_DURATION_SECONDS=67
+WATERING_PROPOSAL_DURATION_SECONDS=65
 ```
 
 Stop the simulator if it is running. Recreate the API, monitor, and proposal
@@ -564,7 +667,7 @@ Run it only with the outlet in a measured vessel:
 
 ```bash
 docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
-  exec gardenhub-api php bin/console gardenhub:watering:request 67
+  exec gardenhub-api php bin/console gardenhub:watering:request 65
 docker compose --env-file .env --env-file .env.local -f compose.yaml -f compose-dev.yaml \
   exec gardenhub-api php bin/console gardenhub:watering:status
 ```
@@ -580,9 +683,11 @@ physical pump is OFF before `gardenhub:watering:acknowledge-stop
 Run its isolated integration suite with:
 
 ```bash
-python3 tests/watering-control/compose-deployment.py
-docker compose -f tests/watering-control/compose.yaml run --rm tests
-docker compose -f tests/watering-control/compose.yaml down -v
+make test-phpunit GROUP=functional_gardenhub-compose-configuration
+make test-phpunit GROUP=functional_gardenhub-deployment
+make test-phpunit GROUP=functional_gardenhub-watering-control
+make test-phpunit GROUP=functional_gardenhub-watering-proposals
+make test-phpunit GROUP=functional_gardenhub-watering-mqtt
 ```
 
 ## Current Status
@@ -590,7 +695,7 @@ docker compose -f tests/watering-control/compose.yaml down -v
 ### Implemented
 
 - Docker Compose based deployment.
-- PHP 8.4 / Symfony 7.4 LTS backend.
+- PHP 8.5 / Symfony 7.4 LTS backend.
 - API Platform 4.3+.
 - MySQL 8.4 persistent storage.
 - Doctrine ORM and Doctrine Migrations.
@@ -891,8 +996,9 @@ and MQTT services on a separate Compose network, without production data or
 credentials:
 
 ```bash
-docker compose -f tests/mqtt-lifecycle/compose.yaml run --rm tests
-docker compose -f tests/mqtt-lifecycle/compose.yaml down -v
+make test-phpunit GROUP=functional_gardenhub-mqtt-worker
+make test-phpunit GROUP=functional_gardenhub-mqtt-delivery
+make test-phpunit GROUP=functional_gardenhub-migration-upgrade
 ```
 
 Build the API image first if it is not available. Tests cover repeated uplinks,
@@ -1020,7 +1126,7 @@ report, alongside **GardenHub — Garden Overview**. Its direct path is
 available too.
 
 The **Run outcomes** chart above the table shows stacked daily counts for
-completed, timed-out, uncertain, reviewed, pending, and running runs. Counts use
+completed, timed-out, uncertain, reviewed, pending, running, break, and cancelled cycles. Counts use
 each run's current status and include runs without a valid watering interval.
 Daily buckets use UTC calendar days; timestamp labels use the dashboard timezone.
 The chart uses the same time-range filter as the table, which stays at the bottom.
@@ -1028,14 +1134,20 @@ The chart uses the same time-range filter as the table, which stays at the botto
 The report includes one row per `watering_run`, newest first,
 within the dashboard time range. The range uses `started_at`, falling back to
 `requested_at` for runs that never started; timestamps use the dashboard timezone.
-Actual duration is the recorded end minus start, not `requested_seconds`.
+For automatic cycles, actual duration sums the two confirmed physical-stage
+intervals, never the 30-minute break. For legacy/manual runs, it remains the
+recorded end minus start, not `requested_seconds`. Stage status and the second
+stage's due time appear alongside the logical cycle.
 Estimated volume uses the pump calibration **67 seconds = 500 ml**, rounded to
 one decimal place: 67 seconds → 500.0 ml, 10 seconds → 74.6 ml, and 3 seconds → 22.4 ml.
 
-Only `completed` runs with both timestamps present and a nonnegative interval
+Only `completed` automatic cycles with two completed, valid stage intervals,
+or legacy/manual runs with both timestamps present and a nonnegative interval,
 have duration and volume values. Other runs remain visible with empty calculated
 cells. In particular, `reviewed.finished_at` records an operator acknowledgement,
-not the actual watering end. No device joins or production schema changes are used.
+not the actual watering end. Calibration is unchanged: a cycle with two
+65-second confirmed intervals reports 130 seconds and approximately 970.1 ml,
+even though its elapsed cycle time includes the 30-minute break.
 
 Dashboard files are checked by the provisioner every 30 seconds. To explicitly
 refresh Grafana after updating the file, run `make deploy-grafana`; this only
@@ -1532,14 +1644,123 @@ docker compose exec gardenhub-api php bin/console gardenhub:telegram:test
 
 This reports whether a record was *dispatched*, never *delivered*: delivery failures are swallowed by design (see below), so check the target Telegram chat to confirm receipt.
 
-Run the automated test scripts (dev stack only, requires the `compose-dev.yaml` bind mount):
+Run the PHPUnit groups (isolated development runner; no live Telegram access):
 
 ```bash
-docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/telegram_handler_test.php
-docker compose -f compose.yaml -f compose-dev.yaml run --rm gardenhub-api php tests/stream_telegram_transport_test.php
+make test-build
+make test-phpunit GROUP=unitest_gardenhub-telegram-handler
+make test-phpunit GROUP=functional_gardenhub-telegram-logging
+make test-phpunit GROUP=functional_gardenhub-telegram-http
 ```
 
-The second script exercises `StreamTelegramTransport` itself (HTTP errors, invalid JSON, `ok:false`, connection failures, and repeated calls) against a local fake server — no real Telegram access involved.
+The HTTP group exercises `StreamTelegramTransport` itself (HTTP errors, invalid
+JSON, `ok:false`, connection failures, and repeated calls) against a loopback
+server.
+
+### PHPUnit Migration Status
+
+PHPUnit 13.4.4 and Xdebug 3.5.3 are development-only. The native ARM64 runtime is
+PHP 8.5.12. Production installs use `--no-dev`, and production image copies exclude
+test sources, PHPUnit configuration and development PHP configuration.
+
+Composer requires PHP 8.5.12 or newer and resolves dependencies against 8.5.12.
+The shared Docker base pins `php:8.5.12-fpm-alpine`; PHP 8.5 includes OPcache, so
+it must not be installed or loaded separately as `opcache.so`.
+After changing the runtime, rebuild the development, test and production images.
+All application consumers share the application image: recreate the API,
+workers, scheduler and enabled watering services through the existing gated
+deployment process. Editing the Dockerfile alone does not upgrade running
+containers.
+
+The runtime upgrade includes targeted Symfony 7.4 and PHPUnit security patches.
+PHP image builds refresh inherited Alpine packages, and production and packaged
+smoke use the same `nginx:1.30.6-alpine-slim` base. The slim variant retains the
+static-file/FastCGI features used here without unused curl and image-filter
+dependencies. Composer and production-image audits remain required release checks.
+
+The Telegram handler/HTTP/daily-summary, scheduler, Python release/image-audit,
+sensor identity/concurrency, Compose and Make deployment scenarios have migrated.
+MQTT worker callback/reset/recovery, outage alerts, pre-SUBACK delivery and
+persistent-session resumption have also migrated, preserving real broker and
+fresh-process interactions.
+Application, Grafana and production-smoke suites run through PHPUnit with
+isolated service runners. The main CI job runs core suites once under Xdebug;
+Grafana and packaged production smoke run only in their dedicated required jobs.
+Composer and production-image audits remain required by `CI Ready`.
+
+```bash
+make test-build                 # Separate gardenhub-tests:phpunit image
+make test-phpunit               # Complete suite
+make test-groups                # List exact independently runnable groups
+make test-report               # TestDox, timings and JUnit XML
+make test-ci                   # Core suites, excluding Grafana and packaged smoke
+make test-phpunit GROUP=unitest_gardenhub-image-audit
+make test-coverage-probe        # Focused CLI/HTTP/FPM collection proof
+make test-coverage             # Native aggregate api/src coverage, 80% required
+```
+
+Reports are written to `.test-reports/phpunit/<group>/junit.xml` and
+`testdox.txt` (`all` for an unfiltered run). No host PHP, active application
+stack, Docker socket mount or real credentials are required. The summary and
+scheduler-delivery and sensor identity/concurrency groups start their own isolated MySQL service sequentially;
+they require 384 MiB available memory, use a small buffer pool and disk-backed
+disposable volume, and remove their stack on exit. Their reports live in
+`.test-reports/phpunit/telegram-summary/` and `scheduler-delivery/`, respectively.
+
+Normal runs are sequential, use a 160 MiB PHP limit, bounded subprocess output
+and Xdebug off. The launcher refuses runs below 256 MiB available host memory
+and never stops unrelated services. The current Pi kernel cannot enforce Docker
+memory caps, so this check is a headroom guard, not an aggregate memory guarantee.
+Existing swap usage and live services must be considered before heavier suites.
+The full database/Grafana suite still needs measured 2 GB validation.
+
+Native aggregate coverage is opt-in locally and required in CI. The collection
+proof tests (CLI, loopback HTTP and real FPM) are included in core/full runs.
+Application subprocess collection uses a development-only prepend/runtime and
+`GARDENHUB_COVERAGE_DIR`, never production INI. Forced-kill processes cannot
+flush shutdown coverage. `make test-coverage` collects the same core suites as
+`make test-ci`, without repeating Grafana or packaged production smoke.
+
+CI enables `GARDENHUB_COVERAGE=1` during `make test-ci`, then runs
+`bash tests/phpunit-coverage.sh --merge-only` with the same report root.
+Enforcement requires every expected suite to succeed, a completed collection
+manifest, successful JUnit reports and native coverage fragments. Failed tests,
+incomplete collection and coverage below 80% all fail the required CI job.
+All `api/src` files, including uncovered files, remain in the denominator.
+Clover XML, HTML and text reports are emitted before threshold enforcement in
+`.test-reports/coverage/<run>/` and uploaded even on a below-threshold failure.
+
+New proposals persist their initial/renewed notification classification. Legacy
+proposals with an unknown classification retain their Telegram text; terminal
+reconciliation removes buttons through `editMessageReplyMarkup` and completes
+only after Telegram succeeds. API failures retry without changing the durable
+decision; expired callbacks remain rejected by the backend.
+
+The replaced-runner preservation ledger is:
+
+| Former Runner | PHPUnit Replacement | Preserved Scenarios |
+| --- | --- | --- |
+| `api/tests/telegram_handler_test.php` | Handler unit and logging functional groups | All seven handler cases plus enabled container/channel isolation |
+| `api/tests/stream_telegram_transport_test.php` | Telegram HTTP functional group | All six success/error/connection/error-handler cases |
+| `tests/release-ci/test_release_checks.py` | Release-gate, image-audit and release-order groups | All eight release methods and variants, two audit methods and variants, real Make refusal ordering |
+| `tests/watering-control/compose-deployment.py` | Compose-selection, Compose-configuration and deployment groups | All thirteen methods; 523 boolean fixtures; both selection modes; all 52 health fixtures and shutdown/startup guards |
+| `tests/scheduler-cron/scheduler-cron.php` | Scheduler-wiring and scheduler-delivery groups | All six scenarios: exact registration, six DST dates, three startup instants, real generated delivery, failure propagation, disabled transport |
+| `tests/telegram-summary/telegram-daily-summary.php` | Telegram-summary group | All eleven scenarios: min/max, grouping, uplink counts, half-open boundaries, empty output, escaping, failure, disabled, custom/default hours, six invalid hours |
+| `tests/sensor-identity/sensor-identity.php` | Sensor-identity group | All six identity phases, twelve invalid payloads, three exact fieldsets, nested/read-only exposure and stored measurement count |
+| `tests/sensor-identity/concurrency.php` | Sensor-concurrency group | All three real races, InnoDB exception-chain proof, performance_schema connection-ID proof, independent writer continuity, unchanged identity and measurement counts |
+| `tests/mqtt-lifecycle/worker-lifecycle.php` | MQTT-worker and MQTT-outage groups | All five child modes, original-manager/debug resets, accepted payload counts, provisioning IDs, flush/reset stops, real connection retries, outage threshold/recovery and fresh-instance state |
+| `tests/mqtt-lifecycle/pre-suback-delivery.php` | MQTT-pre-suback group | Forced pre-SUBACK A, post-SUBACK B and final D delivered once; unrelated C excluded after D proves packet processing |
+| `tests/mqtt-lifecycle/session-resume.php` | MQTT-session-resume group | Real migration, persistent acknowledged subscription, five offline QoS1 markers, fresh worker async enqueue, duplicate tolerance and SIGKILL |
+| `tests/mqtt-lifecycle/delivery-guarantees.php` | MQTT-delivery group | All ten phases: routing, malformed input, persistence, recovery, four-attempt exhaustion and terminal alert, inspection, validation, replay, UUID boundary and eight-event continuous-consumer collision |
+| `tests/mqtt-lifecycle/identity-race.php` | MQTT-identity-race group | Persistent independently relabeled identity fails four attempts/three retries with exact causes; restored identity succeeds after one retry; queue and measurement invariants |
+| `tests/mqtt-lifecycle/migration-upgrade.php` | Migration-upgrade group | All six scenarios: real legacy chain and snapshots/backfill, uniqueness acceptances/refusals, full fresh chain/no pending versions, watering IDs and links/indexes/FKs, empty up/down/up, orphan/interrupted-column guards |
+| `tests/watering-control/orm-mapping.php` | Entity-contracts and watering-orm groups | Nine entity metadata contracts, five invalid entities, enum/alias strings, integer JSON, stale/fresh CAS, foreign keys, referrer removal, nine callback bounds and unknown action |
+| `tests/watering-control/watering-control.php` | Watering-control group | Five invalid payloads, six request guards, exact ON/deadline, duplicate/restart/cooldown, failed publish, timeout/manual review, two alarms, rolling budget, two overdue states, blocked-row isolation and active/latest tie |
+| `tests/watering-control/production.php` | Watering-configuration and watering-production groups | Ten configuration refusals; disabled/incomplete/enabled production DI, real publication, four read-only unresolved statuses, reviewed idle, missing/stale/fresh heartbeats and one-shot fake Telegram poll |
+| `tests/watering-control/proposals.php` | Watering-proposals and watering-actuator-switch groups | Complete dry-episode/notification/authorization/reminder/recovery/replay history, duration limits, daily boundary, two independent approval children, stale/gap/publish-failure/offset checks; all four stored-topic switch and legacy scenarios |
+| `tests/watering-control/watering-mqtt-acknowledgements.php` | Watering-mqtt group | All nine real MQTT/DB scenarios, non-retained QoS1 wire fields, PUBACK timeout, missing/rejected SUBACK, disconnect/reconnect heartbeats, trigger-error precedence, ignored later callbacks and dangling FK |
+| `tests/production-smoke/run.sh` assertions | Production-smoke group | Immutable no-dev subject, www-data platform/migrations/schema/cache, real nginx/FPM health and all seven permission requests; physical PHPUnit/Xdebug/test exclusions |
+| `tests/grafana-db/run.sh` | Grafana history, alerting and provisioning groups | All real provisioned SQL/config/21-row history/outcome cases, three alert flows and nine timed moisture stages, per-instance health/recovery/eviction and string chat ID |
 
 ## Daily summary
 
@@ -1582,11 +1803,9 @@ it and how to opt in.
 Run the isolated test suites (own disposable MySQL container, never the dev database):
 
 ```bash
-docker compose -f tests/telegram-summary/compose.yaml run --rm tests
-docker compose -f tests/telegram-summary/compose.yaml down -v
-
-docker compose -f tests/scheduler-cron/compose.yaml run --rm tests
-docker compose -f tests/scheduler-cron/compose.yaml down -v
+make test-phpunit GROUP=functional_gardenhub-telegram-summary
+make test-phpunit GROUP=functional_gardenhub-scheduler-wiring
+make test-phpunit GROUP=functional_gardenhub-scheduler-delivery
 ```
 
 ## `gardenhub-scheduler`

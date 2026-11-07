@@ -7,6 +7,7 @@
 # Put parameters here that don't need to change on each machine where the app is deployed
 # https://symfony.com/doc/current/best_practices.html#use-parameters-for-application-configuration
 parameters:
+    env(WATERING_PROPOSAL_RETRY_SECONDS): '1800'
     # Maps ChirpStack codec-decoded payload fields to Sensor type/unit.
     # Defaults match the real Dragino SE01-LB codec output; adjust to the
     # codec configured in ChirpStack. Unmapped fields (Node_type, s_flag,
@@ -83,6 +84,7 @@ services:
             $maxGapMinutes: '%env(int:WATERING_PROPOSAL_MAX_GAP_MINUTES)%'
             $validityMinutes: '%env(int:WATERING_PROPOSAL_VALIDITY_MINUTES)%'
             $durationSeconds: '%env(int:WATERING_PROPOSAL_DURATION_SECONDS)%'
+            $retrySeconds: '%env(WATERING_PROPOSAL_RETRY_SECONDS)%'
             $actuatorTopic: '%env(WATERING_MQTT_TOPIC)%'
 
     App\Watering\InterfaceTelegramGateway: '@App\Watering\StreamTelegramGateway'

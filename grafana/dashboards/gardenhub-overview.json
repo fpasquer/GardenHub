@@ -985,7 +985,7 @@
         "type": "mysql",
         "uid": "gardenhub-mysql"
       },
-      "description": "Estimated volume uses recorded elapsed time and the calibration 67 seconds = 500 ml. Only completed runs have a confirmed interval; reviewed end timestamps record operator acknowledgement.",
+      "description": "Completed automatic cycles sum both confirmed stage intervals, excluding the OFF break. Legacy/manual runs use their confirmed elapsed interval. Calibration remains 67 seconds = 500 ml; reviewed timestamps are operator acknowledgements.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -1039,7 +1039,7 @@
           "datasource": { "type": "mysql", "uid": "gardenhub-mysql" },
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  r.id AS `Run ID`,\n  r.status AS `Status`,\n  r.started_at AS `Started at`,\n  r.finished_at AS `Ended at`,\n  r.actual_seconds AS `Actual duration (seconds)`,\n  ROUND(r.actual_seconds * 500.0 / 67.0, 1) AS `Estimated volume (ml)`\nFROM (\n  SELECT id, status, requested_at, started_at, finished_at,\n    CASE\n      WHEN status = 'completed'\n        AND started_at IS NOT NULL\n        AND finished_at IS NOT NULL\n        AND finished_at >= started_at\n      THEN TIMESTAMPDIFF(SECOND, started_at, finished_at)\n      ELSE NULL\n    END AS actual_seconds\n  FROM watering_run\n  WHERE COALESCE(started_at, requested_at) BETWEEN $__timeFrom() AND $__timeTo()\n) r\nORDER BY COALESCE(r.started_at, r.requested_at) DESC, r.id DESC",
+          "rawSql": "SELECT\n  r.id AS `Run ID`,\n  r.status AS `Status`,\n  r.started_at AS `Started at`,\n  r.finished_at AS `Ended at`,\n  r.actual_seconds AS `Actual duration (seconds)`,\n  ROUND(r.actual_seconds * 500.0 / 67.0, 1) AS `Estimated volume (ml)`,\n  (SELECT GROUP_CONCAT(CONCAT(s.position, ': ', s.status) ORDER BY s.position SEPARATOR ', ') FROM watering_stage s WHERE s.run_id = r.id) AS `Stages`,\n  r.second_stage_due_at AS `Second stage due at`\nFROM (\n  SELECT id, status, requested_at, started_at, finished_at, second_stage_due_at,\n    CASE\n      WHEN status = 'completed' AND actuator_topic IS NOT NULL THEN\n        (SELECT CASE WHEN COUNT(*) = 2 AND SUM(s.status = 'completed' AND s.started_at IS NOT NULL AND s.finished_at IS NOT NULL AND s.finished_at >= s.started_at) = 2\n          THEN SUM(TIMESTAMPDIFF(SECOND, s.started_at, s.finished_at)) ELSE NULL END\n         FROM watering_stage s WHERE s.run_id = w.id)\n      WHEN status = 'completed' AND actuator_topic IS NULL\n        AND started_at IS NOT NULL AND finished_at IS NOT NULL AND finished_at >= started_at\n      THEN TIMESTAMPDIFF(SECOND, started_at, finished_at)\n      ELSE NULL\n    END AS actual_seconds\n  FROM watering_run w\n  WHERE COALESCE(started_at, requested_at) BETWEEN $__timeFrom() AND $__timeTo()\n) r\nORDER BY COALESCE(r.started_at, r.requested_at) DESC, r.id DESC",
           "refId": "A"
         }
       ],

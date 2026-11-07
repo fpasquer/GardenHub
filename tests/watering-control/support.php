@@ -87,6 +87,8 @@ function newTestManager(
     int $maxSeconds = WateringManager::DEFAULT_MAX_SECONDS,
     int $dailySeconds = WateringManager::DEFAULT_DAILY_SECONDS,
     int $cooldownSeconds = WateringManager::DEFAULT_COOLDOWN_SECONDS,
+    ?\Psr\Clock\ClockInterface $clock = null,
+    string $topic = 'gardenhub/dev/watering/avocado',
 ): WateringManager {
     /** @var WateringControlRepository $controls */
     $controls = $em->getRepository(WateringControl::class);
@@ -98,10 +100,11 @@ function newTestManager(
         $runs,
         new TransactionRunner($em, testRegistry()),
         $publisher,
-        new WateringConfiguration($enabled, $environment, 'mqtt', 1883, 'test', 'test', 'gardenhub/dev/watering/avocado'),
+        new WateringConfiguration($enabled, $environment, 'mqtt', 1883, 'test', 'test', $topic),
         $maxSeconds,
         $dailySeconds,
         $cooldownSeconds,
+        $clock ?? new \Symfony\Component\Clock\NativeClock('UTC'),
     );
 }
 
@@ -109,7 +112,8 @@ function newTestPolicy(
     EntityManagerInterface $em,
     WateringManager $manager,
     string $actuatorTopic,
-    int $durationSeconds = 3,
+    int $durationSeconds = 65,
+    int|string $retrySeconds = 1800,
 ): ProposalPolicy {
     /** @var DeviceRepository $devices */
     $devices = $em->getRepository(Device::class);
@@ -136,6 +140,7 @@ function newTestPolicy(
         30,
         $durationSeconds,
         $actuatorTopic,
+        $retrySeconds,
     );
 }
 

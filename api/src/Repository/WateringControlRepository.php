@@ -50,6 +50,8 @@ class WateringControlRepository extends ServiceEntityRepository
         $this->createQueryBuilder('c')
             ->update()
             ->set('c.monitorSeenAt', 'NULL')
+            ->set('c.actuatorSeenAt', 'NULL')
+            ->set('c.actuatorSafe', 'NULL')
             ->where('c.id = :id')
             ->setParameter('id', WateringControl::SINGLETON_ID)
             ->getQuery()

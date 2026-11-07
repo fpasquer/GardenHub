@@ -47,6 +47,9 @@ def validate_mqtt(environment):
         raise ValueError('Invalid watering cooldown.')
     if not 1 <= int(environment['WATERING_PROPOSAL_DURATION_SECONDS']) <= maximum:
         raise ValueError('Invalid watering proposal duration.')
+    retry = str(environment.get('WATERING_PROPOSAL_RETRY_SECONDS', '1800')).strip()
+    if not re.fullmatch(r'\+?[1-9][0-9]*', retry) or int(retry) > sys.maxsize:
+        raise ValueError('Invalid watering proposal retry interval.')
 
 
 def validate_modes(services):
@@ -63,6 +66,10 @@ def validate_modes(services):
             if not str(services['gardenhub-watering-sim']['environment'].get(name, '')).strip():
                 raise ValueError('Simulator startup requires its dedicated credentials and host.')
     if 'gardenhub-watering-proposals' in services:
+        if int(environment['WATERING_PROPOSAL_DURATION_SECONDS']) != 65:
+            raise ValueError('Automatic watering requires two 65-second stages.')
+        if int(environment['WATERING_MAX_SECONDS']) < 65 or int(environment['WATERING_DAILY_SECONDS']) < 130:
+            raise ValueError('Automatic watering requires limits allowing a 130-second cycle.')
         if 'gardenhub-watering-monitor' not in services:
             raise ValueError('Select watering-hardware or watering-sim together with watering-proposals.')
         if not str(environment.get('TELEGRAM_BOT_TOKEN', '')).strip():

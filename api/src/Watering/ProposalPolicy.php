@@ -7,6 +7,7 @@ namespace App\Watering;
 use App\Entity\Device;
 use App\Entity\WateringProposal;
 use App\Entity\WateringProposalState;
+use App\Entity\WateringRun;
 use App\Repository\DeviceRepository;
 use App\Repository\MeasurementRepository;
 use App\Repository\WateringProposalRepository;
@@ -22,8 +23,7 @@ final class ProposalPolicy
     private const DEVICE_NAME = 'SE01-Avocado';
     private const READINGS = 3;
     private const DAY_SECONDS = 86400;
-    /** One initial prompt and one reminder per actuator, until a wet reading resets the episode. */
-    private const MAX_PROMPTS = 2;
+    private readonly int $retrySeconds;
 
     public function __construct(
         private readonly DeviceRepository $devices,
@@ -39,8 +39,14 @@ final class ProposalPolicy
         private readonly int $validityMinutes,
         private readonly int $durationSeconds,
         private readonly string $actuatorTopic,
+        int|string $retrySeconds = 1800,
     ) {
-        if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || $durationSeconds < 1 || $durationSeconds > $watering->maxSeconds()) {
+        $retry = filter_var($retrySeconds, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if (false === $retry) {
+            throw new \LogicException('Watering proposal retry must be a positive integer number of seconds.');
+        }
+        $this->retrySeconds = $retry;
+        if (!is_finite($threshold) || $threshold <= 0 || $threshold > 100 || $freshnessMinutes < 1 || $maxGapMinutes < 1 || $validityMinutes < 1 || WateringManager::STAGE_SECONDS !== $durationSeconds || $durationSeconds > $watering->maxSeconds()) {
             throw new \LogicException('Invalid watering proposal configuration.');
         }
     }
@@ -116,6 +122,11 @@ final class ProposalPolicy
         }
     }
 
+    public function recordRenderedMessage(int $id, string $text): void
+    {
+        $this->proposals->recordRenderedMessage($id, $text);
+    }
+
     private function evaluateLocked(): ?WateringProposal
     {
         $device = $this->devices->lockByName(self::DEVICE_NAME);
@@ -152,30 +163,55 @@ final class ProposalPolicy
     private function prompt(Device $device, \DateTimeImmutable $now, array $readings, ?\DateTimeImmutable $attempt): ?WateringProposal
     {
         $state = $this->states->lockOrCreate($device, $this->actuatorTopic);
-        if (!$this->mayPrompt($state, $now)) {
+        $previous = $this->proposals->latestForDevice((int) $device->getId());
+        if (!$this->mayPrompt($state, $previous, $now)) {
             return null;
         }
-        $proposal = $this->createProposal($device, $now, $readings, $attempt);
-        $state->setPromptCount($state->getPromptCount() + 1)->setLastPromptAt($now);
+        $renewed = $state->getPromptCount() > 0
+            && WateringProposalStatus::Expired->value === $previous?->getStatus();
+        if ($state->getPromptCount() > 0) {
+            try {
+                $this->watering->assertProposalEligible($this->durationSeconds, $now);
+            } catch (\DomainException) {
+                return null;
+            }
+        }
+        $proposal = $this->createProposal($device, $now, $readings, $attempt, $renewed);
+        $state->setPromptCount($renewed ? 2 : 1)->setLastPromptAt($now);
 
         return $proposal;
     }
 
-    private function mayPrompt(WateringProposalState $state, \DateTimeImmutable $now): bool
+    private function mayPrompt(WateringProposalState $state, ?WateringProposal $previous, \DateTimeImmutable $now): bool
     {
-        $count = $state->getPromptCount();
-        $last = $state->getLastPromptAt();
-        if ($count >= self::MAX_PROMPTS) {
+        if (0 === $state->getPromptCount()) {
+            return true;
+        }
+        if (null === $previous || $previous->getActuatorTopic() !== $this->actuatorTopic
+            || $state->getLastPromptAt() != $previous->getCreatedAt()) {
             return false;
         }
+        $deadline = match ($previous->getStatus()) {
+            WateringProposalStatus::Expired->value => $previous->getExpiresAt(),
+            WateringProposalStatus::Rejected->value => $previous->getDecidedAt(),
+            WateringProposalStatus::Approved->value => $previous->getRun()?->getRequestedAt(),
+            default => null,
+        };
+        $delay = WateringProposalStatus::Expired->value === $previous->getStatus()
+            ? $this->retrySeconds : self::DAY_SECONDS;
 
-        return 0 === $count || null === $last || $last->getTimestamp() <= $now->getTimestamp() - self::DAY_SECONDS;
+        return null !== $deadline && $now->getTimestamp() - $deadline->getTimestamp() >= $delay;
+    }
+
+    public function isRenewed(WateringProposal $proposal): ?bool
+    {
+        return $proposal->isRenewed();
     }
 
     /**
      * @param list<array{value: float, measuredAt: \DateTimeImmutable}> $readings
      */
-    private function createProposal(Device $device, \DateTimeImmutable $now, array $readings, ?\DateTimeImmutable $attempt): WateringProposal
+    private function createProposal(Device $device, \DateTimeImmutable $now, array $readings, ?\DateTimeImmutable $attempt, bool $renewed): WateringProposal
     {
         $snapshot = array_reverse(array_map(
             static fn (array $r): array => ['value' => (float) $r['value'], 'measured_at' => $r['measuredAt']->format('Y-m-d H:i:s')],
@@ -187,10 +223,13 @@ final class ProposalPolicy
             ->setCreatedAt($now)
             ->setExpiresAt($now->modify(sprintf('+%d minutes', $this->validityMinutes)))
             ->setDurationSeconds($this->durationSeconds)
+            ->setStageCount(WateringManager::STAGE_COUNT)
+            ->setBreakSeconds(WateringManager::BREAK_SECONDS)
             ->setReadingsJson($snapshot)
             ->setLastAttemptAt($attempt)
             ->setNotificationStatus(WateringNotificationStatus::New->value)
-            ->setActuatorTopic($this->actuatorTopic);
+            ->setActuatorTopic($this->actuatorTopic)
+            ->setRenewed($renewed);
         $this->proposals->add($proposal);
 
         return $proposal;
@@ -215,6 +254,14 @@ final class ProposalPolicy
 
             return ProposalDecisionResult::Invalidated->value;
         }
+        if (WateringManager::STAGE_COUNT !== $p->getStageCount()
+            || WateringManager::STAGE_SECONDS !== $p->getDurationSeconds()
+            || WateringManager::BREAK_SECONDS !== $p->getBreakSeconds()) {
+            $p->setStatus(WateringProposalStatus::Invalidated->value)
+                ->setFailure('Watering cycle terms changed; a new approval is required');
+
+            return ProposalDecisionResult::Invalidated->value;
+        }
         if (self::ACTION_REJECT === $action) {
             $p->setStatus(WateringProposalStatus::Rejected->value);
 
@@ -229,8 +276,16 @@ final class ProposalPolicy
     private function execute(int $id): string
     {
         try {
-            $duration = (int) $this->proposals->fresh($id)?->getDurationSeconds();
-            $runId = $this->watering->request($duration, fn (\DateTimeImmutable $now) => $this->assertStillValid($id, $now));
+            $runId = $this->watering->requestCycle(
+                $this->actuatorTopic,
+                function (\DateTimeImmutable $now, WateringRun $run) use ($id): void {
+                    $this->assertStillValid($id, $now);
+                    $proposal = $this->proposals->fresh($id)
+                        ?? throw new \LogicException('Claimed proposal disappeared.');
+                    $proposal->setRun($run)
+                        ->setStatus(WateringProposalStatus::Approved->value);
+                },
+            );
             $this->proposals->finishExecution($id, WateringProposalStatus::Approved->value, null, $runId);
 
             return ProposalDecisionResult::Approved->value;

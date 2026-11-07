@@ -52,6 +52,23 @@ CREATE TABLE watering_run (
     last_state_at DATETIME DEFAULT NULL,
     last_state VARCHAR(10) DEFAULT NULL,
     error VARCHAR(255) DEFAULT NULL,
+    actuator_topic VARCHAR(255) DEFAULT NULL,
+    second_stage_due_at DATETIME DEFAULT NULL,
+    safety_probe_at DATETIME DEFAULT NULL,
     PRIMARY KEY (id),
     INDEX idx_watering_requested (requested_at)
+) DEFAULT CHARACTER SET utf8mb4;
+
+CREATE TABLE watering_stage (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    run_id INT NOT NULL,
+    position INT NOT NULL,
+    requested_seconds INT NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    requested_at DATETIME DEFAULT NULL,
+    started_at DATETIME DEFAULT NULL,
+    finished_at DATETIME DEFAULT NULL,
+    deadline_at DATETIME DEFAULT NULL,
+    UNIQUE INDEX uniq_watering_stage (run_id, position),
+    FOREIGN KEY (run_id) REFERENCES watering_run (id) ON DELETE CASCADE
 ) DEFAULT CHARACTER SET utf8mb4;
